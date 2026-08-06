@@ -1,0 +1,4 @@
+pillow>=12.3.0
+customtkinter>=5.2.2
+tkinterdnd2>=0.6.2
+pyinstaller>=6.21.0

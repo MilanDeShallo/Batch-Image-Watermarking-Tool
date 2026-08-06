@@ -1,0 +1,39 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.exe
+*.dll
+
+# 测试与覆盖率缓存
+.pytest_cache/
+.cache/
+.coverage
+htmlcov/
+
+# 测试输出文件
+test_output.jpg
+*_output.jpg
+
+# 日志
+*.log
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+
+# 操作系统文件
+.DS_Store
+Thumbs.db

@@ -1,0 +1,514 @@
+"""
+纯 Pillow 水印引擎（无 GUI 依赖，可独立测试/命令行调用）
+
+核心功能：
+1. safe_open_image() - 安全打开图片（EXIF 校正 + CMYK 兼容 + 大图安全）
+2. prepare_exif_for_save() - 清除 Orientation 标记防二次旋转
+3. add_text_watermark() - 文字水印（含空字符串容错 v4）
+4. add_image_watermark() - 图片/Logo 水印
+5. apply_watermark() - 统一入口，根据 config.type 分发
+6. save_with_format() - 智能保存（格式转换 + 安全 EXIF）
+7. load_font_with_fallback() - 字体四级回退链
+
+设计原则：
+- 本模块不 import 任何 GUI 库
+- 所有函数接收 WatermarkConfig dataclass 作为参数
+- 可通过 python -m src.watermark_engine 命令行测试
+"""
+
+from __future__ import annotations
+
+import gc
+import os
+import re
+from typing import Optional
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+# ============================================================
+# 全局安全设置
+# ============================================================
+# 关闭 Pillow 的 DecompressionBombError 限制（支持超高分辨率大图）
+Image.MAX_IMAGE_PIXELS = None
+
+# EXIF Orientation 标签编号 (274 = 0x0112)
+ORIENTATION_TAG = 0x0112
+
+# 支持的图片扩展名（小写）
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+
+
+# ============================================================
+# 字体加载 — 四级回退链
+# ============================================================
+
+_FONT_FALLBACK_CHAIN = [
+    lambda p: p if p else None,                    # 1. 用户指定路径
+    lambda _: r"C:\Windows\Fonts\msyh.ttc",         # 2. 微软雅黑
+    lambda _: r"C:\Windows\Fonts\simhei.ttf",       # 3. 黑体
+]
+
+
+def load_font_with_fallback(user_path: str | None, size: int) -> tuple:
+    """
+    加载字体文件，按优先级逐级回退。
+
+    返回 (font, is_warning) 元组：
+    - font: ImageFont.FreeTypeFont 或 ImageFont.ImageFont
+    - is_warning: True 表示回退到了默认字体（不支持中文字符），调用方应提示用户
+    """
+    for getter in _FONT_FALLBACK_CHAIN:
+        path = getter(user_path)
+        if path and os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, size), False
+            except (OSError, IOError):
+                continue
+    # 全部失败 → Pillow 内置位图字体（不支持中文）
+    return ImageFont.load_default(), True
+
+
+# ============================================================
+# 图片安全打开 — EXIF 校正 + 色彩空间兼容
+# ============================================================
+
+def safe_open_image(path: str) -> Image.Image:
+    """
+    安全打开图片文件，执行以下预处理：
+
+    1. ImageOps.exif_transpose() - 自动校正手机/相机竖拍照片的旋转方向
+    2. 色彩空间归一化 - CMYK/P/La 等非标准模式转为 RGB
+    3. 大图安全保障 - MAX_IMAGE_PIXELS 已在模块级设为 None
+    """
+    img = Image.open(path)
+    img.load()  # 强制加载像素数据，尽早发现损坏文件
+
+    # 1. EXIF 方向自动校正
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass  # 某��图片可能无 EXIF 数据或解析失败，忽略
+
+    # 2. 色彩空间兼容：CMYK/P/La 等非标准模式统一转 RGB
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGB")
+
+    return img
+
+
+# ============================================================
+# EXIF 保存 — 防二次旋转（v3 关键修复）
+# ============================================================
+
+def prepare_exif_for_save(img: Image.Image) -> Optional[bytes]:
+    """
+    清除 EXIF 中的 Orientation 标记为 1 (Normal)，防止二次旋转。
+
+    背景：
+    - safe_open_image() 中已调用 exif_transpose() 实际旋转了像素数据
+    - 但原始 EXIF 中的 Orientation 仍为旧值（如 6=Rotate 90CW）
+    - 如果原封不动写入新图，支持 EXIF 的查看器会对已旋转的图再次旋转 → 图片倒过来！
+
+    返回：
+    - bytes: 处理后的 EXIF 数据（可直接传给 img.save(exif=...)）
+    - None: 无法获取/处理 EXIF 时返回 None（调用方应跳过 exif 参数）
+    """
+    try:
+        exif_obj = img.getexif()
+        exif_obj[ORIENTATION_TAG] = 1  # 1 = Normal, no rotation needed
+        return exif_obj.tobytes()
+    except Exception:
+        return None
+
+
+# ============================================================
+# 位置计算 — 九宫格定位
+# ============================================================
+
+def anchor_position(
+    base_size: tuple[int, int],
+    sprite_size: tuple[int, int],
+    position: str,
+    margin: int
+) -> tuple[int, int]:
+    """
+    根据九宫格位置字符串计算水印左上角坐标。
+
+    position 格式："{vertical}-{horizontal}"
+    - vertical: top / middle / bottom
+    - horizontal: left / center / right
+    特殊值："center" 等同于 "middle-center"
+    """
+    bw, bh = base_size
+    sw, sh = sprite_size
+
+    # 解析位置字符串
+    if position == "center":
+        position = "middle-center"
+
+    parts = position.split("-")
+    v_pos = parts[0] if len(parts) >= 1 else "middle"
+    h_pos = parts[1] if len(parts) >= 2 else "center"
+
+    # 水平位置
+    x = {
+        "left": margin,
+        "center": (bw - sw) // 2,
+        "right": bw - sw - margin,
+    }.get(h_pos, (bw - sw) // 2)
+
+    # 垂直位置
+    y = {
+        "top": margin,
+        "middle": (bh - sh) // 2,
+        "bottom": bh - sh - margin,
+    }.get(v_pos, (bh - sh) // 2)
+
+    return (x, y)
+
+
+def custom_anchor_position(
+    base_size: tuple[int, int],
+    sprite_size: tuple[int, int],
+    x_pct: int,
+    y_pct: int,
+) -> tuple[int, int]:
+    """
+    根据自定义百分比坐标计算水印左上角坐标。
+
+    Args:
+        base_size: 基图尺寸 (width, height)
+        sprite_size: 水印尺寸 (width, height)
+        x_pct: 水平位置百分比 (0=左边缘, 100=右边缘)
+        y_pct: 垂直位置百分比 (0=上边缘, 100=下边缘)
+
+    Returns:
+        (x, y) 水印左上角在基图上的像素坐标
+    """
+    bw, bh = base_size
+    sw, sh = sprite_size
+
+    # 将百分比转换为像素坐标（以水印中心为基准）
+    x = int(bw * x_pct / 100) - sw // 2
+    y = int(bh * y_pct / 100) - sh // 2
+
+    # 边界约束：确保水印不超出图片范围
+    x = max(0, min(x, bw - sw))
+    y = max(0, min(y, bh - sh))
+
+    return (x, y)
+
+
+# ============================================================
+# 平铺网格绘制
+# ============================================================
+
+def tile_grid(
+    overlay: Image.Image,
+    sprite: Image.Image,
+    spacing_x: int,
+    spacing_y: int,
+    stagger: bool = False
+) -> None:
+    """
+    在 overlay 上以平铺方式粘贴 sprite。
+
+    Args:
+        overlay: 目标画布（RGBA 模式，会被就地修改）
+        sprite: 水印精灵图（需有 alpha 通道作为 mask）
+        spacing_x: 水平间距
+        spacing_y: 垂直间距
+        stagger: 是否相邻行错位（半间距偏移）
+    """
+    step_x = sprite.width + spacing_x
+    step_y = sprite.height + spacing_y
+    row = 0
+
+    for y in range(-sprite.height, overlay.height + step_y, step_y):
+        offset = (step_x // 2) if (row % 2 and stagger) else 0
+        for x in range(-sprite.width + offset, overlay.width + step_x, step_x):
+            overlay.paste(sprite, (x, y), sprite)
+        row += 1
+
+
+# ============================================================
+# 文字水印渲染
+# ============================================================
+
+def _render_text_sprite(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    color_rgba: tuple,
+    angle: float
+) -> Image.Image:
+    """
+    先在透明图层上渲染文字，再整体旋转，得到带角度的水印 sprite。
+
+    注意 bbox 负坐标处理：
+    - 某些字体或含下沉字母(g/j/p/y)的文字，bbox[0] 或 bbox[1] 可能为负数
+    - 绘制位置需用 (pad - bbox[0], pad - bbox[1]) 补偿
+    - 画布尺寸也需相应调整
+    """
+    # 第一步：在 1x1 临时图上测量文字包围盒
+    tmp = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.multiline_textbbox((0, 0), text, font=font, align="center")
+
+    # 计算预留边距（用于旋转后不裁切）
+    pad = max(int((bbox[2] - bbox[0]) * 0.3), 20)
+
+    # 创建实际尺寸的透明图层（Pillow 12.x bbox 返回 float，需转 int）
+    layer_w = int(bbox[2] - bbox[0]) + pad * 2
+    layer_h = int(bbox[3] - bbox[1]) + pad * 2
+    layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
+
+    # 在补偿后的位置绘制文字
+    draw = ImageDraw.Draw(layer)
+    draw.multiline_text(
+        (pad - bbox[0], pad - bbox[1]),
+        text,
+        font=font,
+        fill=color_rgba,
+        align="center"
+    )
+
+    # 旋转（如有角度）
+    if angle:
+        layer = layer.rotate(angle, expand=True, resample=Image.BICUBIC)
+
+    return layer
+
+
+def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
+    """
+    为图片添加文字水印。
+
+    v4 新增：空字符串/纯空格容错 —— 若 text 为空或纯空白，直接返回原图。
+    """
+    # v4: 空字符串/纯空格容错
+    if not cfg.text or not cfg.text.strip():
+        return base
+
+    base = base.convert("RGBA")
+
+    # 计算字号（相对短边的百分比）
+    font_size = max(12, int(min(base.size) * cfg.font_ratio))
+    font, is_warning = load_font_with_fallback(cfg.font_path or None, font_size)
+
+    # 渲染文字 sprite
+    sprite = _render_text_sprite(cfg.text, font, cfg.color_rgba, cfg.angle)
+
+    # 创建透明覆盖层
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+
+    if cfg.tile:
+        # 平铺模式
+        tile_grid(overlay, sprite, cfg.spacing_x, cfg.spacing_y, cfg.stagger)
+    else:
+        # 单次定位（支持九宫格 / 自定义坐标）
+        pos_mode = getattr(cfg, 'position_mode', 'grid')
+        if pos_mode == "custom":
+            cx = getattr(cfg, 'custom_x', 50)
+            cy = getattr(cfg, 'custom_y', 50)
+            x, y = custom_anchor_position(base.size, sprite.size, cx, cy)
+        else:
+            x, y = anchor_position(base.size, sprite.size, cfg.position, cfg.margin)
+        overlay.paste(sprite, (x, y), sprite)
+
+    # Alpha 合成
+    return Image.alpha_composite(base, overlay)
+
+
+# ============================================================
+# 图片/Logo 水印渲染
+# ============================================================
+
+def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
+    """为图片添加 Logo/图片水印"""
+    import os
+
+    # Logo 路径有效性检查
+    if not getattr(cfg, 'logo_path', None) or not os.path.exists(cfg.logo_path):
+        return base
+
+    base = base.convert("RGBA")
+
+    # 加载并缩放 Logo
+    logo = Image.open(cfg.logo_path).convert("RGBA")
+    target_w = max(16, int(base.width * cfg.scale_ratio))
+    target_h = int(logo.height * target_w / logo.width)
+    logo = logo.resize((target_w, target_h), Image.LANCZOS)
+
+    # 透明度调节（仅缩放 alpha 通道，保留原透明底）
+    opacity_factor = cfg.logo_opacity / 100.0
+    if opacity_factor < 1.0:
+        alpha = logo.getchannel("A").point(lambda a: int(a * opacity_factor))
+        logo.putalpha(alpha)
+
+    # 旋转角度
+    logo_angle = getattr(cfg, 'logo_angle', 0)
+    if logo_angle:
+        logo = logo.rotate(-logo_angle, expand=True, resample=Image.BICUBIC)
+
+    # 创建透明覆盖层
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+
+    if cfg.logo_tile:
+        # 平铺模式
+        tile_grid(overlay, logo, cfg.logo_spacing_x, cfg.logo_spacing_y)
+    else:
+        # 单次定位（支持九宫格 / 自定义坐标）
+        pos_mode = getattr(cfg, 'logo_position_mode', 'grid')
+        if pos_mode == "custom":
+            cx = getattr(cfg, 'logo_custom_x', 50)
+            cy = getattr(cfg, 'logo_custom_y', 50)
+            x, y = custom_anchor_position(base.size, logo.size, cx, cy)
+        else:
+            x, y = anchor_position(base.size, logo.size, cfg.logo_position, cfg.logo_margin)
+        overlay.paste(logo, (x, y), logo)
+
+    return Image.alpha_composite(base, overlay)
+
+
+# ============================================================
+# 统一入口
+# ============================================================
+
+def apply_watermark(img: Image.Image, cfg) -> Image.Image:
+    """
+    统一水印应用入口。根据 cfg.watermark_type 分发到对应处理函数。
+
+    支持的类型：
+    - "text": 仅文字水印
+    - "image": 仅图片水印
+    - "both": 同时应用两种水印（先文字后图片）
+    """
+    result = img
+
+    # 应用文字水印
+    if cfg.watermark_type in ("text", "both"):
+        result = add_text_watermark(result, cfg)
+
+    # 应用图片水印
+    if cfg.watermark_type in ("image", "both"):
+        if cfg.logo_path and os.path.isfile(cfg.logo_path):
+            result = add_image_watermark(result, cfg)
+        # 若 logo_path 不存在且类型为 image，静默跳过（不报错）
+
+    return result
+
+
+# ============================================================
+# 智能保存 — 格式转换 + 安全 EXIF
+# ============================================================
+
+def save_with_format(
+    img: Image.Image,
+    path: str,
+    jpeg_quality: int = 90
+) -> None:
+    """
+    智能保存图片，根据扩展名自动选择格式和模式转换。
+
+    功能：
+    - JPEG: RGBA→RGB（白底）+ 安全 EXIF（Orientation 已清除）
+    - PNG: 保持 RGBA
+    - TIFF/WebP: 支持 EXIF 透传
+    - 其他: 直接保存
+    """
+    ext = os.path.splitext(path)[1].lower()
+    safe_exif = prepare_exif_for_save(img)
+
+    if ext in (".jpg", ".jpeg"):
+        # JPEG 不支持 alpha/RGBA → 转 RGB（白底）
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        kwargs = {"quality": jpeg_quality}
+        if safe_exif:
+            kwargs["exif"] = safe_exif
+
+    elif ext == ".png":
+        # PNG 保留 RGBA
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        kwargs = {}
+        # PNG 的 EXIF 支持有限，部分查看器忽略；如需保留可取消下行注释
+        # if safe_exif:
+        #     kwargs["exif"] = safe_exif
+
+    elif ext in (".tiff", ".webp"):
+        # TIFF/WebP 支持 EXIF
+        kwargs = {}
+        if safe_exif:
+            kwargs["exif"] = safe_exif
+
+    else:
+        # 其他格式（BMP 等）
+        kwargs = {}
+
+    # 确保输出目录存在
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    img.save(path, **kwargs)
+
+
+# ============================================================
+# 路径清洗工具
+# ============================================================
+
+_PATH_CLEAN_RE = re.compile(r'^[\'\"{\s]+|[\'\"}\s]+$')
+
+
+def sanitize_path(raw: str) -> str:
+    """
+    清洗 Windows 拖拽传入的路径。
+
+    问题：Windows 拖拽经常传入带 {} 包裹或引号的路径，
+          如 {C:/Program Files/img.jpg} 或 'C:\\Photos\\test.png'
+    """
+    return _PATH_CLEAN_RE.sub('', raw.strip())
+
+
+# ============================================================
+# 命令行测试入口
+# ============================================================
+
+if __name__ == "__main__":
+    """命令行单张测试：python -m src.watermark_engine <输入图片> <输出图片>"""
+    import sys
+
+    if len(sys.argv) < 3:
+        print("用法: python -m src.watermark_engine <输入图片> <输出图片>")
+        print("示例: python -m src.watermark_engine photo.jpg output.jpg")
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2]
+
+    print(f"[引擎测试] 输入: {input_path}")
+    print(f"[引擎测试] 输出: {output_path}")
+
+    # 使用默认配置
+    from src.config import WatermarkConfig
+    default_cfg = WatermarkConfig(
+        watermark_type="text",
+        text="内部资料\nConfidential",
+        color_rgba=(255, 255, 255, 80),
+        font_ratio=0.04,
+        angle=30,
+        tile=True,
+        spacing_x=150,
+        spacing_y=150,
+        stagger=True,
+    )
+
+    # 执行
+    img = safe_open_image(input_path)
+    result = apply_watermark(img, default_cfg)
+    save_with_format(result, output_path, jpeg_quality=90)
+
+    print("[引擎测试] 完成!")
