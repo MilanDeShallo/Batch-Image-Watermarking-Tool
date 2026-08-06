@@ -1,0 +1,17 @@
+# 统一换行符：仓库内文本文件统一存储为 LF
+* text=auto eol=lf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.bmp binary
+*.webp binary
+*.tiff binary
+*.tif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.ttf binary
+*.ttc binary
