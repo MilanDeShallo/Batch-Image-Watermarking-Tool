@@ -86,7 +86,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         row += 1
 
         # --- 透明度 ---
-        ctk.CTkLabel(self, text="透明度:").grid(row=row, column=0, sticky="w", padx=12)
+        ctk.CTkLabel(self, text="不透明度:").grid(row=row, column=0, sticky="w", padx=12)
         row += 1
 
         self.opacity_slider = ctk.CTkSlider(
@@ -223,7 +223,8 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         self._stagger_var = ctk.BooleanVar(value=False)
         stagger_check = ctk.CTkCheckBox(
             self.tile_params_frame, text="交错排列", width=90,
-            variable=self._stagger_var
+            variable=self._stagger_var,
+            command=self._notify_change,  # 勾选后立即刷新预览
         )
         stagger_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.stagger_var = self._stagger_var
@@ -396,6 +397,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             "logo_tile": self.tile_var.get(),
             "logo_spacing_x": self.spacing_x_entry.get(),
             "logo_spacing_y": self.spacing_y_entry.get(),
+            "logo_stagger": self._stagger_var.get(),
             "logo_angle": int(self.angle_slider.get()),
         }
 
@@ -484,7 +486,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         self.spacing_y_entry.delete(0, "end")
         self.spacing_y_entry.insert(0, str(data.get("logo_spacing_y", 100)))
         if self.stagger_var:
-            self.stagger_var.set(data.get("stagger", False))
+            self.stagger_var.set(data.get("logo_stagger", False))
 
         self._loading = False
         self._notify_change()

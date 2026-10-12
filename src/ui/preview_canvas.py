@@ -38,6 +38,10 @@ class PreviewCanvas(ctk.CTkFrame):
         self._cached_render: Image.Image | None = None
         self._cached_orig_size = (0, 0)
 
+        # PDF 翻页状态（仅 PDF 文件使用）
+        self._pdf_page = 0            # 当前预览页码（0 起）
+        self._pdf_page_count = None   # 总页数（首次渲染完成后回填）
+
         # 缩放
         self._zoom_var = ctk.DoubleVar(value=1.0)
         self._zoom_label_var = ctk.StringVar(value="100%")
@@ -125,6 +129,46 @@ class PreviewCanvas(ctk.CTkFrame):
             zoom_bar, text="", text_color="gray", font=("Microsoft YaHei", 10)
         )
         self.size_label.pack(side="right", padx=4)
+
+        # ---- PDF 翻页栏（仅 PDF 文件时显示） ----
+        self._pdf_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self._pdf_bar.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self._pdf_bar.grid_remove()  # 初始隐藏
+
+        self._pdf_prev_btn = ctk.CTkButton(
+            self._pdf_bar, text="◀ 上一页", width=78, height=26,
+            font=("Microsoft YaHei", 11),
+            command=lambda: self._go_pdf_page(-1),
+        )
+        self._pdf_prev_btn.pack(side="left", padx=(0, 4))
+
+        self._pdf_page_var = ctk.StringVar(value="第 1 页 / 共 ? 页")
+        self._pdf_page_label = ctk.CTkLabel(
+            self._pdf_bar, textvariable=self._pdf_page_var,
+            width=130, font=("Microsoft YaHei", 11),
+        )
+        self._pdf_page_label.pack(side="left", padx=4)
+
+        self._pdf_next_btn = ctk.CTkButton(
+            self._pdf_bar, text="下一页 ▶", width=78, height=26,
+            font=("Microsoft YaHei", 11),
+            command=lambda: self._go_pdf_page(1),
+        )
+        self._pdf_next_btn.pack(side="left", padx=(4, 0))
+
+        ctk.CTkLabel(
+            self._pdf_bar, text="跳到第", text_color="gray",
+            font=("Microsoft YaHei", 10),
+        ).pack(side="left", padx=(14, 2))
+
+        self._pdf_jump_entry = ctk.CTkEntry(self._pdf_bar, width=54, height=26)
+        self._pdf_jump_entry.pack(side="left")
+        self._pdf_jump_entry.bind("<Return>", lambda e: self._jump_pdf_page())
+
+        ctk.CTkLabel(
+            self._pdf_bar, text="页（回车）", text_color="gray",
+            font=("Microsoft YaHei", 10),
+        ).pack(side="left", padx=(2, 4))
 
     def _get_canvas_bg(self):
         """根据主题获取画布背景色"""
@@ -260,7 +304,12 @@ class PreviewCanvas(ctk.CTkFrame):
         if not image_path or not os.path.exists(image_path):
             self._show_placeholder("图片不存在")
             return
+        if image_path != self.current_image_path:
+            # 换文件时回到第 1 页；总页数等首次渲染完成后回填
+            self._pdf_page = 0
+            self._pdf_page_count = None
         self.current_image_path = image_path
+        self._update_pdf_bar()
         self._schedule_refresh()
 
     def request_refresh(self):
@@ -272,8 +321,77 @@ class PreviewCanvas(ctk.CTkFrame):
         self.current_image_path = None
         self._cached_render = None
         self._cached_orig_size = (0, 0)
+        self._pdf_page = 0
+        self._pdf_page_count = None
         self._cancel_debounce()
+        self._update_pdf_bar()
         self._show_placeholder("拖入图片后在此预览水印效果")
+
+    # ==================== PDF 翻页 ====================
+
+    def _is_pdf(self) -> bool:
+        """当前预览的文件是否为 PDF"""
+        return bool(self.current_image_path) and self.current_image_path.lower().endswith(".pdf")
+
+    def _go_pdf_page(self, delta: int):
+        """上一页 / 下一页"""
+        if not self._is_pdf():
+            return
+        self._set_pdf_page(self._pdf_page + delta)
+
+    def _jump_pdf_page(self):
+        """跳到输入框指定的页（用户输入 1 起页码）"""
+        from src.validators import parse_number
+
+        value = parse_number(self._pdf_jump_entry.get(), integer=True)
+        if value is None:
+            self._update_pdf_bar()  # 输入非法：还原为当前页
+            return
+        self._set_pdf_page(int(value) - 1)
+
+    def _set_pdf_page(self, page_index: int):
+        """切换预览页（越界夹取；页码未变则不重复渲染）"""
+        if not self._is_pdf():
+            return
+
+        count = self._pdf_page_count
+        if count:
+            page_index = max(0, min(count - 1, page_index))
+        else:
+            page_index = max(0, page_index)
+
+        if page_index == self._pdf_page:
+            self._update_pdf_bar()
+            return
+
+        self._pdf_page = page_index
+        self._update_pdf_bar()
+        self._schedule_refresh()
+
+    def _update_pdf_bar(self):
+        """刷新翻页栏的显示与按钮可用状态"""
+        if not self._is_pdf():
+            self._pdf_bar.grid_remove()
+            return
+
+        self._pdf_bar.grid()
+        count = self._pdf_page_count
+        total = str(count) if count else "?"
+        self._pdf_page_var.set(f"第 {self._pdf_page + 1} 页 / 共 {total} 页")
+        self._pdf_prev_btn.configure(
+            state="normal" if (not count or self._pdf_page > 0) else "disabled"
+        )
+        self._pdf_next_btn.configure(
+            state="normal" if (not count or self._pdf_page < count - 1) else "disabled"
+        )
+        # 回填当前页；正在输入时不打断用户
+        try:
+            editing = self.focus_get() is self._pdf_jump_entry
+        except Exception:
+            editing = False
+        if not editing:
+            self._pdf_jump_entry.delete(0, "end")
+            self._pdf_jump_entry.insert(0, str(self._pdf_page + 1))
 
     # ==================== 内部 ====================
 
@@ -304,12 +422,12 @@ class PreviewCanvas(ctk.CTkFrame):
 
         t = threading.Thread(
             target=self._render_in_background,
-            args=(gen, path, config),
+            args=(gen, path, config, self._pdf_page),
             daemon=True
         )
         t.start()
 
-    def _render_in_background(self, gen: int, path: str, config):
+    def _render_in_background(self, gen: int, path: str, config, pdf_page: int = 0):
         """后台线程：渲染水印，完成后通过 after 回主线程"""
         if gen != self._generation:
             return
@@ -317,15 +435,19 @@ class PreviewCanvas(ctk.CTkFrame):
         try:
             from src.watermark_engine import safe_open_image, apply_watermark
 
-            # PDF：渲染首页（预览与导出使用相同相对几何，所见即所得）
+            # PDF：渲染指定页（预览与导出使用相同相对几何，所见即所得）
             page_count = None
             if path.lower().endswith(".pdf"):
                 from src.pdf_engine import render_pdf_page, get_pdf_page_count
-                orig = render_pdf_page(path, page_num=0, scale=2.0)
                 try:
                     page_count = get_pdf_page_count(path)
                 except Exception:
                     page_count = None
+                if page_count:
+                    pdf_page = max(0, min(page_count - 1, pdf_page))
+                else:
+                    pdf_page = max(0, pdf_page)
+                orig = render_pdf_page(path, page_num=pdf_page, scale=2.0)
             else:
                 orig = safe_open_image(path)
             orig_size = orig.size
@@ -366,13 +488,17 @@ class PreviewCanvas(ctk.CTkFrame):
                 return
 
             # 回主线程显示
-            self.after(0, lambda: self._cache_and_display(display, orig_size, gen, page_count))
+            self.after(
+                0,
+                lambda: self._cache_and_display(display, orig_size, gen, page_count, pdf_page),
+            )
 
         except Exception as e:
             if gen == self._generation:
                 self.after(0, lambda: self._show_placeholder(f"预览出错: {e}"))
 
-    def _cache_and_display(self, display_img: Image.Image, orig_size, gen: int, page_count=None):
+    def _cache_and_display(self, display_img: Image.Image, orig_size, gen: int,
+                           page_count=None, pdf_page: int = 0):
         """主线程：缓存结果 + 应用缩放"""
         if gen != self._generation:
             return
@@ -380,9 +506,14 @@ class PreviewCanvas(ctk.CTkFrame):
         self._cached_render = display_img
         self._cached_orig_size = orig_size
         if page_count is not None:
+            # 回填页数并同步翻页栏（首帧渲染完成后按钮才有正确的可用状态）
+            self._pdf_page_count = page_count
+            self._pdf_page = pdf_page
             self.info_label.configure(
-                text=f"PDF {page_count} 页 | 首页: {orig_size[0]}x{orig_size[1]}"
+                text=f"PDF 共 {page_count} 页 | 第 {pdf_page + 1} 页: "
+                     f"{orig_size[0]}x{orig_size[1]}"
             )
+            self._update_pdf_bar()
         else:
             self.info_label.configure(text=f"原图: {orig_size[0]}x{orig_size[1]}")
         self._pan_offset = (0, 0)

@@ -136,7 +136,12 @@ class TestPdfWatermark:
             dst = os.path.join(tmpdir, "out.pdf")
             _create_test_pdf(src, pages=1)
 
-            cfg = WatermarkConfig(text="WATERMARK", font_ratio=0.12, opacity=100)
+            # 白底 + 默认白色水印本来就"看不见"（白字白底），
+            # 这里用红色断言水印确实被画到了页面上
+            cfg = WatermarkConfig(
+                text="WATERMARK", font_ratio=0.12,
+                color_rgba=(255, 0, 0, 255), opacity=100,
+            )
             apply_pdf_watermark(src, cfg, dst)
 
             # 渲染对比：加水印页应有显著差异

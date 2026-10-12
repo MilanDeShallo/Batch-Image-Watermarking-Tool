@@ -48,6 +48,7 @@ class WatermarkConfig:
     logo_tile: bool = False  # Logo 平铺
     logo_spacing_x: int = 100
     logo_spacing_y: int = 100
+    logo_stagger: bool = False  # Logo 平铺相邻行错位（v5 新增，面板早有此控件）
     logo_angle: float = 0.0
     logo_position: str = "bottom-right"
     logo_position_mode: str = "grid"  # "grid" | "custom"

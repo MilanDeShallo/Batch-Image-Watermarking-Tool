@@ -121,7 +121,9 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._color_btn.pack(side="left", padx=5)
         self._color_rgba: tuple = (255, 255, 255, 128)  # 默认白色半透明
 
-        ctk.CTkLabel(color_frame, text="透明度:").pack(side="left", padx=(15, 0))
+        # 语义澄清：滑块值就是 alpha（不透明度），不是"透明度"
+        # 0 = 完全看不见，100 = 完全不透明
+        ctk.CTkLabel(color_frame, text="不透明度:").pack(side="left", padx=(15, 0))
         self._opacity_label = ctk.CTkLabel(color_frame, text="50%", width=35)
         self._opacity_label.pack(side="right", padx=5)
 
@@ -133,6 +135,18 @@ class TextWatermarkPanel(ctk.CTkFrame):
             command=lambda v: self._on_opacity_changed(v),
         )
         self._opacity_slider.pack(side="left", fill="x", expand=True, padx=5)
+
+        # 透明度是最容易误解的控件：滑块值即 alpha（不透明度），
+        # 0 = 完全看不见。浅色底图配白色水印在 100% 时同样会"看不见"，
+        # 因此这里直接给出可见提示，避免反复试滑块
+        ctk.CTkLabel(
+            self,
+            text="0 = 完全透明（看不见），100 = 完全不透明；浅色底图请选深色水印",
+            text_color="gray",
+            font=("Microsoft YaHei", 9),
+            justify="left",
+            wraplength=260,
+        ).pack(anchor="w", padx=12, pady=(0, 2))
 
         # ---- 平铺模式 ----
         self._tile_var = ctk.BooleanVar(value=False)
@@ -441,13 +455,15 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._font_ratio_var.set(ratio)
         self._font_ratio_label.configure(text=f"{ratio:.1f}%")
 
-        # 颜色
+        # 颜色 + 不透明度
+        # 以 opacity 为准重建 color_rgba 的 alpha：历史预设里这两者可能各自独立，
+        # 若只回填滑块，会出现「滑块显示 80% 但渲染用的是 alpha=128」的错位
         self._color_rgba = getattr(cfg, 'color_rgba', (255, 255, 255, 128))
         r, g, b = self._color_rgba[:3]
         self._color_btn.configure(fg_color=f"#{r:02x}{g:02x}{b:02x}")
 
-        # 透明度
-        opacity = getattr(cfg, 'opacity', 50)
+        opacity = int(getattr(cfg, 'opacity', 50))
+        self._color_rgba = (r, g, b, max(0, min(255, int(opacity * 255 / 100))))
         self._opacity_var.set(opacity)
         self._opacity_label.configure(text=f"{opacity}%")
 

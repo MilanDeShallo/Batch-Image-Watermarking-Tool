@@ -212,6 +212,37 @@ def custom_anchor_position(
 # 平铺网格绘制
 # ============================================================
 
+# 判定「墨迹」的 alpha 阈值：低于此值视为透明（抗锯齿/插值边缘不计入尺寸）
+INK_ALPHA_THRESHOLD = 8
+
+
+def crop_to_ink(sprite: Image.Image, threshold: int = INK_ALPHA_THRESHOLD) -> Image.Image:
+    """
+    把精灵裁剪到实际可见内容的外框（去掉透明内边距）。
+
+    为什么必须裁：
+    - 文字精灵为容纳旋转后的四角、以及字体的 ascender/descender 空间，
+      四周存在大量透明边距。实测 4% 字号下水平浪费约 39%、垂直浪费 64%~71%
+    - 平铺步长 = 精灵尺寸 + 间距，透明边距会被算进「间距」里，
+      于是间距调到 1 仍然看着很稀；单次定位时也会让边距/坐标虚高
+    - 裁到墨迹外框后，间距与边距才等于用户眼睛看到的距离
+
+    保留 1px 安全边避免抗锯齿边缘被切掉；无墨迹时原样返回（不做任何裁切）。
+    """
+    alpha = sprite.getchannel("A")
+    bbox = alpha.point(lambda v: 255 if v >= threshold else 0).getbbox()
+    if not bbox:
+        return sprite
+
+    left = max(0, bbox[0] - 1)
+    top = max(0, bbox[1] - 1)
+    right = min(sprite.width, bbox[2] + 1)
+    bottom = min(sprite.height, bbox[3] + 1)
+    if (left, top, right, bottom) == (0, 0, sprite.width, sprite.height):
+        return sprite
+    return sprite.crop((left, top, right, bottom))
+
+
 def tile_grid(
     overlay: Image.Image,
     sprite: Image.Image,
@@ -224,8 +255,8 @@ def tile_grid(
 
     Args:
         overlay: 目标画布（RGBA 模式，会被就地修改）
-        sprite: 水印精灵图（需有 alpha 通道作为 mask）
-        spacing_x: 水平间距
+        sprite: 水印精灵图（应为 crop_to_ink 处理过的墨迹外框）
+        spacing_x: 水平间距（相邻水印可见边缘之间的距离）
         spacing_y: 垂直间距
         stagger: 是否相邻行错位（半间距偏移）
     """
@@ -239,7 +270,11 @@ def tile_grid(
     for y in range(-sprite.height, overlay.height + step_y, step_y):
         offset = (step_x // 2) if (row % 2 and stagger) else 0
         for x in range(-sprite.width + offset, overlay.width + step_x, step_x):
-            overlay.paste(sprite, (x, y), sprite)
+            # 必须用 alpha_composite，不能用 paste(sprite, pos, sprite)：
+            # 拿 RGBA 精灵当遮罩时，Pillow 会把遮罩同时乘到 RGB 和 alpha 上，
+            # 半透明水印的 alpha 被平方级削弱（实测 50% 不透明度只剩 1/4 浓度，
+            # 且 RGB 被预乘导致"越半透明越灰"），滑块中段几乎失效
+            overlay.alpha_composite(sprite, (x, y))
         row += 1
 
 
@@ -254,24 +289,30 @@ def _render_text_sprite(
     angle: float
 ) -> Image.Image:
     """
-    先在透明图层上渲染文字，再整体旋转，得到带角度的水印 sprite。
+    先在透明图层上渲染文字，再整体旋转，最后裁到墨迹外框。
 
     注意 bbox 负坐标处理：
     - 某些字体或含下沉字母(g/j/p/y)的文字，bbox[0] 或 bbox[1] 可能为负数
     - 绘制位置需用 (pad - bbox[0], pad - bbox[1]) 补偿
     - 画布尺寸也需相应调整
+
+    内边距为什么只留 2px：
+    - 旋转由 rotate(expand=True) 自动扩充画布，四角不会被裁掉；
+      旧实现额外按宽度 30% 留内边距，这些透明边距会被平铺步长吃掉
+      （实测水平浪费 39%、垂直浪费 64%~71%），
+      正是"间距调到 1 仍然很稀"的根因
+    - 2px 仅用于吸收双三次插值的振铃，随后 crop_to_ink 再裁一次
     """
     # 第一步：在 1x1 临时图上测量文字包围盒
     tmp = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     d = ImageDraw.Draw(tmp)
     bbox = d.multiline_textbbox((0, 0), text, font=font, align="center")
 
-    # 计算预留边距（用于旋转后不裁切）
-    pad = max(int((bbox[2] - bbox[0]) * 0.3), 20)
+    pad = 2  # 抗锯齿/插值安全边（旋转扩充由 expand=True 负责）
 
     # 创建实际尺寸的透明图层（Pillow 12.x bbox 返回 float，需转 int）
-    layer_w = int(bbox[2] - bbox[0]) + pad * 2
-    layer_h = int(bbox[3] - bbox[1]) + pad * 2
+    layer_w = max(1, int(bbox[2] - bbox[0]) + pad * 2)
+    layer_h = max(1, int(bbox[3] - bbox[1]) + pad * 2)
     layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
 
     # 在补偿后的位置绘制文字
@@ -288,7 +329,8 @@ def _render_text_sprite(
     if angle:
         layer = layer.rotate(angle, expand=True, resample=Image.BICUBIC)
 
-    return layer
+    # 裁到墨迹外框：间距与边距从此按"看得见的边缘"计算
+    return crop_to_ink(layer)
 
 
 def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
@@ -325,7 +367,8 @@ def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
             x, y = custom_anchor_position(base.size, sprite.size, cx, cy)
         else:
             x, y = anchor_position(base.size, sprite.size, cfg.position, cfg.margin)
-        overlay.paste(sprite, (x, y), sprite)
+        # alpha_composite 而非 paste(..., sprite)：见 tile_grid 中的说明
+        overlay.alpha_composite(sprite, (x, y))
 
     # Alpha 合成
     return Image.alpha_composite(base, overlay)
@@ -350,11 +393,14 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
     with Image.open(cfg.logo_path) as src_logo:
         src_logo.load()
         logo = src_logo.convert("RGBA")
+    # 先裁掉 Logo 自带的透明边框：这样 scale_ratio 对应"看得见的宽度"，
+    # 也能避免带留白的 Logo 把平铺间距撑大
+    logo = crop_to_ink(logo)
     target_w = max(16, int(base.width * cfg.scale_ratio))
-    target_h = int(logo.height * target_w / logo.width)
+    target_h = max(1, int(logo.height * target_w / logo.width))
     logo = logo.resize((target_w, target_h), Image.LANCZOS)
 
-    # 透明度调节（仅缩放 alpha 通道，保留原透明底）
+    # 不透明度调节（仅缩放 alpha 通道，保留原透明底）
     opacity_factor = cfg.logo_opacity / 100.0
     if opacity_factor < 1.0:
         alpha = logo.getchannel("A").point(lambda a: int(a * opacity_factor))
@@ -364,13 +410,18 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
     logo_angle = getattr(cfg, 'logo_angle', 0)
     if logo_angle:
         logo = logo.rotate(-logo_angle, expand=True, resample=Image.BICUBIC)
+        logo = crop_to_ink(logo)  # 旋转扩充出来的透明角同样要裁掉
 
     # 创建透明覆盖层
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
 
     if cfg.logo_tile:
-        # 平铺模式
-        tile_grid(overlay, logo, cfg.logo_spacing_x, cfg.logo_spacing_y)
+        # 平铺模式（支持交错排列 —— v5 之前该参数从未传给引擎）
+        tile_grid(
+            overlay, logo,
+            cfg.logo_spacing_x, cfg.logo_spacing_y,
+            getattr(cfg, 'logo_stagger', False),
+        )
     else:
         # 单次定位（支持九宫格 / 自定义坐标）
         pos_mode = getattr(cfg, 'logo_position_mode', 'grid')
@@ -380,7 +431,8 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
             x, y = custom_anchor_position(base.size, logo.size, cx, cy)
         else:
             x, y = anchor_position(base.size, logo.size, cfg.logo_position, cfg.logo_margin)
-        overlay.paste(logo, (x, y), logo)
+        # alpha_composite 而非 paste(..., logo)：见 tile_grid 中的说明
+        overlay.alpha_composite(logo, (x, y))
 
     return Image.alpha_composite(base, overlay)
 
