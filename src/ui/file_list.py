@@ -324,7 +324,13 @@ class FileList(ctk.CTkScrollableFrame):
                     from src.pdf_engine import render_pdf_page
                     img = render_pdf_page(path, page_num=0, scale=0.3)
                 else:
-                    img = Image.open(path)
+                    # 走引擎的安全打开，而不是 Image.open：
+                    # 1) 手机竖拍照片带 EXIF 方向，直接 open 会拿到未旋转的图，
+                    #    列表缩略图方向与预览/导出不一致；
+                    # 2) open() 返回惰性对象会一直占着文件句柄，Windows 下
+                    #    源文件无法改名/删除
+                    from src.watermark_engine import safe_open_image
+                    img = safe_open_image(path)
                 img.thumbnail((32, 32), Image.LANCZOS)
                 if img.mode != "RGBA":
                     img = img.convert("RGBA")

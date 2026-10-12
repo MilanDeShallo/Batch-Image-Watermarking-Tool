@@ -5,6 +5,9 @@
     单元测试各自都对，不代表"在窗口里点一遍"也是对的。
     作用范围三档、专属标记、翻页取值、PDF 输出与合并这些能力，
     胶水全在 AppWindow 里，只有把窗口真的建起来才能验证。
+    另外还覆盖两处"界面里点一遍才会暴露"的问题：
+      - 预览的工作分辨率与 scale 换算（决定预览与导出是否一致）
+      - 完成对话框不持有模态抓取（持有会让窗口最小化后唤不醒）
 
 安全约定：
     1. 窗口创建后立刻 withdraw + 全透明，不打扰正在用电脑的人
@@ -44,11 +47,13 @@ _mb.askyesno = lambda *a, **k: False  # 崩溃恢复一律选"不恢复"
 
 from PIL import Image  # noqa: E402
 from reportlab.pdfgen import canvas as rl_canvas  # noqa: E402
+import customtkinter as ctk  # noqa: E402
 
 from src.config import WatermarkConfig  # noqa: E402
 from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_PAGE  # noqa: E402
 from src.pdf_engine import (  # noqa: E402
     get_pdf_page_count,
+    pdf_page_reference_size,
     render_pdf_page,
 )
 from src.ui.app_window import AppWindow  # noqa: E402
@@ -452,6 +457,145 @@ def main():
         check("会话里的文件层保留了 B",
               B in (data.get("scopes", {}).get("files") or {}),
               list((data.get("scopes", {}).get("files") or {}).keys()))
+
+    # ---------- 预览：工作分辨率与 scale ----------
+    head("预览管线：工作分辨率与按比例渲染")
+    pc = app._preview_canvas
+
+    # 预览必须在缩小后的图上渲染（画布只有几百像素），同时把
+    # 「工作尺寸 / 导出尺寸」交给引擎换算间距与边距 —— 否则预览与导出不一致
+    big_path = os.path.join(src_dir, "big.jpg")
+    Image.new("RGB", (6000, 4000), (10, 40, 80)).save(big_path, quality=92)
+
+    work, ref, scale = pc._prepare_base(big_path, 0, 1200)
+    check("大图底图被缩到工作分辨率", max(work.size) <= 1200, work.size)
+    check("参考分辨率=原图像素尺寸", ref == (6000, 4000), ref)
+    check("scale=工作宽度/参考宽度", abs(scale - work.width / 6000) < 1e-6,
+          (scale, work.width))
+
+    work2, ref2, scale2 = pc._prepare_base(big_path, 0, 1200)
+    check("同一(路径,页,尺寸)命中底图缓存", work2 is work)
+
+    small_path = os.path.join(src_dir, "small.jpg")
+    Image.new("RGB", (640, 480), (10, 40, 80)).save(small_path, quality=92)
+    swork, sref, sscale = pc._prepare_base(small_path, 0, 1200)
+    check("小图不放大，scale=1.0", swork.size == (640, 480) and abs(sscale - 1.0) < 1e-9,
+          (swork.size, sscale))
+
+    pdf_ref = pdf_page_reference_size(C, 0)
+    pwork, pref, pscale = pc._prepare_base(C, 0, 800)
+    check("PDF 参考尺寸=覆盖层口径", pref == pdf_ref, (pref, pdf_ref))
+    check("PDF 工作尺寸<=目标", max(pwork.size) <= 800, pwork.size)
+    check("PDF scale=工作宽度/参考宽度", abs(pscale - pwork.width / pdf_ref[0]) < 1e-6,
+          (pscale, pwork.width, pdf_ref))
+
+    # ---------- 预览：缩放与拖动缓存 ----------
+    head("预览：缩放与拖动只重采样一次")
+    pc._cached_render = Image.new("RGB", (1600, 1200), (20, 20, 20))
+    pc._cached_orig_size = (6000, 4000)
+    pc._display_key = None
+    # 放大到 200%：隐藏窗口里画布只有 100px 见方，不放大就没有可拖动的余量
+    pc._zoom_var.set(2.0)
+    pc._apply_zoom(force=True)
+    key_after_zoom = pc._display_key
+    tk_before = pc._display_image_tk
+    check("缩放后生成了显示图",
+          tk_before is not None and pc._display_size[0] > 0, pc._display_size)
+    check("显示图大于画布（有可拖动余量）", pc._display_size[0] > 100, pc._display_size)
+
+    class _Ev:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    pc._on_pan_start(_Ev(10, 10))
+    pc._on_pan_motion(_Ev(60, 40))
+    pc._on_pan_end(_Ev(60, 40))
+    app.update()
+    check("拖动没有重新采样（显示图与缓存键未变）",
+          pc._display_key == key_after_zoom and pc._display_image_tk is tk_before,
+          (pc._display_key, key_after_zoom))
+    check("拖动确实移动了视图", pc._pan_offset != (0, 0), pc._pan_offset)
+
+    pc._zoom_timer = None
+    pc._last_zoom_apply = time.monotonic()   # 假装刚算过，触发节流分支
+    pc._on_zoom_slider(1.2)
+    pc._on_zoom_slider(1.3)
+    check("滑块连续回调被节流（未每帧重采样）", pc._zoom_timer is not None)
+    if pc._zoom_timer:
+        pc.after_cancel(pc._zoom_timer)
+        pc._zoom_timer = None
+    pc._cached_render = None
+    pc._show_placeholder("（冒烟测试结束预览）")
+
+    # ---------- 完成对话框与僵尸抓取 ----------
+    head("完成对话框：不持有模态抓取")
+    # 前面把弹窗换成了记录器，这里调用一次真实实现
+    AppWindow._show_completion_dialog(app, out_a, 3, 0)
+    app.update()
+    dlg = getattr(app, "_completion_dialog", None)
+    check("完成对话框已创建", dlg is not None and dlg.winfo_exists())
+    check("对话框没有 grab（最小化后不会吞掉输入）",
+          app.grab_current() is None, app.grab_current())
+
+    # 安全网：万一有不可见窗口抓着模态，主窗口重新出现时必须清掉它
+    zombie = ctk.CTkToplevel(app)
+    zombie.withdraw()
+    app.update()
+    zombie.grab_set()
+    app.update()
+    check("已构造出僵尸抓取（前置条件）", app.grab_current() is zombie)
+    app._release_stale_grab()
+    app.update()
+    check("安全网释放了不可见窗口的抓取", app.grab_current() is None,
+          app.grab_current())
+    try:
+        zombie.destroy()
+    except Exception:
+        pass
+
+    if dlg is not None:
+        app._close_completion_dialog(dlg)
+        app.update()
+        check("关闭后清掉单例引用",
+              getattr(app, "_completion_dialog", None) is None)
+
+    # ---------- 两个 Tab 合并成一份完整参数 ----------
+    head("水印类型由内容推导（切 Tab 不再丢另一种水印）")
+    app._scope = SCOPE_ALL   # 让后续提交只作用于全局默认，不污染文件/页层
+    logo_path = os.path.join(src_dir, "logo.png")
+    Image.new("RGBA", (200, 80), (255, 255, 255, 255)).save(logo_path)
+
+    app._text_panel.set_from_config(WatermarkConfig(watermark_type="text", text="文字"))
+    app._image_panel.set_from_config(
+        WatermarkConfig(watermark_type="image", logo_path=logo_path)
+    )
+    app.update()
+
+    app._settings_tabview.set("文字水印")
+    app.update()
+    cfg_text_tab = app._get_current_config()
+    check("文字 Tab 下类型=both（Logo 没被关掉）",
+          cfg_text_tab.watermark_type == "both", cfg_text_tab.watermark_type)
+
+    app._settings_tabview.set("图片水印")
+    app.update()
+    cfg_image_tab = app._get_current_config()
+    check("图片 Tab 下类型仍=both（切 Tab 不改变类型）",
+          cfg_image_tab.watermark_type == "both", cfg_image_tab.watermark_type)
+    check("完整参数同时含文字与 Logo",
+          cfg_image_tab.text == "文字" and cfg_image_tab.logo_path == logo_path,
+          (cfg_image_tab.text, cfg_image_tab.logo_path))
+
+    app._text_panel.set_from_config(WatermarkConfig(watermark_type="text", text=""))
+    app.update()
+    check("只有 Logo 没有文字时类型=image",
+          app._get_current_config().watermark_type == "image",
+          app._get_current_config().watermark_type)
+
+    # 复原，避免影响后续（如有）检查
+    app._image_panel.set_from_config(WatermarkConfig(watermark_type="image", logo_path=""))
+    app._text_panel.set_from_config(base_cfg)
+    app.update()
 
     # ---------- 收尾 ----------
     head("收尾")

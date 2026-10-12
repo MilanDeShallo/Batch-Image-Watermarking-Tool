@@ -178,9 +178,9 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         # --- 边距 ---
         margin_frame = ctk.CTkFrame(self, fg_color="transparent")
         margin_frame.grid(row=row, column=0, **grid_opts)
-        ctk.CTkLabel(margin_frame, text="边距 (%):").pack(side="left")
+        ctk.CTkLabel(margin_frame, text="边距 (px):").pack(side="left")
         self.margin_slider = ctk.CTkSlider(
-            margin_frame, from_=0, to=15, width=140,
+            margin_frame, from_=0, to=100, width=140,
             command=lambda v: self._update_label(self.margin_value_label, f"{int(v)}")
         )
         self.margin_slider.pack(side="left", padx=(8, 4))

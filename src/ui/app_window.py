@@ -74,6 +74,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # 内部状态
         self._cancel_requested = False
+        self._completion_dialog = None   # 完成对话框单例
 
         # 三层参数作用域：全局默认 / 本文件专属 / 本页专属
         self._scopes = ScopeStore()
@@ -330,6 +331,10 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 窗口关闭时保存布局
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
+        # 安全网：窗口重新出现或获得焦点时，清掉挂在不可见窗口上的僵尸抓取
+        self.bind("<Map>", self._release_stale_grab)
+        self.bind("<FocusIn>", self._release_stale_grab)
+
     def _schedule_layout_save(self, event=None):
         """防抖保存布局（500ms 后执行）"""
         if self._layout_save_timer:
@@ -341,6 +346,34 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._save_layout()
         self._clear_session()
         self.destroy()
+
+    def _release_stale_grab(self, event=None):
+        """
+        若模态抓取落在了一个不可见的窗口上，主动释放它。
+
+        为什么需要：抓取一旦挂到「已隐藏/已最小化」的窗口上，
+        Tk 会把应用的全部输入事件都送给那个看不见的窗口，
+        于是主窗口看着正常却完全点不动、从任务栏也唤不醒。
+        这里在窗口重新映射或获得焦点时兜底清理，避免任何一处
+        （包括第三方控件内部）留下这种状态。
+        """
+        try:
+            grabber = self.grab_current()
+        except Exception:
+            return
+        if grabber is None:
+            return
+        try:
+            alive = bool(grabber.winfo_exists())
+            visible = bool(grabber.winfo_viewable()) if alive else False
+        except Exception:
+            alive, visible = False, False
+        if alive and visible:
+            return
+        try:
+            grabber.grab_release()
+        except Exception:
+            pass
 
     # ============================================================
     # 崩溃恢复
@@ -574,29 +607,60 @@ class AppWindow(ctk.CTk, DnDWrapper):
     # 配置联动 / 三层参数作用域
     # ============================================================
 
-    def _active_panel(self):
-        """当前激活 Tab 对应的设置面板"""
-        current_tab = self._settings_tabview.get()
-        if current_tab == "文字水印":
-            return self._text_panel
-        if current_tab == "图片水印":
-            return self._image_panel
-        return None
+    def _full_panel_dict(self) -> dict | None:
+        """
+        读取「两个面板合起来」的完整参数字典。
 
-    def _panel_dict(self) -> dict | None:
-        """读取当前面板参数字典（含输入值校验与状态栏提示）"""
-        panel = self._active_panel()
-        if panel is None:
+        为什么必须合并，而不是只取当前 Tab：
+        1. 作用域存的是一份完整参数 —— ScopeStore.set_file/set_page 需要完整参数
+           才能算出"与上一层不同的字段"。只提交当前 Tab，会把另一个 Tab 刚设的
+           专属改动从该层挤掉；
+        2. watermark_type 必须由两个面板的实际内容推导，不能采纳"当前 Tab 的类型"。
+           两个面板各自固定返回 "text" / "image"，若直接采纳，用户在图片页配好
+           Logo 后切到文字页看一眼，类型就会被写成 text，Logo 被静默关掉
+           （预览和导出都会没有 Logo）。
+
+        :return: 完整参数字典；两个面板都读不到时返回 None
+        """
+        merged: dict = {}
+        found = False
+        for panel in (self._text_panel, self._image_panel):
+            try:
+                data = panel.get_config_dict()
+            except Exception as e:
+                print(f"[Panel Read Error] {e}")
+                continue
+            if not data:
+                continue
+            found = True
+            merged.update(data)
+            # 输入值被修正时在状态栏提示（越界夹取 / 非法回退）
+            notices = getattr(panel, 'last_notices', None)
+            if notices and hasattr(self, '_status_label'):
+                self._status_label.configure(text="；".join(notices))
+
+        if not found:
             return None
 
-        data = panel.get_config_dict()
+        merged["watermark_type"] = self._derived_watermark_type(merged)
+        return merged
 
-        # 输入值被修正时在状态栏提示（越界夹取 / 非法回退）
-        notices = getattr(panel, 'last_notices', None)
-        if notices and hasattr(self, '_status_label'):
-            self._status_label.configure(text="；".join(notices))
+    @staticmethod
+    def _derived_watermark_type(full: dict) -> str:
+        """
+        由面板内容推导水印类型（而不是"当前 Tab 是哪个"）。
 
-        return data
+        - 有文字 + 有 Logo → both
+        - 只有 Logo        → image（文字为空时不该把配好的 Logo 一起关掉）
+        - 其余             → text
+        """
+        text = str(full.get("text", "") or "").strip()
+        logo = str(full.get("logo_path", "") or "").strip()
+        if text and logo:
+            return "both"
+        if logo and not text:
+            return "image"
+        return "text"
 
     def _request_preview_refresh(self):
         """请求预览刷新（统一入口）+ 预设已修改检测 + 提交到当前作用层"""
@@ -614,10 +678,10 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._preview_canvas.request_refresh()
 
     def _commit_current_layer(self):
-        """把面板当前参数合并进「当前作用层」"""
+        """把面板当前参数（两个 Tab 合并）合并进「当前作用层」"""
         if self._syncing:
             return  # 回填面板期间不算用户编辑，否则会把继承值写死在该层
-        data = self._panel_dict()
+        data = self._full_panel_dict()
         if not data:
             return
 
@@ -653,18 +717,22 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
     def _get_current_config(self) -> WatermarkConfig | None:
         """
-        获取当前激活 Tab 对应的 WatermarkConfig
-        由 PreviewCanvas.on_config_changed 回调调用
+        获取当前生效的完整 WatermarkConfig（两个面板合并 + 底部栏输出参数）。
+
+        由 PreviewCanvas.on_config_changed 回调调用。这里必须与导出用的那份
+        参数同源（同样是"两个面板合并 + 三层作用域"），否则预览与导出会不一致。
         """
         try:
-            data = self._panel_dict()
+            data = self._full_panel_dict()
             if data is None:
                 return None
 
             # 补充底部栏的通用参数
-            data["output_format"] = self._format_var.get()
+            from src.batch_planner import normalize_format
+            data["output_format"] = normalize_format(self._format_var.get())
             data["jpeg_quality"] = self._quality_var.get()
             output_dir = self._output_dir_var.get().strip()
+
             if output_dir and os.path.isdir(output_dir):
                 data["output_dir"] = output_dir
 
@@ -677,13 +745,16 @@ class AppWindow(ctk.CTk, DnDWrapper):
         """
         把两个面板的初始状态登记为全局默认。
 
-        注意顺序：先图片面板后文字面板，让 watermark_type 落在默认 Tab（文字水印）上。
+        用合并后的完整参数整体替换，而不是分别合并两个面板：
+        分别合并时 watermark_type 会取"最后写入的那个面板"的类型，
+        与用户实际配置无关。
         """
-        for panel in (self._image_panel, self._text_panel):
-            try:
-                self._scopes.update_base(panel.get_config_dict())
-            except Exception as e:
-                print(f"[Scope Init Error] {e}")
+        try:
+            data = self._full_panel_dict()
+            if data:
+                self._scopes.set_base(data)
+        except Exception as e:
+            print(f"[Scope Init Error] {e}")
         self._refresh_scope_ui()
 
     # ---------- 作用范围：档位切换、面板回填与标记 ----------
@@ -1061,6 +1132,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._preview_canvas.clear_preview()
         # 文件都不在了，挂在它们身上的专属参数一并清掉
         self._scopes.clear_overrides()
+        # 档位也要回落：没有文件就没有"本文件/本页"，否则面板会停在
+        # 一个不存在的目标上，后续编辑会写入一个空路径的层
+        self._scope = SCOPE_ALL
         self._preview_canvas.set_pdf_marked_pages([])
         self._refresh_scope_marks()
         self._refresh_scope_ui()
@@ -1444,23 +1518,48 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         :param note: 可选补充说明，会替换默认的「成功 N 张 | 失败 M 张」那行
                      （合并模式用它来显示输出页数）
+
+        为什么不用模态抓取（grab_set）：
+        - CTkToplevel 在构造时为了刷新标题栏颜色，会先 withdraw() 自己、
+          再延迟 deiconify()。抓取如果落在"当前不可见"的窗口上，就会一直挂着；
+        - 主窗口最小化时子对话框被系统置为 withdrawn，而抓取仍在它身上，
+          此时应用的全部输入事件都会被吞掉 —— 表现就是窗口看着还在、
+          点任务栏也唤不醒（实测 grab_current 始终指向那个 withdrawn 的对话框）；
+        - 完成提示不需要阻塞操作，非模态反而更顺手（可以立刻改参数再跑一次）。
         """
         import subprocess
         import os
 
+        # 单例：连续导出时不要叠出一堆对话框
+        old = getattr(self, '_completion_dialog', None)
+        if old is not None:
+            try:
+                if old.winfo_exists():
+                    old.destroy()
+            except Exception:
+                pass
+            self._completion_dialog = None
+
         dialog = ctk.CTkToplevel(self)
+        self._completion_dialog = dialog
         dialog.title("处理完成")
         dialog.geometry("400x200")
         dialog.resizable(False, False)
-        # 模态对话框
         dialog.transient(self)
-        dialog.grab_set()
 
         # 居中显示
         dialog.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() // 2) - 200
         y = self.winfo_y() + (self.winfo_height() // 2) - 100
         dialog.geometry(f"+{x}+{y}")
+
+        # 没有抓取，就靠 lift 保证它不被主窗口挡在后面
+        dialog.lift()
+        dialog.after(80, dialog.lift)
+
+        # 标题栏关闭按钮与「关闭」按钮走同一条收尾路径
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_completion_dialog(dialog))
+        dialog.bind("<Destroy>", lambda e: self._forget_completion_dialog(e, dialog))
 
         # 内容
         ctk.CTkLabel(
@@ -1491,8 +1590,36 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         ctk.CTkButton(
             btn_frame, text="关闭", width=80,
-            command=dialog.destroy
+            command=lambda: self._close_completion_dialog(dialog)
         ).pack(side="left", padx=10)
+
+    def _close_completion_dialog(self, dialog):
+        """关闭完成对话框，并把焦点交回主窗口"""
+        # 主动释放可能存在的抓取：万一将来有人给它加了模态，
+        # 也不会留下"抓取挂在已销毁窗口上"的僵尸状态
+        try:
+            if self.grab_current() is dialog:
+                dialog.grab_release()
+        except Exception:
+            pass
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+        if getattr(self, '_completion_dialog', None) is dialog:
+            self._completion_dialog = None
+        try:
+            self.lift()
+            self.focus_set()
+        except Exception:
+            pass
+
+    def _forget_completion_dialog(self, event, dialog):
+        """对话框被销毁（含用户点标题栏 X）时清掉单例引用"""
+        if getattr(event, 'widget', None) is not dialog:
+            return
+        if getattr(self, '_completion_dialog', None) is dialog:
+            self._completion_dialog = None
 
 
 # ============================================================

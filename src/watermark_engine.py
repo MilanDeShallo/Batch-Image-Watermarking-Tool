@@ -39,6 +39,38 @@ SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif
 
 
 # ============================================================
+# 按比例渲染 — 预览与导出一致的关键
+# ============================================================
+# 水印参数分两类：
+#   1) 相对量：font_ratio（字号占短边比例）、scale_ratio（logo 占宽度比例）
+#      —— 天然随图尺寸等比缩放，任何分辨率下渲染都一致
+#   2) 绝对像素量：spacing_x/spacing_y、margin、logo_margin、logo_spacing_x/y
+#      —— 只在「导出分辨率」下才是用户看到的那个距离
+#
+# 预览为了流畅会把图缩小后再渲染。若不换算第 2 类参数，预览里的水印
+# 就会比真实导出更稀、离边更远（实测 6000px 图偏差 1.5 倍、8000px 偏 2 倍）。
+#
+# 约定：scale = 本次渲染分辨率 / 参考分辨率
+#       参考分辨率 = 导出时使用的那套尺寸（图片=原图像素，PDF=页面可视尺寸×倍率）
+#       scale = 1.0 表示按导出分辨率原样渲染，行为与历史版本完全一致
+MIN_FONT_PX = 12   # 字号下限（参考分辨率下）
+MIN_LOGO_PX = 16   # logo 宽度下限（参考分辨率下）
+
+
+def scaled_px(value, scale: float = 1.0) -> int:
+    """
+    把「参考分辨率下的像素量」换算成本次渲染分辨率下的像素量。
+
+    非数值输入回落到 0（由调用方的兜底逻辑处理），不抛异常 ——
+    引擎是批量处理的最后一环，不能因为单个参数异常就整批失败。
+    """
+    try:
+        return int(round(float(value) * float(scale)))
+    except (TypeError, ValueError):
+        return 0
+
+
+# ============================================================
 # 字体加载 — 四级回退链
 # ============================================================
 
@@ -366,11 +398,15 @@ def _render_text_sprite(
     return crop_to_ink(layer)
 
 
-def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
+def add_text_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Image:
     """
     为图片添加文字水印。
 
     v4 新增：空字符串/纯空格容错 —— 若 text 为空或纯空白，直接返回原图。
+
+    :param scale: 本次渲染分辨率 / 参考分辨率（导出分辨率）。
+                  平铺间距、边距、字号下限都按它换算，使预览与导出几何一致；
+                  scale=1.0 即导出，与历史行为完全一致。
     """
     # v4: 空字符串/纯空格容错
     if not cfg.text or not cfg.text.strip():
@@ -378,8 +414,11 @@ def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
 
     base = base.convert("RGBA")
 
-    # 计算字号（相对短边的百分比）
-    font_size = max(12, int(min(base.size) * cfg.font_ratio))
+    # 计算字号（相对短边的百分比）。
+    # 字号下限也按 scale 换算：否则预览缩小时字号会被 12px 下限顶住，
+    # 显示出的字号比导出大（ratio 很小时能差 3 倍以上）
+    font_floor = max(1, scaled_px(MIN_FONT_PX, scale))
+    font_size = max(font_floor, int(min(base.size) * cfg.font_ratio))
     font, is_warning = load_font_with_fallback(cfg.font_path or None, font_size)
 
     # 渲染文字 sprite
@@ -390,7 +429,11 @@ def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
 
     if cfg.tile:
         # 平铺模式
-        tile_grid(overlay, sprite, cfg.spacing_x, cfg.spacing_y, cfg.stagger)
+        tile_grid(
+            overlay, sprite,
+            scaled_px(cfg.spacing_x, scale), scaled_px(cfg.spacing_y, scale),
+            cfg.stagger,
+        )
     else:
         # 单次定位（支持九宫格 / 自定义坐标）
         pos_mode = getattr(cfg, 'position_mode', 'grid')
@@ -399,7 +442,9 @@ def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
             cy = getattr(cfg, 'custom_y', 50)
             x, y = custom_anchor_position(base.size, sprite.size, cx, cy)
         else:
-            x, y = anchor_position(base.size, sprite.size, cfg.position, cfg.margin)
+            x, y = anchor_position(
+                base.size, sprite.size, cfg.position, scaled_px(cfg.margin, scale)
+            )
         # alpha_composite 而非 paste(..., sprite)：见 tile_grid 中的说明
         overlay.alpha_composite(sprite, (x, y))
 
@@ -411,8 +456,13 @@ def add_text_watermark(base: Image.Image, cfg) -> Image.Image:
 # 图片/Logo 水印渲染
 # ============================================================
 
-def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
-    """为图片添加 Logo/图片水印"""
+def add_image_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Image:
+    """
+    为图片添加 Logo/图片水印
+
+    :param scale: 本次渲染分辨率 / 参考分辨率，见 add_text_watermark。
+                  logo 边距、平铺间距、宽度下限按它换算。
+    """
     import os
 
     # Logo 路径有效性检查
@@ -429,7 +479,7 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
     # 先裁掉 Logo 自带的透明边框：这样 scale_ratio 对应"看得见的宽度"，
     # 也能避免带留白的 Logo 把平铺间距撑大
     logo = crop_to_ink(logo)
-    target_w = max(16, int(base.width * cfg.scale_ratio))
+    target_w = max(max(1, scaled_px(MIN_LOGO_PX, scale)), int(base.width * cfg.scale_ratio))
     target_h = max(1, int(logo.height * target_w / logo.width))
     logo = logo.resize((target_w, target_h), Image.LANCZOS)
 
@@ -452,7 +502,7 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
         # 平铺模式（支持交错排列 —— v5 之前该参数从未传给引擎）
         tile_grid(
             overlay, logo,
-            cfg.logo_spacing_x, cfg.logo_spacing_y,
+            scaled_px(cfg.logo_spacing_x, scale), scaled_px(cfg.logo_spacing_y, scale),
             getattr(cfg, 'logo_stagger', False),
         )
     else:
@@ -463,7 +513,10 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
             cy = getattr(cfg, 'logo_custom_y', 50)
             x, y = custom_anchor_position(base.size, logo.size, cx, cy)
         else:
-            x, y = anchor_position(base.size, logo.size, cfg.logo_position, cfg.logo_margin)
+            x, y = anchor_position(
+                base.size, logo.size, cfg.logo_position,
+                scaled_px(cfg.logo_margin, scale),
+            )
         # alpha_composite 而非 paste(..., logo)：见 tile_grid 中的说明
         overlay.alpha_composite(logo, (x, y))
 
@@ -474,7 +527,7 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
 # 统一入口
 # ============================================================
 
-def apply_watermark(img: Image.Image, cfg) -> Image.Image:
+def apply_watermark(img: Image.Image, cfg, scale: float = 1.0) -> Image.Image:
     """
     统一水印应用入口。根据 cfg.watermark_type 分发到对应处理函数。
 
@@ -482,17 +535,22 @@ def apply_watermark(img: Image.Image, cfg) -> Image.Image:
     - "text": 仅文字水印
     - "image": 仅图片水印
     - "both": 同时应用两种水印（先文字后图片）
+
+    :param scale: 本次渲染分辨率 / 参考分辨率（导出分辨率）。
+                  预览在缩小图上渲染时传入它，绝对像素类参数（间距、边距、
+                  字号下限）会等比换算，于是预览与导出的几何完全一致。
+                  导出请保持默认 1.0。
     """
     result = img
 
     # 应用文字水印
     if cfg.watermark_type in ("text", "both"):
-        result = add_text_watermark(result, cfg)
+        result = add_text_watermark(result, cfg, scale)
 
     # 应用图片水印
     if cfg.watermark_type in ("image", "both"):
         if cfg.logo_path and os.path.isfile(cfg.logo_path):
-            result = add_image_watermark(result, cfg)
+            result = add_image_watermark(result, cfg, scale)
         # 若 logo_path 不存在且类型为 image，静默跳过（不报错）
 
     return result

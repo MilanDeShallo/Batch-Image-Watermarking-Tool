@@ -3,27 +3,44 @@
 
 特性：
 1. 后台线程渲染水印，主线程仅通过 after() 更新 UI
-2. 生成计数器丢弃过期结果
+2. 渲染「单飞」：同一时刻只有一个渲染线程，期间的请求合并成一次
 3. 缩放 25%-200%，Ctrl+滚轮，鼠标拖动查看
 4. 缩放只缩放缓存图，不重新渲染水印
 5. 窗口大小变化时自动重新适应
 6. 拖动范围限制（不能拖出视野）
-7. 缓存 1800px 分辨率，减少 200% 放大模糊
+7. 预览分辨率随画布自适应，并把缩放比例交给引擎，
+   使预览的几何与导出结果一致（见 watermark_engine.scaled_px）
+
+性能约定（改这里之前先看这段）
+------------------------------
+预览要"丝滑"，必须避免三类重复劳动，本文件对每一类都做了缓存：
+1. 解码：按 (路径, 页) 缓存解码+缩放后的底图，参数微调时不再重新解码
+   （一张 6000x4000 JPEG 解码 61ms + LANCZOS 缩到 4000px 252ms）
+2. 渲染：参数变化才重渲染；缩放/拖动只重采样已渲染好的缓存图
+3. 显示：显示图按 (画布尺寸, 缩放, 渲染版本) 缓存，拖动只移动画布项
+   （每次拖动事件重采样 1800px 图要 25ms，而事件频率约 60-100 次/秒）
+历史实现三者皆无，实测拖动一帧 35ms、参数微调一次刷新 500ms 以上，
+表现就是预览卡顿且拖不动。
 """
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
 import threading
+import time
 import os
 
 
 class PreviewCanvas(ctk.CTkFrame):
 
-    # 缓存图最大尺寸（提高到 1800 减少 200% 放大模糊）
-    RENDER_MAX_SIZE = (1800, 1800)
-    WORK_MAX_DIMENSION = 4000
+    # 工作分辨率 = 画布长边 × 该倍数（放大到 200% 仍有足够像素），再夹取到上下限。
+    # 直接在原图分辨率上渲染水印既慢又看不出差别：画布只有几百像素宽，
+    # 4000px 与 1600px 的渲染结果缩到画布上看不出区别，但耗时差 6 倍。
+    WORK_ZOOM_FACTOR = 2.0
+    WORK_MIN_DIM = 900
+    WORK_MAX_DIM = 1800
+
     DEBOUNCE_MS = 150
-    MAX_PIXELS_FOR_PREVIEW = 50_000_000
+    ZOOM_THROTTLE_MS = 50
 
     def __init__(self, parent, on_config_changed=None, on_page_changed=None, **kwargs):
         super().__init__(parent, **kwargs)
@@ -36,9 +53,30 @@ class PreviewCanvas(ctk.CTkFrame):
         self._debounce_timer = None
         self._generation = 0
 
-        # 缓存：已渲染的水印图（高分辨率）
+        # 缓存：已渲染的水印图
         self._cached_render: Image.Image | None = None
         self._cached_orig_size = (0, 0)
+
+        # 渲染单飞状态（只允许主线程读写）
+        self._render_busy = False
+        self._render_pending = False
+
+        # 底图缓存（解码+缩放后的渲染底图，供后台线程复用）
+        # ref = 参考分辨率（导出时用的尺寸）；scale = 工作尺寸 / 参考尺寸
+        self._base_lock = threading.Lock()
+        self._base_key = None
+        self._base_work: Image.Image | None = None
+        self._base_ref = (0, 0)
+        self._base_scale = 1.0
+        self._base_page_count = None   # PDF 总页数（随之缓存，避免重复解析）
+        self._base_page_index = 0      # 底图对应的页码（已夹到合法范围）
+
+        # 显示缓存：显示图只在 (画布尺寸, 缩放, 渲染版本) 变化时重采样
+        self._display_key = None
+        self._display_size = (0, 0)
+        self._render_token = 0
+        self._zoom_timer = None
+        self._last_zoom_apply = 0.0
 
         # PDF 翻页状态（仅 PDF 文件使用）
         self._pdf_page = 0            # 当前预览页码（0 起）
@@ -192,13 +230,37 @@ class PreviewCanvas(ctk.CTkFrame):
     # ==================== 缩放 ====================
 
     def _on_zoom_slider(self, value):
+        """滑块回调（拖动时高频触发）→ 节流后再重采样"""
         self._zoom_label_var.set(f"{int(value * 100)}%")
+        self._request_zoom_apply()
+
+    def _request_zoom_apply(self):
+        """
+        节流：第一次立即响应，之后的拖动合并到 ZOOM_THROTTLE_MS 后。
+
+        拖滑块时每个像素都会触发 command，若每帧都重采样 1800px 缓存图，
+        一次拖动就是几十次 20ms+ 的重采样，滑动条会明显跟手迟滞。
+        """
+        now = time.monotonic()
+        if self._zoom_timer is None:
+            if (now - self._last_zoom_apply) * 1000 >= self.ZOOM_THROTTLE_MS:
+                self._last_zoom_apply = now
+                self._apply_zoom()
+            else:
+                self._zoom_timer = self.after(
+                    self.ZOOM_THROTTLE_MS, self._zoom_timer_fire
+                )
+
+    def _zoom_timer_fire(self):
+        self._zoom_timer = None
+        self._last_zoom_apply = time.monotonic()
         self._apply_zoom()
 
     def _adjust_zoom(self, delta):
         new_val = max(0.25, min(2.0, self._zoom_var.get() + delta))
         self._zoom_var.set(new_val)
         self._zoom_label_var.set(f"{int(new_val * 100)}%")
+        self._last_zoom_apply = time.monotonic()
         self._apply_zoom()
 
     def _fit_to_window(self):
@@ -206,6 +268,7 @@ class PreviewCanvas(ctk.CTkFrame):
         self._zoom_var.set(1.0)
         self._zoom_label_var.set("100%")
         self._pan_offset = (0, 0)
+        self._last_zoom_apply = time.monotonic()
         self._apply_zoom()
 
     def _on_ctrl_scroll(self, event):
@@ -215,56 +278,81 @@ class PreviewCanvas(ctk.CTkFrame):
             self._adjust_zoom(-0.1)
 
     def _on_canvas_resize(self, event=None):
-        """Canvas 尺寸变化时重新适应（仅缩放显示，不重新渲染）"""
+        """Canvas 尺寸变化时重新适应（仅缩放显示，不重新渲染水印）"""
         if self._cached_render is not None:
             self._apply_zoom()
         else:
             self._center_placeholder()
 
-    def _apply_zoom(self):
-        """从缓存图按缩放比例显示"""
+    def _apply_zoom(self, force: bool = False):
+        """
+        从缓存图按缩放比例显示。
+
+        显示图按 (画布尺寸, 缩放, 渲染版本) 缓存：拖动时参数不变，
+        命中缓存后只做「移动画布项」，不再做任何图像重采样。
+        """
         if self._cached_render is None:
             return
 
-        zoom = self._zoom_var.get()
         cw = max(self._canvas.winfo_width(), 100)
         ch = max(self._canvas.winfo_height(), 100)
+        zoom = round(self._zoom_var.get(), 4)
 
-        # 先 fit 到画布尺寸
-        base = self._cached_render.copy()
-        base.thumbnail((cw, ch), Image.LANCZOS)
+        key = (cw, ch, zoom, self._render_token)
+        if force or key != self._display_key:
+            self._rebuild_display(cw, ch, zoom)
+            self._display_key = key
 
-        if zoom == 1.0:
+        self._draw_canvas_image()
+
+    def _rebuild_display(self, cw: int, ch: int, zoom: float):
+        """按「适应窗口 × zoom」重采样缓存图，并生成 Tk 图像对象"""
+        base = self._cached_render
+        if not base or base.width <= 0:
+            return
+
+        # 先 fit 到画布，再乘缩放：zoom=1.0 即"适应窗口"
+        fit = min(cw / base.width, ch / base.height)
+        total = fit * zoom
+        w = max(1, int(round(base.width * total)))
+        h = max(1, int(round(base.height * total)))
+
+        if (w, h) == base.size:
             display = base
+        elif total < 1.0:
+            display = base.resize((w, h), Image.LANCZOS)   # 缩小：LANCZOS 更锐利
         else:
-            new_w = max(1, int(base.width * zoom))
-            new_h = max(1, int(base.height * zoom))
-            display = base.resize((new_w, new_h), Image.LANCZOS)
+            display = base.resize((w, h), Image.BICUBIC)   # 放大：BICUBIC 更快且够用
 
         if display.mode != "RGB":
             display = display.convert("RGB")
 
         self._display_image_tk = ImageTk.PhotoImage(display)
-        self._draw_canvas_image(display.width, display.height, cw, ch)
+        self._display_size = (display.width, display.height)
 
-    def _draw_canvas_image(self, w, h, cw, ch):
-        """在 Canvas 上绘制图片，限制拖动范围"""
+        if self._cached_orig_size[0] > 0:
+            # 显示的是"适应窗口后的像素数"，不是原图分辨率 —— 别让用户误判清晰度
+            self.size_label.configure(
+                text=f"显示: {display.width}x{display.height} ({int(zoom * 100)}%)"
+            )
+
+    def _draw_canvas_image(self):
+        """把当前显示图放到 Canvas 上（只移动位置，不重采样）"""
+        w, h = self._display_size
+        if w <= 0 or h <= 0 or self._display_image_tk is None:
+            return
+
+        cw = max(self._canvas.winfo_width(), 100)
+        ch = max(self._canvas.winfo_height(), 100)
+
         self._canvas.itemconfig(self._placeholder_id, text="")
 
         if self._image_item is not None:
             self._canvas.delete(self._image_item)
 
         # 限制偏移范围（不能把图片拖出视野）
-        if w <= cw:
-            # 图片比画布小：居中，不允许水平偏移
-            max_dx = 0
-        else:
-            max_dx = (w - cw) // 2
-
-        if h <= ch:
-            max_dy = 0
-        else:
-            max_dy = (h - ch) // 2
+        max_dx = (w - cw) // 2 if w > cw else 0
+        max_dy = (h - ch) // 2 if h > ch else 0
 
         self._pan_offset = (
             max(-max_dx, min(max_dx, self._pan_offset[0])),
@@ -279,24 +367,26 @@ class PreviewCanvas(ctk.CTkFrame):
             x, y, anchor="nw", image=self._display_image_tk
         )
 
-        if self._cached_orig_size[0] > 0:
-            self.size_label.configure(
-                text=f"预览: {w}x{h} ({int(self._zoom_var.get() * 100)}%)"
-            )
-
     # ==================== 拖动 ====================
 
     def _on_pan_start(self, event):
         self._pan_start = (event.x, event.y)
 
     def _on_pan_motion(self, event):
+        """
+        拖动查看：只移动画布项，完全不碰图像数据。
+
+        拖动事件每秒 60-100 次，旧实现在这里调 _apply_zoom()，
+        每次都要复制 1800px 缓存图 + LANCZOS 重采样（实测 25ms/帧），
+        于是拖动既迟滞又掉帧。显示图已按缩放缓存，移动是零成本的。
+        """
         if self._pan_start is None or self._cached_render is None:
             return
         dx = event.x - self._pan_start[0]
         dy = event.y - self._pan_start[1]
         self._pan_offset = (self._pan_offset[0] + dx, self._pan_offset[1] + dy)
         self._pan_start = (event.x, event.y)
-        self._apply_zoom()
+        self._draw_canvas_image()
 
     def _on_pan_end(self, event):
         self._pan_start = None
@@ -315,9 +405,10 @@ class PreviewCanvas(ctk.CTkFrame):
             self._show_placeholder("图片不存在")
             return
         if image_path != self.current_image_path:
-            # 换文件时回到第 1 页；总页数等首次渲染完成后回填
+            # 换文件时回到第 1 页与居中视野；总页数等首次渲染完成后回填
             self._pdf_page = 0
             self._pdf_page_count = None
+            self._pan_offset = (0, 0)
         self.current_image_path = image_path
         self._update_pdf_bar()
         self._schedule_refresh()
@@ -329,10 +420,10 @@ class PreviewCanvas(ctk.CTkFrame):
 
     def clear_preview(self):
         self.current_image_path = None
-        self._cached_render = None
-        self._cached_orig_size = (0, 0)
+        self._invalidate_base()
         self._pdf_page = 0
         self._pdf_page_count = None
+        self._pan_offset = (0, 0)
         self._cancel_debounce()
         self._update_pdf_bar()
         self._show_placeholder("拖入图片后在此预览水印效果")
@@ -431,9 +522,10 @@ class PreviewCanvas(ctk.CTkFrame):
 
     # ==================== 内部 ====================
 
-    def _schedule_refresh(self):
+    def _schedule_refresh(self, immediate: bool = False):
         self._cancel_debounce()
-        self._debounce_timer = self.after(self.DEBOUNCE_MS, self._start_background_refresh)
+        delay = 0 if immediate else self.DEBOUNCE_MS
+        self._debounce_timer = self.after(delay, self._start_background_refresh)
 
     def _cancel_debounce(self):
         if self._debounce_timer:
@@ -443,10 +535,34 @@ class PreviewCanvas(ctk.CTkFrame):
                 pass
             self._debounce_timer = None
 
+    def _preview_work_dim(self) -> int:
+        """
+        预览工作分辨率（长边）。
+
+        以画布长边 × WORK_ZOOM_FACTOR 为基准：放大到 200% 时仍有足够像素，
+        再夹到 [WORK_MIN_DIM, WORK_MAX_DIM]。必须在主线程调用（要读控件尺寸）。
+        """
+        try:
+            side = max(self._canvas.winfo_width(), self._canvas.winfo_height(), 400)
+        except Exception:
+            side = 800
+        return int(max(self.WORK_MIN_DIM,
+                       min(self.WORK_MAX_DIM, side * self.WORK_ZOOM_FACTOR)))
+
     def _start_background_refresh(self):
-        """主线程：收集参数，启动后台线程"""
+        """
+        主线程：收集参数、算工作分辨率，启动后台渲染。
+
+        渲染「单飞」：已有渲染在跑时只登记一个待办标记。
+        旧实现每次参数变化都新起一个线程，拖一次滑块能堆十几个线程，
+        每个都在解码+缩放+渲染同一张图，CPU 被占满、预览越拖越卡。
+        """
+        self._debounce_timer = None
         self._generation += 1
-        gen = self._generation
+
+        if self._render_busy:
+            self._render_pending = True
+            return
 
         path = self.current_image_path
         if not path or not os.path.exists(path):
@@ -456,108 +572,159 @@ class PreviewCanvas(ctk.CTkFrame):
         if self.on_config_changed:
             config = self.on_config_changed()
 
-        t = threading.Thread(
+        self._render_busy = True
+        threading.Thread(
             target=self._render_in_background,
-            args=(gen, path, config, self._pdf_page),
+            args=(self._generation, path, config, self._pdf_page,
+                  self._preview_work_dim()),
             daemon=True
-        )
-        t.start()
+        ).start()
 
-    def _render_in_background(self, gen: int, path: str, config, pdf_page: int = 0):
-        """后台线程：渲染水印，完成后通过 after 回主线程"""
-        if gen != self._generation:
-            return
+    def _prepare_base(self, path: str, pdf_page: int, target_dim: int):
+        """
+        取（并缓存）渲染底图，返回 (工作图, 参考分辨率, scale)。
 
-        try:
-            from src.watermark_engine import safe_open_image, apply_watermark
+        参考分辨率 = 导出时使用的尺寸：
+        - 图片 → 原图像素尺寸
+        - PDF  → 页面可视尺寸 × OVERLAY_SCALE（覆盖层底图尺寸）
+        scale = 工作图宽度 / 参考宽度，交给引擎换算绝对像素类参数，
+        使预览与导出的水印几何一致。
+        """
+        key = (path, int(pdf_page), int(target_dim))
+        with self._base_lock:
+            if self._base_key == key and self._base_work is not None:
+                return self._base_work, self._base_ref, self._base_scale
 
-            # PDF：渲染指定页（预览与导出使用相同相对几何，所见即所得）
-            page_count = None
-            if path.lower().endswith(".pdf"):
-                from src.pdf_engine import render_pdf_page, get_pdf_page_count
-                try:
-                    page_count = get_pdf_page_count(path)
-                except Exception:
-                    page_count = None
-                if page_count:
-                    pdf_page = max(0, min(page_count - 1, pdf_page))
-                else:
-                    pdf_page = max(0, pdf_page)
-                orig = render_pdf_page(path, page_num=pdf_page, scale=2.0)
+        from src.watermark_engine import safe_open_image
+
+        page_count = None
+        if path.lower().endswith(".pdf"):
+            from src.pdf_engine import (
+                get_pdf_page_count, pdf_page_reference_size,
+                render_pdf_page, OVERLAY_SCALE,
+            )
+            try:
+                page_count = get_pdf_page_count(path)
+            except Exception:
+                page_count = None
+            if page_count:
+                pdf_page = max(0, min(page_count - 1, pdf_page))
             else:
-                orig = safe_open_image(path)
-            orig_size = orig.size
+                pdf_page = max(0, pdf_page)
+            ref_size = pdf_page_reference_size(path, pdf_page)
+            # 渲染倍率按参考尺寸折算：目标工作尺寸 ÷ 覆盖层底图尺寸 × 覆盖层倍率
+            render_scale = OVERLAY_SCALE * (target_dim / max(ref_size))
+            img = render_pdf_page(path, page_num=pdf_page, scale=render_scale)
+        else:
+            img = safe_open_image(path)
+            ref_size = img.size
 
-            pixels = orig.width * orig.height
-            if pixels > self.MAX_PIXELS_FOR_PREVIEW:
-                ratio = (self.MAX_PIXELS_FOR_PREVIEW / pixels) ** 0.5
-                orig = orig.resize(
-                    (int(orig.width * ratio), int(orig.height * ratio)),
-                    Image.LANCZOS
-                )
-
-            max_dim = max(orig.size)
-            if max_dim > self.WORK_MAX_DIMENSION:
-                ratio = self.WORK_MAX_DIMENSION / max_dim
-                work = orig.resize(
-                    (int(orig.width * ratio), int(orig.height * ratio)),
-                    Image.LANCZOS
-                )
-            else:
-                work = orig.copy()
-
-            if config is not None:
-                result = apply_watermark(work, config)
-            else:
-                result = work
-
-            # 缓存到高分辨率（1800px）
-            display = result.copy()
-            display.thumbnail(self.RENDER_MAX_SIZE, Image.LANCZOS)
-
-            if display.mode != "RGB":
-                display = display.convert("RGB")
-
-            del orig, work, result
-
-            if gen != self._generation:
-                return
-
-            # 回主线程显示
-            self.after(
-                0,
-                lambda: self._cache_and_display(display, orig_size, gen, page_count, pdf_page),
+        # 缩放到工作尺寸：这是省时间的关键，也是对 scale 的唯一来源
+        long_side = max(img.size)
+        if long_side > target_dim:
+            ratio = target_dim / long_side
+            img = img.resize(
+                (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                Image.LANCZOS
             )
 
-        except Exception as e:
-            if gen == self._generation:
-                self.after(0, lambda: self._show_placeholder(f"预览出错: {e}"))
+        scale = img.width / max(ref_size[0], 1)
 
-    def _cache_and_display(self, display_img: Image.Image, orig_size, gen: int,
+        with self._base_lock:
+            self._base_key = key
+            self._base_work = img
+            self._base_ref = ref_size
+            self._base_scale = scale
+            # 页数一并缓存：PDF 解析不便宜，别在每次参数微调时再解析一遍
+            self._base_page_count = page_count
+            self._base_page_index = pdf_page
+
+        return img, ref_size, scale
+
+    def _invalidate_base(self):
+        """丢弃底图缓存（换文件/清空时调用，避免大图常驻内存）"""
+        with self._base_lock:
+            self._base_key = None
+            self._base_work = None
+            self._base_ref = (0, 0)
+            self._base_scale = 1.0
+            self._base_page_count = None
+            self._base_page_index = 0
+
+    def _render_in_background(self, gen: int, path: str, config, pdf_page: int = 0,
+                              target_dim: int = 1200):
+        """后台线程：渲染水印，完成后通过 after 回主线程"""
+        payload = None
+        error = None
+        try:
+            from src.watermark_engine import apply_watermark
+
+            work, ref_size, scale = self._prepare_base(path, pdf_page, target_dim)
+
+            # 关键：把 scale 交给引擎，绝对像素类参数（间距/边距/字号下限）
+            # 会等比换算，于是预览与导出的几何完全一致
+            result = apply_watermark(work, config, scale) if config is not None else work
+
+            display = result if result.mode == "RGB" else result.convert("RGB")
+            # 页码/页数取底图缓存里记下的值（_prepare_base 已经把页码夹到合法范围）
+            page_count = self._base_page_count
+            pdf_page = self._base_page_index
+
+            payload = (display, ref_size, gen, page_count, pdf_page)
+        except Exception as e:
+            error = str(e)
+        finally:
+            # 无论成功、失败还是被新一轮请求取代，都必须回主线程收尾，
+            # 否则「单飞」标记会永远卡住，预览再也不刷新
+            self.after(0, lambda: self._on_render_done(gen, payload, error))
+
+    def _on_render_done(self, gen: int, payload, error):
+        """主线程：收尾 +（若期间又有请求）立刻补一次渲染"""
+        self._render_busy = False
+
+        if gen == self._generation:
+            if payload is not None:
+                display, ref_size, _gen, page_count, pdf_page = payload
+                self._cache_and_display(display, ref_size, gen, page_count, pdf_page)
+            elif error is not None:
+                self._show_placeholder(f"预览出错: {error}")
+
+        if self._render_pending or gen != self._generation:
+            self._render_pending = False
+            self._schedule_refresh(immediate=True)
+
+    def _cache_and_display(self, display_img: Image.Image, ref_size, gen: int,
                            page_count=None, pdf_page: int = 0):
         """主线程：缓存结果 + 应用缩放"""
         if gen != self._generation:
             return
 
         self._cached_render = display_img
-        self._cached_orig_size = orig_size
+        self._cached_orig_size = ref_size
+        self._render_token += 1      # 让显示图缓存失效
+        self._display_key = None
+
         if page_count is not None:
             # 回填页数并同步翻页栏（首帧渲染完成后按钮才有正确的可用状态）
             self._pdf_page_count = page_count
             self._pdf_page = pdf_page
             self.info_label.configure(
                 text=f"PDF 共 {page_count} 页 | 第 {pdf_page + 1} 页: "
-                     f"{orig_size[0]}x{orig_size[1]}"
+                     f"{ref_size[0]}x{ref_size[1]}"
             )
             self._update_pdf_bar()
         else:
-            self.info_label.configure(text=f"原图: {orig_size[0]}x{orig_size[1]}")
-        self._pan_offset = (0, 0)
-        self._apply_zoom()
+            self.info_label.configure(text=f"原图: {ref_size[0]}x{ref_size[1]}")
+        # 注意：这里不再重置 _pan_offset —— 微调参数时视图跳回中心很打断操作，
+        # 换文件时由 set_image() 重置
+        self._apply_zoom(force=True)
 
     def _show_placeholder(self, message: str):
         self._cached_render = None
         self._cached_orig_size = (0, 0)
+        self._display_key = None
+        self._display_size = (0, 0)
+        self._render_token += 1
         if self._image_item is not None:
             self._canvas.delete(self._image_item)
             self._image_item = None
@@ -570,4 +737,5 @@ class PreviewCanvas(ctk.CTkFrame):
     def destroy(self):
         self._cancel_debounce()
         self._generation += 1
+        self._invalidate_base()
         super().destroy()

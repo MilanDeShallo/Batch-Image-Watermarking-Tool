@@ -69,6 +69,22 @@ def get_pdf_page_count(pdf_path: str) -> int:
         doc.close()
 
 
+def pdf_page_reference_size(pdf_path: str, page_num: int = 0) -> tuple[int, int]:
+    """
+    该页在「导出分辨率」下的像素尺寸（即覆盖层底图尺寸）。
+
+    预览需要在缩小后的图上渲染水印，就必须知道这个口径才能把间距/边距
+    按同比例换算；否则预览里的水印会比导出结果更稀、离边更远。
+
+    :raises FileNotFoundError / ValueError: PDF 不存在、损坏、加密或不存在该页
+    """
+    reader = _open_reader(pdf_path)
+    if page_num < 0 or page_num >= len(reader.pages):
+        page_num = 0
+    media_w, media_h, rotate, _origin_x, _origin_y = _page_geometry(reader.pages[page_num])
+    return overlay_reference_size(media_w, media_h, rotate)
+
+
 # ============================================================
 # 覆盖层生成
 # ============================================================
@@ -103,6 +119,18 @@ def visual_size(media_w: float, media_h: float, rotate: int) -> tuple[float, flo
     if rotate in (90, 270):
         return media_h, media_w
     return media_w, media_h
+
+
+def overlay_reference_size(media_w: float, media_h: float, rotate: int) -> tuple[int, int]:
+    """
+    覆盖层底图的像素尺寸 —— 也就是该页的「导出分辨率」。
+
+    这是预览一致性的口径来源：预览渲染的图相对这个尺寸缩小了多少，
+    就要把同样的比例交给引擎去换算间距/边距（见 watermark_engine.scaled_px）。
+    覆盖层生成与预览参考尺寸都从这里取，避免两处算法漂移。
+    """
+    vis_w, vis_h = visual_size(media_w, media_h, rotate)
+    return max(1, int(vis_w * OVERLAY_SCALE)), max(1, int(vis_h * OVERLAY_SCALE))
 
 
 def _overlay_placement(media_w: float, media_h: float, rotate: int) -> tuple[float, float, int]:
@@ -152,9 +180,8 @@ def _make_overlay_pdf(
     # 水印按「显示方向」渲染：旋转页的可视尺寸与 MediaBox 正好相反
     vis_w, vis_h = visual_size(media_w, media_h, rotate)
 
-    # 1. 全透明底图（可视尺寸 × 渲染倍率）
-    img_w = max(1, int(vis_w * OVERLAY_SCALE))
-    img_h = max(1, int(vis_h * OVERLAY_SCALE))
+    # 1. 全透明底图（可视尺寸 × 渲染倍率，尺寸口径统一由 overlay_reference_size 定义）
+    img_w, img_h = overlay_reference_size(media_w, media_h, rotate)
     base = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
 
     # 2. 现有引擎渲染水印（相对几何与预览一致）
