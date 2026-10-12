@@ -29,8 +29,10 @@ from src.ui.file_list import FileList
 from src.ui.text_watermark_panel import TextWatermarkPanel
 from src.ui.image_watermark_panel import ImageWatermarkPanel
 from src.ui.preview_canvas import PreviewCanvas
-from src.file_manager import collect_files, is_image_file
+from src.ui.scope_selector import ScopeSelector
+from src.file_manager import collect_files, is_image_file, is_pdf_file
 from src.config import WatermarkConfig
+from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_PAGE, ScopeStore
 
 # 布局配置文件：存到用户 AppData 目录，与水印预设完全分离
 LAYOUT_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WatermarkTool", "ui_layout.json")
@@ -73,8 +75,18 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 内部状态
         self._cancel_requested = False
 
+        # 三层参数作用域：全局默认 / 本文件专属 / 本页专属
+        self._scopes = ScopeStore()
+        self._scope = SCOPE_ALL   # 当前正在编辑哪一层
+        self._syncing = False     # 面板回填期间暂停"提交到当前层"
+
         # 构建 UI
         self._build_ui()
+
+        # 把两个面板的初始状态登记为全局默认。
+        # 不做这一步的话，首次按作用域回填面板会用 WatermarkConfig 的默认值
+        # （text 为空）覆盖面板里的初始文字，预览会突然"没有水印"
+        self._init_scope_base()
 
         # 检测上次是否意外崩溃
         self.after(500, self._check_crash_recovery)
@@ -198,12 +210,25 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         self._preview_canvas = PreviewCanvas(
             center_frame, on_config_changed=self._get_current_config,
+            on_page_changed=self._on_preview_page_changed,
         )
         self._preview_canvas.pack(fill="both", expand=True, padx=4, pady=4)
 
         # ---- 右栏：水印设置区 ----
         right_frame = ctk.CTkFrame(self._hpaned)
         self._hpaned.add(right_frame, minsize=MIN_RIGHT, width=320)
+
+        # 作用范围：决定当前这套参数记到哪一层（全部文件 / 仅本文件 / 仅本页）
+        self._scope_selector = ScopeSelector(
+            right_frame,
+            on_scope_changed=self._on_scope_changed,
+            on_clear=self._on_clear_scope_override,
+        )
+        self._scope_selector.pack(fill="x", padx=8, pady=(8, 0))
+
+        ctk.CTkFrame(right_frame, height=1, fg_color=("gray70", "gray30")).pack(
+            fill="x", padx=10, pady=(8, 2)
+        )
 
         self._settings_tabview = ctk.CTkTabview(right_frame)
         self._settings_tabview.pack(fill="both", expand=True, padx=4, pady=4)
@@ -242,9 +267,19 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._format_var = ctk.StringVar(value="自动")
         self._format_menu = ctk.CTkOptionMenu(
             bottom_bar, variable=self._format_var,
-            values=["自动", "PNG", "JPEG"], width=80,
+            values=["自动", "PNG", "JPEG", "PDF"], width=80,
+            command=self._on_format_changed,
         )
         self._format_menu.pack(side="left", padx=2)
+
+        # 仅格式=PDF 时出现：把整批合成一个多页 PDF
+        self._merge_pdf_var = ctk.BooleanVar(value=False)
+        self._merge_pdf_cb = ctk.CTkCheckBox(
+            bottom_bar, text="合并为单个 PDF", variable=self._merge_pdf_var,
+            width=118, font=("Microsoft YaHei", 11),
+        )
+        self._merge_pdf_cb.pack(side="left", padx=(6, 2))
+        self._merge_pdf_cb.pack_forget()  # 非 PDF 格式时隐藏
 
         ctk.CTkLabel(bottom_bar, text="质量:").pack(side="left", padx=5)
         self._quality_var = ctk.IntVar(value=90)
@@ -256,7 +291,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._quality_value_label = ctk.CTkLabel(bottom_bar, text="90", width=25, font=("Microsoft YaHei", 11))
         self._quality_value_label.pack(side="left", padx=2)
         ctk.CTkLabel(
-            bottom_bar, text="(JPEG)", text_color="gray", font=("Microsoft YaHei", 9)
+            bottom_bar, text="(JPEG/PDF)", text_color="gray", font=("Microsoft YaHei", 9)
         ).pack(side="left", padx=2)
 
         ctk.CTkFrame(bottom_bar, width=1, fg_color=("gray70", "gray30")).pack(side="left", fill="y", padx=8)
@@ -357,6 +392,8 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 # 恢复格式和质量
                 fmt = session.get("format", "自动")
                 self._format_var.set(fmt)
+                self._on_format_changed(fmt)  # set() 不触发下拉回调，需手动同步
+                self._merge_pdf_var.set(bool(session.get("merge_pdf", False)))
                 quality = session.get("quality", 90)
                 self._quality_var.set(quality)
 
@@ -370,6 +407,22 @@ class AppWindow(ctk.CTk, DnDWrapper):
                     except Exception:
                         pass
 
+                # 恢复作用域数据（文件层 / 页层专属参数）
+                # 顺序必须在面板回填之后：没有存过作用域数据时，
+                # 需要把恢复后的面板状态重新登记为全局默认。
+                scopes_dict = session.get("scopes", {})
+                if scopes_dict:
+                    try:
+                        self._scopes = ScopeStore.from_dict(scopes_dict)
+                        self._scopes.prune(self._file_list.files)
+                    except Exception as e:
+                        print(f"[Scope Restore Error] {e}")
+                        self._init_scope_base()
+                else:
+                    self._init_scope_base()
+
+                self._refresh_scope_marks()
+                self._refresh_scope_ui()
                 self._status_label.configure(text="已恢复上次会话，可重新开始处理")
 
             # 无论是否恢复，都清除会话文件
@@ -389,7 +442,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 "config": config.to_dict() if config else {},
                 "output_dir": self._output_dir_var.get(),
                 "format": self._format_var.get(),
+                "merge_pdf": bool(self._merge_pdf_var.get()),
                 "quality": self._quality_var.get(),
+                "scopes": self._scopes.to_dict(),
             }
             os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
             with open(SESSION_FILE, 'w', encoding='utf-8') as f:
@@ -516,11 +571,35 @@ class AppWindow(ctk.CTk, DnDWrapper):
             pass
 
     # ============================================================
-    # 配置联动与预览刷新
+    # 配置联动 / 三层参数作用域
     # ============================================================
 
+    def _active_panel(self):
+        """当前激活 Tab 对应的设置面板"""
+        current_tab = self._settings_tabview.get()
+        if current_tab == "文字水印":
+            return self._text_panel
+        if current_tab == "图片水印":
+            return self._image_panel
+        return None
+
+    def _panel_dict(self) -> dict | None:
+        """读取当前面板参数字典（含输入值校验与状态栏提示）"""
+        panel = self._active_panel()
+        if panel is None:
+            return None
+
+        data = panel.get_config_dict()
+
+        # 输入值被修正时在状态栏提示（越界夹取 / 非法回退）
+        notices = getattr(panel, 'last_notices', None)
+        if notices and hasattr(self, '_status_label'):
+            self._status_label.configure(text="；".join(notices))
+
+        return data
+
     def _request_preview_refresh(self):
-        """请求预览刷新（统一入口）+ 预设已修改检测"""
+        """请求预览刷新（统一入口）+ 预设已修改检测 + 提交到当前作用层"""
         # 预设已修改检测
         if self._preset_just_loaded:
             # 预设加载后的首次刷新，不算"已修改"
@@ -529,7 +608,48 @@ class AppWindow(ctk.CTk, DnDWrapper):
             # 已加载预设后用户又改了参数 → 显示"已修改"
             self._preset_modified_label.pack(side="left", padx=2)
 
+        # 面板改动写入当前作用层（全部文件 / 本文件 / 本页）
+        self._commit_current_layer()
+
         self._preview_canvas.request_refresh()
+
+    def _commit_current_layer(self):
+        """把面板当前参数合并进「当前作用层」"""
+        if self._syncing:
+            return  # 回填面板期间不算用户编辑，否则会把继承值写死在该层
+        data = self._panel_dict()
+        if not data:
+            return
+
+        path = self._file_list.selected_file
+        try:
+            if self._scope == SCOPE_FILE and path:
+                # 用 set_file 而不是 update_file：面板提交的是完整参数，
+                # set_file 只记下与全局默认的差异，没动过的字段才能继续继承。
+                # 否则这一层会变成一份"当时的全局默认"旧快照，
+                # 用户之后修改全局默认时这个文件不跟着变
+                self._scopes.set_file(path, data)
+            elif self._scope == SCOPE_PAGE and path:
+                self._scopes.set_page(
+                    path, self._preview_canvas.current_pdf_page, data
+                )
+            else:
+                self._scopes.update_base(data)
+        except Exception as e:
+            print(f"[Scope Commit Error] {e}")
+            return
+
+        # 只刷新受影响的那一行：滑块拖动时每帧全量刷新会在上千文件时卡住
+        if path and self._scope in (SCOPE_FILE, SCOPE_PAGE):
+            try:
+                self._file_list.update_marker(path, self._scopes.marker_text(path))
+                if is_pdf_file(path):
+                    self._preview_canvas.set_pdf_marked_pages(
+                        self._scopes.page_numbers(path)
+                    )
+            except Exception:
+                pass
+        self._refresh_scope_ui()
 
     def _get_current_config(self) -> WatermarkConfig | None:
         """
@@ -537,20 +657,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
         由 PreviewCanvas.on_config_changed 回调调用
         """
         try:
-            current_tab = self._settings_tabview.get()
-            if current_tab == "文字水印":
-                panel = self._text_panel
-            elif current_tab == "图片水印":
-                panel = self._image_panel
-            else:
+            data = self._panel_dict()
+            if data is None:
                 return None
-
-            data = panel.get_config_dict()
-
-            # 输入值被修正时在状态栏提示（越界夹取 / 非法回退）
-            notices = getattr(panel, 'last_notices', None)
-            if notices and hasattr(self, '_status_label'):
-                self._status_label.configure(text="；".join(notices))
 
             # 补充底部栏的通用参数
             data["output_format"] = self._format_var.get()
@@ -563,6 +672,185 @@ class AppWindow(ctk.CTk, DnDWrapper):
         except Exception as e:
             print(f"[Config Error] {e}")
             return None
+
+    def _init_scope_base(self):
+        """
+        把两个面板的初始状态登记为全局默认。
+
+        注意顺序：先图片面板后文字面板，让 watermark_type 落在默认 Tab（文字水印）上。
+        """
+        for panel in (self._image_panel, self._text_panel):
+            try:
+                self._scopes.update_base(panel.get_config_dict())
+            except Exception as e:
+                print(f"[Scope Init Error] {e}")
+        self._refresh_scope_ui()
+
+    # ---------- 作用范围：档位切换、面板回填与标记 ----------
+
+    def _on_format_changed(self, choice: str):
+        """输出格式切换：仅 PDF 显示「合并为单个 PDF」开关"""
+        if choice == "PDF":
+            self._merge_pdf_cb.pack(side="left", padx=(6, 2))
+        else:
+            self._merge_pdf_cb.pack_forget()
+            self._merge_pdf_var.set(False)
+
+    def _on_scope_changed(self, scope: str):
+        """用户切换作用范围 → 面板回填该层的参数"""
+        self._scope = scope
+        self._sync_panels_to_target()
+
+    def _on_clear_scope_override(self):
+        """清除当前层的专属参数"""
+        path = self._file_list.selected_file
+        page = self._preview_canvas.current_pdf_page
+
+        cleared = False
+        if self._scope == SCOPE_PAGE and path:
+            cleared = self._scopes.clear_page(path, page)
+        elif self._scope == SCOPE_FILE and path:
+            cleared = self._scopes.clear_file(path)
+
+        if cleared:
+            self._status_label.configure(
+                text=f"已清除「{self._scope_selector.describe(self._scope)}」的专属参数"
+            )
+        else:
+            self._status_label.configure(text="当前层没有专属参数")
+
+        self._sync_panels_to_target()
+
+    def _on_preview_page_changed(self, page_index: int):
+        """预览翻页 → 面板切换到该页的专属参数"""
+        self._sync_panels_to_target()
+
+    def _is_pdf_selected(self) -> bool:
+        """当前选中的是否 PDF"""
+        path = self._file_list.selected_file
+        return bool(path) and is_pdf_file(path)
+
+    def _sync_panels_to_target(self):
+        """
+        把面板回填成「当前目标」生效的参数。
+
+        目标由作用范围决定：
+        - 全部文件 → 全局默认
+        - 仅本文件 → 当前选中文件
+        - 仅本页   → 当前选中 PDF 的当前页
+
+        回填期间用 _syncing 挡住「提交到作用层」，
+        否则 set_from_config 触发的回调会把继承来的整份参数写死在当前层。
+        """
+        path = self._file_list.selected_file
+        page = self._preview_canvas.current_pdf_page
+
+        # 目标不存在时自动降档，避免"面板显示全局、导出用专属"的错觉
+        if self._scope != SCOPE_ALL and not path:
+            self._scope = SCOPE_ALL
+        elif self._scope == SCOPE_PAGE and not self._is_pdf_selected():
+            self._scope = SCOPE_FILE if path else SCOPE_ALL
+        self._scope_selector.set_scope(self._scope)
+
+        if self._scope == SCOPE_ALL:
+            cfg = self._scopes.config_for(None)
+        else:
+            cfg = self._scopes.config_for(path, page)
+
+        self._syncing = True
+        try:
+            self._text_panel.set_from_config(cfg)
+            self._image_panel.set_from_config(cfg)
+        except Exception as e:
+            print(f"[Scope Sync Error] {e}")
+        finally:
+            self._syncing = False
+
+        self._refresh_scope_marks(path)
+        self._refresh_scope_ui()
+        self._preview_canvas.request_refresh()
+
+    def _refresh_scope_marks(self, path: str = None):
+        """
+        刷新专属标记。
+
+        - 传 path：只刷这一行（编辑时高频调用）
+        - 不传：整表刷新（增删文件、清空专属后调用）
+        """
+        try:
+            if path:
+                self._file_list.update_marker(path, self._scopes.marker_text(path))
+            else:
+                self._file_list.refresh_markers(self._scopes.markers())
+        except Exception:
+            pass
+
+        # 预览翻页栏的「专属页」提示
+        try:
+            current = path or self._file_list.selected_file
+            if current and is_pdf_file(current):
+                self._preview_canvas.set_pdf_marked_pages(
+                    self._scopes.page_numbers(current)
+                )
+            else:
+                self._preview_canvas.set_pdf_marked_pages([])
+        except Exception:
+            pass
+
+    def _refresh_scope_ui(self):
+        """刷新作用范围控件：可用状态、清除按钮、提示文案"""
+        path = self._file_list.selected_file
+        page = self._preview_canvas.current_pdf_page
+        is_pdf = self._is_pdf_selected()
+
+        self._scope_selector.set_page_enabled(is_pdf)
+        self._scope_selector.set_scope(self._scope)
+
+        has_override = False
+        if self._scope == SCOPE_PAGE and path:
+            has_override = self._scopes.has_page(path, page)
+        elif self._scope == SCOPE_FILE and path:
+            has_override = self._scopes.has_file(path)
+        self._scope_selector.set_clear_enabled(has_override)
+
+        def short(name, limit=16):
+            return name if len(name) <= limit else name[:limit - 1] + "…"
+
+        warn = False
+        if self._scope == SCOPE_PAGE and path:
+            text = f"当前：只作用于 {short(os.path.basename(path))} 第 {page + 1} 页"
+        elif self._scope == SCOPE_FILE and path:
+            text = f"当前：只作用于 {short(os.path.basename(path))}"
+        elif path and self._scopes.has_override(path):
+            text = (f"当前：全局默认。{short(os.path.basename(path))} 另有专属参数，"
+                    f"此处修改不影响它")
+            warn = True
+        else:
+            text = "当前：全局默认，所有文件共用"
+
+        if self._scope != SCOPE_ALL and not path:
+            text = "未选中文件，已回落到全局默认"
+            warn = True
+
+        self._scope_selector.set_hint(text, warn=warn)
+
+    # ---------- 导出用的参数解析 ----------
+
+    def _build_batch_plan(self, files: list):
+        """
+        把「当前界面设置 + 三层作用域」翻译成批处理计划。
+
+        真正的决策逻辑在 src/batch_planner.py（无 GUI 依赖，可被测试直接覆盖），
+        这里只负责把界面上的两个控件值喂进去。
+        """
+        from src.batch_planner import plan_batch
+
+        return plan_batch(
+            files,
+            self._scopes,
+            out_format=self._format_var.get(),
+            merge_pdf=bool(self._merge_pdf_var.get()),
+        )
 
     # ============================================================
     # 事件处理
@@ -763,18 +1051,39 @@ class AppWindow(ctk.CTk, DnDWrapper):
         from tkinter import messagebox
         if not messagebox.askyesno(
             "确认清空",
-            f"确定要清空全部 {self._file_list.count} 个文件吗？",
+            f"确定要清空全部 {self._file_list.count} 个文件吗？"
+            + self._overrides_clear_hint(),
             parent=self,
         ):
             return
         self._file_list.clear_all()
         self._update_count()
         self._preview_canvas.clear_preview()
+        # 文件都不在了，挂在它们身上的专属参数一并清掉
+        self._scopes.clear_overrides()
+        self._preview_canvas.set_pdf_marked_pages([])
+        self._refresh_scope_marks()
+        self._refresh_scope_ui()
 
     def _on_remove_selected(self):
         """删除选中项"""
         self._file_list.remove_selected()
         self._update_count()
+        self._prune_scopes()
+        self._sync_panels_to_target()
+
+    def _prune_scopes(self) -> int:
+        """丢弃已不在列表里的文件所带的专属参数"""
+        removed = self._scopes.prune(self._file_list.files)
+        self._refresh_scope_marks()
+        return removed
+
+    def _overrides_clear_hint(self) -> str:
+        """清空确认框里提示会连带清掉多少专属参数"""
+        count = len(self._scopes.override_paths())
+        if count:
+            return f"\n\n注意：其中 {count} 个文件带有专属参数，将一并清除"
+        return ""
 
     def _on_move_up(self):
         """上移选中项"""
@@ -786,13 +1095,24 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
     def _on_file_selected(self, path: str | None):
         """
-        文件选中变更回调 → 触发预览
+        文件选中变更回调 → 自动定位作用层、回填参数、刷新预览
         :param path: 选中的文件路径，None 表示无选中
         """
         if path and os.path.exists(path):
             self._preview_canvas.set_image(path)
+
+            # 该文件（或它的某一页）已有专属参数时，自动把作用范围切到那一层。
+            # 面板显示的必须是「这个文件真正会用的参数」，否则预览会与导出不一致
+            deepest = self._scopes.deepest_scope_for(
+                path, self._preview_canvas.current_pdf_page
+            )
+            if deepest and self._scope == SCOPE_ALL:
+                self._scope = deepest
+
+            self._sync_panels_to_target()
         else:
             self._preview_canvas.clear_preview()
+            self._refresh_scope_ui()
 
     def _browse_output_dir(self):
         """浏览选择输出目录"""
@@ -815,7 +1135,6 @@ class AppWindow(ctk.CTk, DnDWrapper):
         import threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from src.file_manager import generate_output_path, get_default_output_dir
-        from src.watermark_engine import safe_open_image, apply_watermark, save_with_format
 
         # 1. 前置检查
         files = self._file_list.files
@@ -855,9 +1174,12 @@ class AppWindow(ctk.CTk, DnDWrapper):
         except Exception:
             pass  # 检查失败不阻止处理
 
-        # 格式映射
-        fmt_map = {"自动": "auto", "PNG": "png", "JPEG": "jpeg"}
-        out_format = fmt_map.get(self._format_var.get(), "auto")
+        # 整批处理计划：每个文件的生效参数 + 输出格式 + 是否合并
+        # （决策逻辑见 src/batch_planner.py，可被测试直接覆盖）
+        plan = self._build_batch_plan(files)
+        specs = plan.tasks
+        out_format = plan.out_format
+        merge_pdf = plan.merge
         quality = self._quality_var.get()
 
         # 2. 更新 UI 状态
@@ -865,7 +1187,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._cancel_btn.configure(state="normal")
         self._progress_bar.pack()
         self._progress_bar.set(0)
-        self._status_label.configure(text="处理中...")
+        self._status_label.configure(text="合并中..." if merge_pdf else "处理中...")
 
         # 3. 动态线程池大小：基于文件大小调整，避免大图内存占满
         avg_size_mb = sum(os.path.getsize(f) for f in files if os.path.exists(f)) / max(len(files), 1) / (1024 * 1024)
@@ -877,45 +1199,87 @@ class AppWindow(ctk.CTk, DnDWrapper):
         else:
             num_workers = cpu_workers  # 小图全速
 
-        # 3.5 预生成所有输出路径（避免多线程竞争 + 重名检测）
-        # PDF 源文件强制输出 PDF 格式（PNG/JPEG 选项对其无效）
-        from src.file_manager import is_pdf_file
+        # 3.5 预生成输出路径（避免多线程竞争 + 重名检测）
+        # - 合并模式只有一个输出文件，用时间戳命名避免与逐文件结果撞名
         existing_names: set[str] = set()
         output_paths: list[str] = []
-        for i, src_path in enumerate(files):
-            src_format = "pdf" if is_pdf_file(src_path) else out_format
-            out_path = generate_output_path(
-                src_path, output_dir,
-                output_format=src_format,
-                seq_counter=i + 1,
-                existing_names=existing_names
-            )
-            output_paths.append(out_path)
+        merged_path = ""
+        if merge_pdf:
+            from src.file_manager import generate_merged_output_path
+            merged_path = generate_merged_output_path(output_dir, existing_names)
+        else:
+            for i, task in enumerate(specs):
+                out_path = generate_output_path(
+                    task.path, output_dir,
+                    output_format=task.output_format,
+                    seq_counter=i + 1,
+                    existing_names=existing_names
+                )
+                output_paths.append(out_path)
 
         # 4. 单个文件处理函数（在工作线程中执行）
+        #    具体的分支决策在 src/batch_planner.execute_task 里，这里只管调度与异常
         def _process_one(task):
             idx, src_path = task
             try:
-                output_path = output_paths[idx]
-
-                if is_pdf_file(src_path):
-                    # PDF：覆盖层合并（原内容保留，文字可选可搜）
-                    from src.pdf_engine import apply_pdf_watermark
-                    apply_pdf_watermark(src_path, config, output_path)
-                else:
-                    # 图片：Pillow 引擎
-                    img = safe_open_image(src_path)
-                    result = apply_watermark(img, config)
-                    save_with_format(result, output_path, quality)
-                    # 显式释放
-                    del img, result
-
+                from src.batch_planner import execute_task
+                execute_task(specs[idx], output_paths[idx], quality)
                 return (idx, True, None, os.path.basename(src_path))
             except Exception as e:
                 return (idx, False, str(e), os.path.basename(src_path))
 
+        # 4.5 合并模式：把所有输入按列表顺序拼成一个多页 PDF
+        #     图片一图一页，PDF 逐页并入；每个输入用各自的文件层/页层参数。
+        #     单线程顺序执行（合并本身是纯顺序 IO），进度与取消走回调。
+        def _merge_all():
+            from src.pdf_engine import MergeCancelled, build_merged_pdf
+
+            total = plan.count
+            start_time = time.time()
+
+            items = plan.merge_items()
+
+            # 进度节流：200ms
+            state = {"last": time.time()}
+
+            def _on_item(index, count, filename):
+                # build_merged_pdf 收尾时会再发一次 index == count 的通知，
+                # 此时不算进度（进度 100% 由 _on_done 统一设置）
+                if index >= count:
+                    return
+                now = time.time()
+                if (now - state["last"]) * 1000 >= 200 or index + 1 >= count:
+                    state["last"] = now
+                    progress = (index + 1) / max(count, 1)
+                    self.after(0, lambda p=progress, d=index + 1, fn=filename:
+                               self._update_progress(p, d, count, fn))
+
+            try:
+                pages = build_merged_pdf(
+                    items, merged_path,
+                    jpeg_quality=quality,
+                    progress=_on_item,
+                    should_cancel=lambda: self._cancel_requested,
+                )
+            except MergeCancelled:
+                # 用户取消：不写出任何文件
+                elapsed = time.time() - start_time
+                self.after(0, lambda: _on_done(0, 0, elapsed, None, True, 0))
+                return
+            except Exception as e:
+                elapsed = time.time() - start_time
+                self.after(0, lambda msg=str(e): _on_done(0, total, elapsed, msg, False, 0))
+                return
+
+            elapsed = time.time() - start_time
+            self.after(0, lambda: _on_done(total, 0, elapsed, None, False, pages))
+
         # 5. 调度器线程 — 提交任务 + 收集结果 + 更新 UI
         def _dispatcher():
+            if merge_pdf:
+                _merge_all()
+                return
+
             total = len(files)
             success_count = 0
             fail_count = 0
@@ -983,13 +1347,37 @@ class AppWindow(ctk.CTk, DnDWrapper):
             was_cancelled = self._cancel_requested
             self.after(0, lambda: _on_done(success_count, fail_count, elapsed, first_error, was_cancelled))
 
-        def _on_done(success, fail, elapsed, first_error, was_cancelled=False):
-            """处理完成回调（主线程）"""
+        def _on_done(success, fail, elapsed, first_error, was_cancelled=False, merged_pages=None):
+            """处理完成回调（主线程）
+
+            merged_pages 为 None 表示逐文件模式；
+            为整数（可为 0）表示合并模式的收尾，此时 success 记的是参与合并的输入数。
+            """
             self._start_btn.configure(state="normal")
             self._cancel_btn.configure(state="disabled")
             self._cancel_requested = False
             self._clear_session()  # 正常完成，清除会话
 
+            # ---------------- 合并模式收尾 ----------------
+            if merged_pages is not None:
+                if was_cancelled:
+                    self._status_label.configure(text=f"已取消合并 ({elapsed:.1f}s)")
+                    return
+                if first_error:
+                    self._status_label.configure(text=f"合并失败: {first_error}")
+                    self._show_message(f"合并失败：\n\n{first_error}")
+                    return
+                self._progress_bar.set(1)
+                self._status_label.configure(
+                    text=f"完成! 已合并 {success} 个输入共 {merged_pages} 页 ({elapsed:.1f}s)"
+                )
+                self._show_completion_dialog(
+                    output_dir, success, 0,
+                    note=f"输出 1 个 PDF，共 {merged_pages} 页",
+                )
+                return
+
+            # ---------------- 逐文件模式收尾 ----------------
             if was_cancelled:
                 self._status_label.configure(
                     text=f"已取消! 成功 {success} 张, 失败 {fail} 张 ({elapsed:.1f}s)"
@@ -1050,8 +1438,13 @@ class AppWindow(ctk.CTk, DnDWrapper):
         from tkinter import messagebox
         messagebox.showinfo("提示", message)
 
-    def _show_completion_dialog(self, output_dir: str, success: int, fail: int):
-        """显示完成对话框，包含"打开文件夹"按钮"""
+    def _show_completion_dialog(self, output_dir: str, success: int, fail: int,
+                                note: str = None):
+        """显示完成对话框，包含"打开文件夹"按钮
+
+        :param note: 可选补充说明，会替换默认的「成功 N 张 | 失败 M 张」那行
+                     （合并模式用它来显示输出页数）
+        """
         import subprocess
         import os
 
@@ -1076,9 +1469,10 @@ class AppWindow(ctk.CTk, DnDWrapper):
             font=ctk.CTkFont(size=18, weight="bold")
         ).pack(pady=(25, 10))
 
+        detail = note if note else f"成功: {success} 张  |  失败: {fail} 张"
         ctk.CTkLabel(
             dialog,
-            text=f"成功: {success} 张  |  失败: {fail} 张\n输出目录: {output_dir}",
+            text=f"{detail}\n输出目录: {output_dir}",
             font=ctk.CTkFont(size=12),
             text_color=("gray20", "gray80")
         ).pack(pady=5)

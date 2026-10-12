@@ -88,13 +88,45 @@
 |------|------|
 | 处理方式 | 覆盖层合并（**非**把页面转成图片），原文内容保留、文字仍可选可搜 |
 | 参数复用 | 文字 / Logo 的全部参数与图片完全一致，预览所见即所得 |
-| 页数显示 | 预览区显示 PDF 总页数与首页尺寸 |
+| 页数显示 | 预览区显示总页数与当前页尺寸，可上一页 / 下一页 / 跳到第 N 页逐页检查 |
 | 尺寸适配 | 按各页原始页面尺寸生成覆盖层，混合页面尺寸的 PDF 同样正确 |
-| 输出格式 | 强制输出为 `.pdf`，PNG / JPEG 格式选项对其无效 |
+| 旋转页 | `/Rotate 90/180/270` 的页面按显示方向渲染并反向写回，水印不被拉伸 |
+| 输出格式 | 强制输出为 `.pdf` |
 
 ### 8. 输入值安全校验
 
 所有数值输入（坐标百分比、间距、透明度、缩放、旋转角度）在进入引擎前统一校验：越界值自动夹取到合法区间、非法值回退默认值，并在状态栏提示修正结果，不会静默产生错误水印。
+
+### 9. 参数作用范围：不同文件、不同页可以用不同参数
+
+右侧面板顶部选择当前这套参数记到哪一层：
+
+| 作用范围 | 含义 |
+|----------|------|
+| 全部文件 | 作为**全局默认**，没单独设置过的文件/页都用它 |
+| 仅本文件 | 只记给列表里选中的这个文件（列表行亮起「专属」） |
+| 仅本页 | 只记给 PDF 当前预览页（翻页栏显示「专属页: 2, 5」） |
+
+导出时按 **页 > 文件 > 全局** 逐层查找：
+
+- **只记改动过的字段**：单独设置某文件后，没改过的字段仍跟随全局默认变化，不会被旧值冻住
+- **自动定位**：选中带专属参数的文件/页时，作用范围自动跳到那一层，面板显示的就是该文件真正会用的参数
+- **手动切回「全部文件」**编辑全局默认时，提示行会写明「本文件已有专属参数，当前修改不影响它」，避免误以为改了个寂寞
+- 「清除专属」删除当前层的专属参数，该文件/页回落到上一层
+
+### 10. 输出为 PDF
+
+输出格式下拉新增 **PDF**：
+
+| 选项 | 行为 |
+|------|------|
+| PDF（不勾选合并） | 每个输入产出一个 PDF：图片 → 单页 PDF（页面尺寸 = 像素 × 72/96，与图片同比例、不留白边）；PDF → 逐页加水印后输出 |
+| PDF + 勾选「合并为单个 PDF」 | 整批按列表顺序合成**一个多页 PDF**（一图一页），默认文件名形如 `合并水印_20261012_174500.pdf`；中途取消不会留下半成品文件 |
+
+每个输入都用**它自己那一层**的参数（文件层 / 页层），所以「A 打红字、B 打蓝字、C 的第 1 页不打」在合并输出里同样成立。
+
+图片放进 PDF 时的编码按**是否存在真实透明像素**选择：有透明像素走无损 PNG（保住 alpha），完全不透明走 JPEG 并应用底部栏的质量设置。
+注意判断依据是"真的有透明像素"而不是"有 alpha 通道" —— 加过水印的图片一律是 RGBA，只看通道会让质量设置彻底失效、体积还大得多。
 
 ---
 
@@ -102,10 +134,10 @@
 
 | 类型 | 输入扩展名 | 输出 |
 |------|-----------|------|
-| 图片 | `.jpg` `.jpeg` `.png` `.bmp` `.webp` `.tiff` `.tif` | 同输入格式，并支持 `auto` / `png` / `jpeg` 格式转换 |
+| 图片 | `.jpg` `.jpeg` `.png` `.bmp` `.webp` `.tiff` `.tif` | 同输入格式，并支持 `auto` / `png` / `jpeg` / `pdf` 格式转换 |
 | PDF | `.pdf` | 固定输出 `.pdf`（逐页叠加水印） |
 
-PDF 与图片可混合拖入同一批次，各自按对应引擎处理。
+PDF 与图片可混合拖入同一批次，各自按对应引擎处理；选择 `PDF` 输出时两者都可产出 PDF，也可整批合并成一个多页 PDF。
 
 ---
 
@@ -262,6 +294,94 @@ print(get_pdf_page_count("input.pdf"))
 ```
 
 `apply_pdf_watermark()` 对加密 PDF 会抛 `ValueError`；若 PDF 可用空密码解锁，则自动解密后处理。
+
+**逐页不同参数**：传 `page_configs={页码: WatermarkConfig}` 只对指定页使用另一套参数（页码 0 起，未列出的页仍用 `cfg`）：
+
+```python
+base = WatermarkConfig(text="内部资料", opacity=40)
+page_cfgs = {1: WatermarkConfig(text="样片", color_rgba=(255, 0, 0, 255), opacity=100)}
+
+apply_pdf_watermark("input.pdf", base, "output.pdf", page_configs=page_cfgs)
+```
+
+**图片 → PDF 与多合一**：
+
+```python
+from src.pdf_engine import build_merged_pdf, image_file_to_pdf_bytes
+
+data = image_file_to_pdf_bytes("photo.jpg", cfg, jpeg_quality=90)   # 单张图片 → 单页 PDF 字节
+
+# 多输入合并为一个多页 PDF（图片一图一页，PDF 逐页并入，顺序即页序）
+pages = build_merged_pdf(
+    [
+        {"path": "photo.jpg", "config": cfg},
+        {"path": "report.pdf", "config": cfg, "page_configs": {0: cfg}},
+    ],
+    "merged.pdf",
+    jpeg_quality=90,
+)
+```
+
+`build_merged_pdf()` 支持 `progress(index, total, filename)` 与 `should_cancel()` 回调；
+取消时抛 `MergeCancelled`，且**不会写出任何文件**（避免留下半成品）。
+
+### 参数作用域 API
+
+`src/overrides.py` 提供三层参数存储（无 GUI 依赖，GUI 与脚本共用同一套语义）：
+
+```python
+from src.overrides import ScopeStore
+
+store = ScopeStore()
+store.update_base({"text": "内部资料", "opacity": 50})   # 全局默认
+store.update_file("B.jpg", {"text": "样片"})             # B 的专属参数
+store.update_page("C.pdf", 2, {"opacity": 100})          # C 第 3 页的专属参数
+
+store.config_for("C.pdf", 2).text      # '内部资料' —— 页层没设 text，逐层继承
+store.config_for("C.pdf", 2).opacity   # 100        —— 被页层覆盖
+store.marker_text("C.pdf")             # '专属 第3页'
+```
+
+面板提交的是**完整参数**而不是小补丁，这种场景用 `set_file` / `set_page`：
+它们会自动与父层做差，只把真正不同的字段记下来。
+
+```python
+store.set_base({"text": "内部资料", "opacity": 50, "margin": 20})
+# 面板提交了一整份参数，其中只有 text 与全局不同
+store.set_file("B.jpg", {"text": "样片", "opacity": 50, "margin": 20})
+
+store.to_dict()["files"]["B.jpg"]   # {'text': '样片'} —— 只存了差异
+
+store.update_base({"opacity": 30})  # 之后再修改全局默认
+store.config_for("B.jpg").opacity   # 30 —— 没动过的字段跟着变，没被旧快照冻住
+```
+
+每层只保存**改动过的字段**，未改动的字段继续向上继承；输出类字段（输出目录、格式、质量、文件名模板）不进入作用域。
+
+`update_file` / `update_page` 保留为「按字段合并」语义，适合脚本里手写小补丁的场景。
+
+### 批处理 API
+
+`src/batch_planner.py` 把「文件列表 + 作用域参数 + 输出设置」翻译成可执行的任务清单，
+不含任何 GUI 代码，因此导出方案可以被测试直接覆盖：
+
+```python
+from src.batch_planner import plan_batch, execute_task
+
+plan = plan_batch(files, store, out_format="PDF", merge_pdf=True)
+plan.out_format        # 'pdf'
+plan.merge             # True
+plan.tasks[1].config   # 该文件真正生效的 WatermarkConfig
+plan.tasks[2].page_configs   # {页码: WatermarkConfig}，只含被单独设置过的页
+
+for task, out_path in zip(plan.tasks, output_paths):
+    execute_task(task, out_path, jpeg_quality=90)
+
+from src.pdf_engine import build_merged_pdf
+build_merged_pdf(plan.merge_items(), "merged.pdf", jpeg_quality=90)
+```
+
+`plan_batch` 的两条内置规则：PDF 源文件无论输出格式选什么都强制输出 PDF；`merge` 只在输出格式为 PDF 且显式勾选时才为真。
 
 ---
 
@@ -439,14 +559,21 @@ watermark_tool/
 ├── assets/                    # 资源目录
 ├── hooks/                     # PyInstaller hooks
 │   └── hook-tkinterdnd2.py
-├── tests/                     # 单元测试
+├── tests/                     # 测试
 │   ├── test_core.py           # 配置 / 路径 / 预设 / 引擎
 │   ├── test_pdf.py            # PDF 水印引擎
-│   └── test_validators.py     # 输入校验 / 句柄释放 / 平铺兜底
+│   ├── test_pdf_output.py     # 逐页参数 / 图片转 PDF / 多合一
+│   ├── test_overrides.py      # 三层参数作用域
+│   ├── test_batch_pipeline.py # 作用域 → 规划 → 实际写出 的端到端
+│   ├── test_render_geometry.py # 合成正确性 / 平铺步长 / 旋转页几何
+│   ├── test_validators.py     # 输入校验 / 句柄释放 / 平铺兜底
+│   └── smoke_gui.py           # 界面冒烟（独立脚本，不经 pytest 运行）
 └── src/
     ├── config.py              # WatermarkConfig 数据类 + JSON 序列化
     ├── watermark_engine.py    # 图片水印引擎（无 GUI 依赖）
-    ├── pdf_engine.py          # PDF 水印引擎（覆盖层合并）
+    ├── pdf_engine.py          # PDF 引擎（覆盖层合并 / 逐页参数 / 图片转 PDF / 多合一）
+    ├── overrides.py           # 三层参数作用域（无 GUI 依赖）
+    ├── batch_planner.py       # 批处理规划：任务清单 / 输出格式 / 是否合并（无 GUI 依赖）
     ├── validators.py          # 输入值校验与归一化（无 GUI 依赖）
     ├── file_manager.py        # 文件收集 / 去重 / 输出路径生成
     ├── preset_manager.py      # 预设管理器
@@ -454,19 +581,28 @@ watermark_tool/
     └── ui/
         ├── app_window.py          # 主窗口
         ├── drop_zone.py           # 拖拽区
-        ├── file_list.py           # 文件列表
+        ├── file_list.py           # 文件列表（含专属参数标记）
+        ├── scope_selector.py      # 作用范围选择器（全部/本文件/本页）
         ├── text_watermark_panel.py# 文字水印面板
         ├── image_watermark_panel.py# 图片水印面板
-        └── preview_canvas.py      # 预览画布
+        └── preview_canvas.py      # 预览画布（含 PDF 逐页检查）
 ```
 
 ### 运行测试
 
 ```bash
-python -m pytest tests/ -q
+python -m pytest tests/ -q          # 单元与集成测试（149 项）
+python tests/smoke_gui.py           # 界面冒烟（52 项检查，退出码 0 表示全过）
 ```
 
-测试覆盖配置序列化与版本迁移、输出路径与重名保护、预设增删改查、图片与 PDF 水印引擎、输入值校验、文件句柄释放、平铺步长兜底。
+测试覆盖配置序列化与版本迁移、输出路径与重名保护、预设增删改查、图片与 PDF 水印引擎、逐页参数与多合一输出、三层参数作用域、输入值校验、文件句柄释放、合成与平铺几何。
+
+界面冒烟会真的把主窗口装配起来跑一遍完整流程（加文件 → 设三档作用范围 → 专属标记 → 翻页取值 → 导出 PDF / 合并），
+专门验证只存在于 `AppWindow` 里的那层胶水 —— 单元测试各自都过，不代表串起来是对的：
+
+- 窗口创建后立刻隐藏、所有弹窗被替换成记录器，不打扰正在用电脑的人
+- `APPDATA` 指向系统临时目录，不读写用户真实的会话与窗口位置文件
+- 中间产物全部落在系统临时目录，不在仓库里留垃圾
 
 ---
 

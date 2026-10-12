@@ -168,6 +168,48 @@ def generate_output_path(
     return candidate
 
 
+def generate_merged_output_path(
+    output_dir: str,
+    existing_names: Optional[set[str]] = None,
+    prefix: str = "合并水印",
+) -> str:
+    """
+    合并输出（多合一 PDF）的文件路径。
+
+    合并结果没有"某一个原始文件名"可用，因此用固定前缀 + 时间戳命名：
+    既不会和逐文件输出撞名，也能一眼看出这是合并结果。
+
+    Args:
+        output_dir: 输出目录（空字符串时退回用户主目录）
+        existing_names: 已存在的输出文件名集合（同批内避免自撞）
+        prefix: 文件名前缀
+
+    Returns:
+        输出 PDF 的完整绝对路径
+    """
+    if not output_dir:
+        output_dir = os.path.expanduser("~")
+
+    now = datetime.now()
+    stem = f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}"
+
+    def _is_taken(path):
+        if existing_names and path in existing_names:
+            return True
+        return os.path.exists(path)
+
+    candidate = os.path.join(output_dir, f"{stem}.pdf")
+    counter = 1
+    while _is_taken(candidate):
+        candidate = os.path.join(output_dir, f"{stem}_{counter}.pdf")
+        counter += 1
+
+    if existing_names is not None:
+        existing_names.add(candidate)
+
+    return candidate
+
+
 def get_default_output_dir(src_files: list[str]) -> str:
     """
     获取默认输出目录。

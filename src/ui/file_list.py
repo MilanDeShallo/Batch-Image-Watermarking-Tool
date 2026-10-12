@@ -44,6 +44,8 @@ class FileList(ctk.CTkScrollableFrame):
         self._files: List[str] = []
         self._selected_index: int = -1
         self._row_widgets: dict[int, ctk.CTkFrame] = {}
+        # 行内的「专属参数」标记，按索引保存，便于只改文案不重建整行
+        self._marker_labels: dict[int, ctk.CTkLabel] = {}
 
         # 缩略图缓存
         self._thumb_cache: dict[str, ImageTk.PhotoImage] = {}
@@ -161,14 +163,43 @@ class FileList(ctk.CTkScrollableFrame):
         return True
 
     def select_by_index(self, index: int):
-        """程序化选中指定索引的行"""
-        if 0 <= index < len(self._files):
-            self._selected_index = index
-            self._highlight_row(index)
-            self.on_selection_changed(self._files[index])
-            # 滚动到可见区域
-            if index in self._row_widgets:
-                self._row_widgets[index].see()
+        """程序化选中指定索引的行（点击行、批量添加后定位都会走这里）"""
+        if not (0 <= index < len(self._files)):
+            return
+
+        self._selected_index = index
+        self._highlight_row(index)
+
+        # 先通知"选中变了"，再做滚动。
+        # 顺序很重要：滚动是锦上添花，不能让它的任何问题吃掉选中回调
+        # （预览、参数面板、作用范围都挂在选中回调上）
+        self.on_selection_changed(self._files[index])
+        self._scroll_row_into_view(index)
+
+    def _scroll_row_into_view(self, index: int):
+        """
+        把指定行滚进可视区域（外层容器不可滚动时安静跳过）。
+
+        注意：行是 CTkFrame，不是 Listbox 的 item，没有 see() 方法。
+        历史实现直接调 row.see()，于是每次点击文件都抛 AttributeError；
+        更糟的是 on_press 里 select_by_index 之后的拖拽状态赋值
+        （_drag_start_y / _drag_source_idx）会被一起跳过，拖拽排序因此整体失效。
+        """
+        row = self._row_widgets.get(index)
+        if row is None:
+            return
+
+        widget = getattr(row, "master", None)
+        while widget is not None:
+            try:
+                if isinstance(widget, ctk.CTkScrollableFrame):
+                    canvas = widget._parent_canvas
+                    span = max(widget.winfo_height(), 1)
+                    canvas.yview_moveto(row.winfo_y() / span)
+                    return
+            except Exception:
+                return  # 滚动失败不应影响选中
+            widget = getattr(widget, "master", None)
 
     def _create_row_widget(self, index: int):
         """为指定索引创建一行 UI 组件"""
@@ -204,6 +235,14 @@ class FileList(ctk.CTkScrollableFrame):
         size_label = ctk.CTkLabel(row, text=size_str, width=70, anchor="e")
         size_label.pack(side="right", padx=8)
 
+        # 专属参数标记：该文件（或它的某几页）被单独设过参数时亮起
+        marker_label = ctk.CTkLabel(
+            row, text="", width=66, anchor="e",
+            text_color="#f59e0b", font=("Microsoft YaHei", 10),
+        )
+        marker_label.pack(side="right", padx=(0, 2))
+        self._marker_labels[index] = marker_label
+
         # 异步加载缩略图
         self._load_thumbnail_async(path, thumb_label)
 
@@ -233,7 +272,7 @@ class FileList(ctk.CTkScrollableFrame):
             self._is_dragging = False
             self._clear_drag_feedback()
 
-        for child in [row, num_label, thumb_label, name_label, size_label]:
+        for child in [row, num_label, thumb_label, name_label, size_label, marker_label]:
             child.bind("<Button-1>", on_press)
             child.bind("<B1-Motion>", on_motion)
             child.bind("<ButtonRelease-1>", on_release)
@@ -245,6 +284,7 @@ class FileList(ctk.CTkScrollableFrame):
         for widget in self._row_widgets.values():
             widget.destroy()
         self._row_widgets.clear()
+        self._marker_labels.clear()
 
         for i in range(len(self._files)):
             self._create_row_widget(i)
@@ -372,3 +412,29 @@ class FileList(ctk.CTkScrollableFrame):
         total_height = len(self._files) * self._height_per_row
         # 通过配置最小高度来影响 ScrollableFrame 的滚动范围
         self.configure(height=max(total_height + 10, 100))
+
+    # ==================== 专属参数标记 ====================
+
+    def update_marker(self, path: str, text: str):
+        """更新单个文件的专属标记（只改文案，不重建行，便于编辑时高频调用）"""
+        for idx, p in enumerate(self._files):
+            if p == path:
+                label = self._marker_labels.get(idx)
+                if label is not None:
+                    try:
+                        label.configure(text=text or "")
+                    except Exception:
+                        pass  # 行已被销毁重建
+                return
+
+    def refresh_markers(self, texts: dict):
+        """按 {路径: 文案} 刷新全部标记（增删文件、清空专属后调用）"""
+        texts = texts or {}
+        for idx, p in enumerate(self._files):
+            label = self._marker_labels.get(idx)
+            if label is None:
+                continue
+            try:
+                label.configure(text=texts.get(p, "") or "")
+            except Exception:
+                pass

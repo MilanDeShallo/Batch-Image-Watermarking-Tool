@@ -25,10 +25,12 @@ class PreviewCanvas(ctk.CTkFrame):
     DEBOUNCE_MS = 150
     MAX_PIXELS_FOR_PREVIEW = 50_000_000
 
-    def __init__(self, parent, on_config_changed=None, **kwargs):
+    def __init__(self, parent, on_config_changed=None, on_page_changed=None, **kwargs):
         super().__init__(parent, **kwargs)
 
         self.on_config_changed = on_config_changed
+        # 翻页回调：主窗口据此把面板切换到该页的专属参数
+        self.on_page_changed = on_page_changed
         self.current_image_path = None
         self._display_image_tk = None
         self._debounce_timer = None
@@ -41,6 +43,7 @@ class PreviewCanvas(ctk.CTkFrame):
         # PDF 翻页状态（仅 PDF 文件使用）
         self._pdf_page = 0            # 当前预览页码（0 起）
         self._pdf_page_count = None   # 总页数（首次渲染完成后回填）
+        self._pdf_marked: list[int] = []  # 有专属参数的页码（0 起），由主窗口回填
 
         # 缩放
         self._zoom_var = ctk.DoubleVar(value=1.0)
@@ -169,6 +172,13 @@ class PreviewCanvas(ctk.CTkFrame):
             self._pdf_bar, text="页（回车）", text_color="gray",
             font=("Microsoft YaHei", 10),
         ).pack(side="left", padx=(2, 4))
+
+        # 哪些页被单独设过参数（由主窗口回填，翻页时一眼可见）
+        self._pdf_marked_label = ctk.CTkLabel(
+            self._pdf_bar, text="", text_color="#f59e0b",
+            font=("Microsoft YaHei", 10),
+        )
+        self._pdf_marked_label.pack(side="left", padx=(12, 2))
 
     def _get_canvas_bg(self):
         """根据主题获取画布背景色"""
@@ -327,6 +337,29 @@ class PreviewCanvas(ctk.CTkFrame):
         self._update_pdf_bar()
         self._show_placeholder("拖入图片后在此预览水印效果")
 
+    @property
+    def current_pdf_page(self) -> int:
+        """当前预览页（0 起；非 PDF 时恒为 0）"""
+        return self._pdf_page
+
+    def set_pdf_marked_pages(self, pages) -> None:
+        """回填「哪些页被单独设过参数」，在翻页栏里显示"""
+        try:
+            self._pdf_marked = sorted({int(p) for p in (pages or [])})
+        except (TypeError, ValueError):
+            self._pdf_marked = []
+        self._update_pdf_marked_label()
+
+    def _update_pdf_marked_label(self):
+        if not self._pdf_marked:
+            self._pdf_marked_label.configure(text="")
+            return
+        shown = self._pdf_marked[:8]
+        text = "专属页: " + ", ".join(str(p + 1) for p in shown)
+        if len(self._pdf_marked) > len(shown):
+            text += f" …共 {len(self._pdf_marked)} 页"
+        self._pdf_marked_label.configure(text=text)
+
     # ==================== PDF 翻页 ====================
 
     def _is_pdf(self) -> bool:
@@ -366,6 +399,9 @@ class PreviewCanvas(ctk.CTkFrame):
 
         self._pdf_page = page_index
         self._update_pdf_bar()
+        # 通知主窗口：面板需要切换到这一页的专属参数
+        if self.on_page_changed:
+            self.on_page_changed(self._pdf_page)
         self._schedule_refresh()
 
     def _update_pdf_bar(self):

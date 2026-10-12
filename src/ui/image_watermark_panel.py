@@ -304,7 +304,11 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             # 禁用位置和边距
             for btn in self.pos_buttons:
                 btn.configure(state="disabled", fg_color="#44474e")
-            self.margin_widget.configure(state="disabled")
+            # 注意：要禁用真正可交互的滑块，而不是外层容器。
+            # CTkFrame 不支持 state 参数，对它 configure(state=...) 会抛
+            # ValueError；异常一旦抛出会中断整个 set_from_config，
+            # 表现为切换作用范围时图片面板只回填了一半
+            self.margin_slider.configure(state="disabled")
             # 也禁用自定义坐标
             self.custom_x_entry.configure(state="disabled")
             self.custom_y_entry.configure(state="disabled")
@@ -316,7 +320,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
                 btn.configure(state="normal")
             # 恢复当前选中的高亮
             self.pos_buttons[self.selected_position].configure(fg_color="#3b82f6")
-            self.margin_widget.configure(state="normal")
+            self.margin_slider.configure(state="normal")
             # 启用自定义坐标（根据当前模式）
             if hasattr(self, 'custom_x_entry'):
                 pos_mode = self.pos_mode_var.get() if hasattr(self, 'pos_mode_var') else "grid"
