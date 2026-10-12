@@ -539,11 +539,18 @@ class AppWindow(ctk.CTk, DnDWrapper):
         try:
             current_tab = self._settings_tabview.get()
             if current_tab == "文字水印":
-                data = self._text_panel.get_config_dict()
+                panel = self._text_panel
             elif current_tab == "图片水印":
-                data = self._image_panel.get_config_dict()
+                panel = self._image_panel
             else:
                 return None
+
+            data = panel.get_config_dict()
+
+            # 输入值被修正时在状态栏提示（越界夹取 / 非法回退）
+            notices = getattr(panel, 'last_notices', None)
+            if notices and hasattr(self, '_status_label'):
+                self._status_label.configure(text="；".join(notices))
 
             # 补充底部栏的通用参数
             data["output_format"] = self._format_var.get()
@@ -738,9 +745,11 @@ class AppWindow(ctk.CTk, DnDWrapper):
         from tkinter.filedialog import askopenfilenames
 
         files = askopenfilenames(
-            title="选择图片文件",
+            title="选择图片/PDF文件",
             filetypes=[
                 ("图片文件", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.tif"),
+                ("PDF 文件", "*.pdf"),
+                ("所有支持的格式", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.tif *.pdf"),
                 ("所有文件", "*.*"),
             ],
         )
@@ -869,29 +878,38 @@ class AppWindow(ctk.CTk, DnDWrapper):
             num_workers = cpu_workers  # 小图全速
 
         # 3.5 预生成所有输出路径（避免多线程竞争 + 重名检测）
+        # PDF 源文件强制输出 PDF 格式（PNG/JPEG 选项对其无效）
+        from src.file_manager import is_pdf_file
         existing_names: set[str] = set()
         output_paths: list[str] = []
         for i, src_path in enumerate(files):
+            src_format = "pdf" if is_pdf_file(src_path) else out_format
             out_path = generate_output_path(
                 src_path, output_dir,
-                output_format=out_format,
+                output_format=src_format,
                 seq_counter=i + 1,
                 existing_names=existing_names
             )
             output_paths.append(out_path)
 
-        # 4. 单张图片处理函数（在工作线程中执行）
+        # 4. 单个文件处理函数（在工作线程中执行）
         def _process_one(task):
             idx, src_path = task
             try:
-                img = safe_open_image(src_path)
-                result = apply_watermark(img, config)
-
                 output_path = output_paths[idx]
-                save_with_format(result, output_path, quality)
 
-                # 显式释放
-                del img, result
+                if is_pdf_file(src_path):
+                    # PDF：覆盖层合并（原内容保留，文字可选可搜）
+                    from src.pdf_engine import apply_pdf_watermark
+                    apply_pdf_watermark(src_path, config, output_path)
+                else:
+                    # 图片：Pillow 引擎
+                    img = safe_open_image(src_path)
+                    result = apply_watermark(img, config)
+                    save_with_format(result, output_path, quality)
+                    # 显式释放
+                    del img, result
+
                 return (idx, True, None, os.path.basename(src_path))
             except Exception as e:
                 return (idx, False, str(e), os.path.basename(src_path))

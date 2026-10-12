@@ -317,7 +317,17 @@ class PreviewCanvas(ctk.CTkFrame):
         try:
             from src.watermark_engine import safe_open_image, apply_watermark
 
-            orig = safe_open_image(path)
+            # PDF：渲染首页（预览与导出使用相同相对几何，所见即所得）
+            page_count = None
+            if path.lower().endswith(".pdf"):
+                from src.pdf_engine import render_pdf_page, get_pdf_page_count
+                orig = render_pdf_page(path, page_num=0, scale=2.0)
+                try:
+                    page_count = get_pdf_page_count(path)
+                except Exception:
+                    page_count = None
+            else:
+                orig = safe_open_image(path)
             orig_size = orig.size
 
             pixels = orig.width * orig.height
@@ -356,20 +366,25 @@ class PreviewCanvas(ctk.CTkFrame):
                 return
 
             # 回主线程显示
-            self.after(0, lambda: self._cache_and_display(display, orig_size, gen))
+            self.after(0, lambda: self._cache_and_display(display, orig_size, gen, page_count))
 
         except Exception as e:
             if gen == self._generation:
                 self.after(0, lambda: self._show_placeholder(f"预览出错: {e}"))
 
-    def _cache_and_display(self, display_img: Image.Image, orig_size, gen: int):
+    def _cache_and_display(self, display_img: Image.Image, orig_size, gen: int, page_count=None):
         """主线程：缓存结果 + 应用缩放"""
         if gen != self._generation:
             return
 
         self._cached_render = display_img
         self._cached_orig_size = orig_size
-        self.info_label.configure(text=f"原图: {orig_size[0]}x{orig_size[1]}")
+        if page_count is not None:
+            self.info_label.configure(
+                text=f"PDF {page_count} 页 | 首页: {orig_size[0]}x{orig_size[1]}"
+            )
+        else:
+            self.info_label.configure(text=f"原图: {orig_size[0]}x{orig_size[1]}")
         self._pan_offset = (0, 0)
         self._apply_zoom()
 

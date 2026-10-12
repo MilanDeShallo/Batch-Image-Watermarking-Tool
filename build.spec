@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec — 批量图片水印工具"""
+"""PyInstaller spec — 批量图片水印工具（图片 + PDF）"""
 
 import os
 import sys
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 block_cipher = None
 
@@ -12,6 +12,9 @@ ctk_datas = collect_data_files('customtkinter')
 
 # 收集 tkinterdnd2 数据文件（含 tkdnd Tcl 库）
 dnd_datas = collect_data_files('tkinterdnd2')
+
+# 收集 pypdfium2 的 PDFium 动态库（DLL）
+pdfium_binaries = collect_dynamic_libs('pypdfium2')
 
 # 合并所有数据文件
 all_datas = ctk_datas + dnd_datas
@@ -22,7 +25,7 @@ all_datas.append(('presets', 'presets'))
 a = Analysis(
     ['main.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=pdfium_binaries,
     datas=all_datas,
     hiddenimports=[
         'customtkinter',
@@ -30,6 +33,12 @@ a = Analysis(
         'tkinterdnd2.TkinterDnD',
         'PIL',
         'PIL._tkinter_finder',
+        # PDF 支持三件套
+        'reportlab',
+        'reportlab.pdfgen.canvas',
+        'reportlab.lib.utils',
+        'pypdf',
+        'pypdfium2',
     ],
     hookspath=['hooks'],
     hooksconfig={},

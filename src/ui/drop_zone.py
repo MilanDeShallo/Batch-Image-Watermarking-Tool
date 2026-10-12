@@ -37,8 +37,8 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
     _HOVER_BORDER_WIDTH = 2
     _DEFAULT_TEXT_COLOR = ("gray50", "gray50")
     _HOVER_TEXT_COLOR = ("#3b82f6", "#60a5fa")
-    _DEFAULT_HINT = "将图片拖拽到这里\n或点击下方按钮添加"
-    _HOVER_HINT = "松开以添加图片"
+    _DEFAULT_HINT = "将图片或 PDF 拖拽到这里\n或点击下方按钮添加"
+    _HOVER_HINT = "松开以添加文件"
 
     def __init__(
         self,

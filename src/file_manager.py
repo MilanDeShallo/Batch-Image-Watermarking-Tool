@@ -15,8 +15,8 @@ import re
 from datetime import datetime
 from typing import Optional
 
-# 支持的图片扩展名（小写）
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+# 支持的文件扩展名（小写）— 图片 + PDF
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".pdf"}
 
 # 路径清洗正则
 _PATH_CLEAN_RE = re.compile(r'^[\'\"{\s]+|[\'\"}\s]+$')
@@ -28,9 +28,14 @@ def sanitize_path(raw: str) -> str:
 
 
 def is_image_file(path: str) -> bool:
-    """检查文件扩展名是否为支持的图片格式"""
+    """检查文件扩展名是否为支持的格式（图片或 PDF）"""
     ext = os.path.splitext(path)[1].lower()
     return ext in SUPPORTED_EXTENSIONS
+
+
+def is_pdf_file(path: str) -> bool:
+    """检查是否为 PDF 文件"""
+    return os.path.splitext(path)[1].lower() == ".pdf"
 
 
 def collect_files(
@@ -65,9 +70,9 @@ def collect_files(
             skipped.append((abs_path, "文件不存在"))
             continue
 
-        # 检查是否为图片
+        # 检查是否为支持的格式（图片/PDF）
         if not is_image_file(abs_path):
-            skipped.append((abs_path, "非图片格式"))
+            skipped.append((abs_path, "不支持的格式"))
             continue
 
         # 去重

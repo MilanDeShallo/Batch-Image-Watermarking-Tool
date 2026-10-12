@@ -79,21 +79,30 @@ def safe_open_image(path: str) -> Image.Image:
     1. ImageOps.exif_transpose() - 自动校正手机/相机竖拍照片的旋转方向
     2. 色彩空间归一化 - CMYK/P/La 等非标准模式转为 RGB
     3. 大图安全保障 - MAX_IMAGE_PIXELS 已在模块级设为 None
+
+    文件句柄释放（Windows 关键）：
+    - Image.open() 返回惰性对象并持有文件句柄，只有 load()/convert() 之后才释放
+    - 若在 open 与 load 之间抛异常，句柄会一直被占用，源图片无法重命名/删除
+    - 因此用 with 包住整个读取过程，并返回完全脱离文件的对象副本
     """
-    img = Image.open(path)
-    img.load()  # 强制加载像素数据，尽早发现损坏文件
+    with Image.open(path) as src:
+        src.load()  # 强制加载像素数据，尽早发现损坏文件
 
-    # 1. EXIF 方向自动校正
-    try:
-        img = ImageOps.exif_transpose(img)
-    except Exception:
-        pass  # 某��图片可能无 EXIF 数据或解析失败，忽略
+        # 1. EXIF 方向自动校正（返回脱离文件的新对象）
+        try:
+            detached = ImageOps.exif_transpose(src)
+        except Exception:
+            detached = None  # 某些图片可能无 EXIF 数据或解析失败，忽略
 
-    # 2. 色彩空间兼容：CMYK/P/La 等非标准模式统一转 RGB
-    if img.mode not in ("RGB", "RGBA", "L"):
-        img = img.convert("RGB")
+        # exif_transpose 未产生新对象时退化为副本，确保不持有句柄
+        if detached is None or detached is src:
+            detached = src.copy()
 
-    return img
+        # 2. 色彩空间兼容：CMYK/P/La 等非标准模式统一转 RGB
+        if detached.mode not in ("RGB", "RGBA", "L"):
+            detached = detached.convert("RGB")
+
+        return detached
 
 
 # ============================================================
@@ -220,8 +229,11 @@ def tile_grid(
         spacing_y: 垂直间距
         stagger: 是否相邻行错位（半间距偏移）
     """
-    step_x = sprite.width + spacing_x
-    step_y = sprite.height + spacing_y
+    # 步长兜底：sprite 尺寸 + 间距 有可能为 0 或负数
+    # 0 → range() 抛 ValueError；负数 → range() 返回空序列，水印静默消失
+    from src.validators import safe_step
+    step_x = safe_step(sprite.width, spacing_x)
+    step_y = safe_step(sprite.height, spacing_y)
     row = 0
 
     for y in range(-sprite.height, overlay.height + step_y, step_y):
@@ -334,7 +346,10 @@ def add_image_watermark(base: Image.Image, cfg) -> Image.Image:
     base = base.convert("RGBA")
 
     # 加载并缩放 Logo
-    logo = Image.open(cfg.logo_path).convert("RGBA")
+    # with 确保源文件句柄及时释放 —— Windows 下否则会导致 Logo 文件无法移动/删除
+    with Image.open(cfg.logo_path) as src_logo:
+        src_logo.load()
+        logo = src_logo.convert("RGBA")
     target_w = max(16, int(base.width * cfg.scale_ratio))
     target_h = int(logo.height * target_w / logo.width)
     logo = logo.resize((target_w, target_h), Image.LANCZOS)

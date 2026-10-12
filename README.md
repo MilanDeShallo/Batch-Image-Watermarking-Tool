@@ -1,6 +1,6 @@
 # 批量图片水印工具
 
-> 基于 Python + Pillow 的桌面端批量水印处理工具，面向图片版权保护与品牌标识场景。开箱即用，支持拖拽导入、批量处理、实时预览，可一键打包为 Windows 可执行文件。
+> 基于 Python + Pillow 的桌面端批量水印处理工具，面向图片与 PDF 的版权保护与品牌标识场景。开箱即用，支持拖拽导入、批量处理、实时预览，可一键打包为 Windows 可执行文件。
 
 <!--
 ## 界面预览
@@ -78,14 +78,32 @@
 
 水印配置可保存为 JSON 预设，支持版本迁移与 Logo 路径失效容错，常用参数一键复用。
 
+### 7. PDF 文件水印
+
+除图片外，同样支持给 **PDF 逐页加水印**。
+
+| 参数 | 说明 |
+|------|------|
+| 处理方式 | 覆盖层合并（**非**把页面转成图片），原文内容保留、文字仍可选可搜 |
+| 参数复用 | 文字 / Logo 的全部参数与图片完全一致，预览所见即所得 |
+| 页数显示 | 预览区显示 PDF 总页数与首页尺寸 |
+| 尺寸适配 | 按各页原始页面尺寸生成覆盖层，混合页面尺寸的 PDF 同样正确 |
+| 输出格式 | 强制输出为 `.pdf`，PNG / JPEG 格式选项对其无效 |
+
+### 8. 输入值安全校验
+
+所有数值输入（坐标百分比、间距、透明度、缩放、旋转角度）在进入引擎前统一校验：越界值自动夹取到合法区间、非法值回退默认值，并在状态栏提示修正结果，不会静默产生错误水印。
+
 ---
 
 ## 支持格式
 
-| 类型 | 扩展名 |
-|------|--------|
-| 输入 | `.jpg` `.jpeg` `.png` `.bmp` `.webp` `.tiff` `.tif` |
-| 输出 | 同输入，并支持 `auto` / `png` / `jpeg` 格式转换 |
+| 类型 | 输入扩展名 | 输出 |
+|------|-----------|------|
+| 图片 | `.jpg` `.jpeg` `.png` `.bmp` `.webp` `.tiff` `.tif` | 同输入格式，并支持 `auto` / `png` / `jpeg` 格式转换 |
+| PDF | `.pdf` | 固定输出 `.pdf`（逐页叠加水印） |
+
+PDF 与图片可混合拖入同一批次，各自按对应引擎处理。
 
 ---
 
@@ -125,10 +143,16 @@ pip install -r requirements.txt
 pillow>=12.3.0
 customtkinter>=5.2.2
 tkinterdnd2>=0.6.2
+reportlab>=4.0.0      # PDF 覆盖层生成
+pypdf>=4.0.0          # PDF 逐页合并
+pypdfium2>=4.30.0     # PDF 预览渲染
 pyinstaller>=6.21.0
 ```
 
 > `pyinstaller` 仅打包时需要，运行时可省略。
+> `reportlab` / `pypdf` / `pypdfium2` 仅为 PDF 功能所需；若只用图片水印，可不安装。
+
+已验证版本组合：Pillow 12.3.0、customtkinter 6.0.0、tkinterdnd2 0.6.2、reportlab 5.0.1、pypdf 6.16.2、pypdfium2 5.13.0、PyInstaller 6.21.0（Python 3.14）。
 
 ### 启动
 
@@ -164,7 +188,7 @@ python -m PyInstaller build.spec --noconfirm
 - 主程序：`dist/WatermarkTool/批量图片水印工具.exe`
 - 将整个 `WatermarkTool` 文件夹分发给用户即可
 
-`build.spec` 已处理 CustomTkinter、tkinterdnd2 的数据文件收集与 `presets` 目录打包，无需额外配置。
+`build.spec` 已处理 CustomTkinter、tkinterdnd2 的数据文件收集、`presets` 目录打包，以及 PDF 所需的 `pypdfium2` 原生 DLL（`collect_dynamic_libs`）与 `reportlab` / `pypdf` 隐式导入，无需额外配置。
 
 ---
 
@@ -210,6 +234,32 @@ img = safe_open_image("input.jpg")
 result = apply_watermark(img, cfg)
 save_with_format(result, "output.jpg", jpeg_quality=90)
 ```
+
+### PDF 引擎 API
+
+PDF 使用独立入口 `apply_pdf_watermark()`，参数复用同一个 `WatermarkConfig`：
+
+```python
+from src.config import WatermarkConfig
+from src.pdf_engine import apply_pdf_watermark, render_pdf_page, get_pdf_page_count
+
+cfg = WatermarkConfig(
+    watermark_type="text",
+    text="内部资料",
+    angle=30,
+    tile=True,
+    spacing_x=200,
+    spacing_y=200,
+)
+
+pages = apply_pdf_watermark("input.pdf", cfg, "output.pdf")   # 返回处理页数
+print(f"已处理 {pages} 页")
+
+first_page = render_pdf_page("input.pdf", page_num=0, scale=2.0)   # 返回 PIL.Image
+print(get_pdf_page_count("input.pdf"))
+```
+
+`apply_pdf_watermark()` 对加密 PDF 会抛 `ValueError`；若 PDF 可用空密码解锁，则自动解密后处理。
 
 ---
 
@@ -317,6 +367,35 @@ PresetManager.delete_preset("品牌水印")
 4. **字体多级回退**：用户指定路径 → 微软雅黑 → 黑体 → Pillow 内置字体，任一可用即停止，避免缺字崩溃。
 5. **空字符串容错**：文字为空或纯空白时直接返回原图，不报错。
 6. **路径清洗**：自动清除 Windows 拖拽传入的 `{}` 包裹与引号。
+7. **文件句柄释放**：所有图片读取路径使用 `with Image.open(...)` 并在加载后返回脱离文件的对象副本。若在打开与加载之间抛异常，句柄会被一直占用，导致源文件无法重命名 / 删除 —— 这在 Windows 上是常见故障。
+8. **输入值统一校验**：`src/validators.py` 对所有数值输入做解析与区间夹取（坐标百分比 0–100、间距 ≥ 1、透明度 0–100、缩放 1%–100%、旋转 -180°–180°），非法值回退默认值并在状态栏提示。同时兜底平铺步长，避免间距为 0 或负数时 `range()` 抛异常或静默返回空序列。
+
+### PDF 水印实现原理
+
+采用**覆盖层合并**方案，而非把 PDF 页面渲染成图片后再重新组卷 —— 后者会丢失文本可选中性与矢量清晰度。
+
+```
+Pillow 引擎在透明底图渲染水印 ──▶ 透明 PNG 覆盖层
+        │
+        ▼
+reportlab 包成与页面同尺寸的覆盖 PDF
+        │
+        ▼
+pypdf merge_page 逐页叠加到原 PDF（原内容保留）
+```
+
+- 覆盖层渲染倍率 `OVERLAY_SCALE = 2.0`（约 144 DPI），保证文字在 200% 缩放下依然清晰
+- 预览（`pypdfium2` 渲染首页 + Pillow 叠加）与导出（透明底图 + 同一 Pillow 引擎）使用相同的相对几何计算，所见即所得
+- 覆盖层按页面尺寸缓存，多页同尺寸时只生成一次
+
+**已知限制**
+
+| 限制 | 说明 |
+|------|------|
+| 覆盖层为整页位图 | A4 单页覆盖层约 1190×1684 RGBA，混合尺寸 PDF 会生成多份缓存，内存与输出体积会上升 |
+| 加密 PDF | 仅支持空密码（自动解密）；有密码的 PDF 会明确报错 |
+| 旋转页 | `/Rotate` 页面由渲染器自动应用旋转，覆盖层按未旋转的 `mediabox` 尺寸创建，可能产生拉伸，建议实测确认 |
+| 页级参数 | 目前对全部页面应用同一套参数，不支持按页指定 |
 
 ### 智能保存
 
@@ -357,9 +436,15 @@ watermark_tool/
 ├── assets/                    # 资源目录
 ├── hooks/                     # PyInstaller hooks
 │   └── hook-tkinterdnd2.py
+├── tests/                     # 单元测试
+│   ├── test_core.py           # 配置 / 路径 / 预设 / 引擎
+│   ├── test_pdf.py            # PDF 水印引擎
+│   └── test_validators.py     # 输入校验 / 句柄释放 / 平铺兜底
 └── src/
     ├── config.py              # WatermarkConfig 数据类 + JSON 序列化
-    ├── watermark_engine.py    # 水印引擎（无 GUI 依赖）
+    ├── watermark_engine.py    # 图片水印引擎（无 GUI 依赖）
+    ├── pdf_engine.py          # PDF 水印引擎（覆盖层合并）
+    ├── validators.py          # 输入值校验与归一化（无 GUI 依赖）
     ├── file_manager.py        # 文件收集 / 去重 / 输出路径生成
     ├── preset_manager.py      # 预设管理器
     ├── logger.py              # 日志系统（轮转）
@@ -371,6 +456,14 @@ watermark_tool/
         ├── image_watermark_panel.py# 图片水印面板
         └── preview_canvas.py      # 预览画布
 ```
+
+### 运行测试
+
+```bash
+python -m pytest tests/ -q
+```
+
+测试覆盖配置序列化与版本迁移、输出路径与重名保护、预设增删改查、图片与 PDF 水印引擎、输入值校验、文件句柄释放、平铺步长兜底。
 
 ---
 
@@ -391,10 +484,30 @@ A：`tkinterdnd2` 的 Tcl 库需正确打包，`build.spec` 已通过 `collect_d
 **Q：预设加载后 Logo 没了？**
 A：预设绑定的 Logo 路径失效时会被自动清空并提示，重新指定 Logo 路径即可。预设设计为可跨机器迁移，路径不作为强依赖。
 
+**Q：PDF 加水印后，原文还能复制文字吗？**
+A：可以。水印以覆盖层形式叠加，原页面内容与文字层完整保留，可正常选中、复制与搜索。
+
+**Q：加了 PDF 支持后输出文件变大了？**
+A：覆盖层是整页位图（`OVERLAY_SCALE = 2.0`），体积会有明显增加，且页面尺寸种类越多、每个尺寸的覆盖层都会各缓存一份。若体积敏感，可调小 `src/pdf_engine.py` 中的 `OVERLAY_SCALE`。
+
+**Q：为什么 PDF 输出格式选不了 PNG / JPEG？**
+A：PDF 无法转换成图片格式而不损失内容。工具对 PDF 源文件强制输出 `.pdf`，格式选项仅对图片生效。
+
+**Q：PDF 有密码打不开怎么办？**
+A：仅支持空密码（自动解密）的 PDF。设有打开密码的 PDF 会明确报错，需要先解密再处理。
+
+**Q：为什么图片处理完删不掉、或者 Logo 换不了？**
+A：这是 Windows 下文件句柄未释放的典型症状。当前所有读取路径已用 `with Image.open(...)` 并在加载后返回脱离文件的对象副本，处理完成后源文件可正常重命名 / 删除。若使用旧版本，请升级到最新版。
+
+**Q：间距输入框填了非数字 / 清空会怎样？**
+A：不会崩溃。输入值统一经 `src/validators.py` 校验，非法值回退到默认值、越界值夹取到合法区间，并在状态栏显示修正说明。
+
 ---
 
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)。
+
+第三方依赖许可证：Pillow（MIT-CMU）、customtkinter（MIT）、tkinterdnd2（MIT）、reportlab（BSD）、pypdf（BSD）、pypdfium2（Apache-2.0 / BSD），均与本项目的 MIT 协议兼容。
 
 如需更换许可协议，请修改本声明并添加对应 LICENSE 文件。

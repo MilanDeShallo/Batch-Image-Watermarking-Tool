@@ -276,7 +276,10 @@ class ImageWatermarkPanel(ctk.CTkFrame):
     def _load_logo(self, path):
         """加载并预览 Logo"""
         try:
-            img = Image.open(path).convert("RGBA")
+            # with 确保源文件句柄及时释放（Windows 下否则 Logo 文件无法移动/删除）
+            with Image.open(path) as src:
+                src.load()
+                img = src.convert("RGBA")
             # 缩放到预览尺寸
             preview = img.copy()
             preview.thumbnail((110, 70), Image.LANCZOS)
@@ -368,26 +371,36 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         """
         返回当前面板配置字典
         字段名与 WatermarkConfig 完全对应
+
+        所有数值字段统一经 validators 校验：
+        越界值夹取到合法区间、非法值回退默认值，并把修正说明写入
+        self.last_notices（由主窗口在状态栏提示用户）。
         """
+        from src.validators import IMAGE_FIELD_SPECS, normalize_fields
+
         # 位置索引转字符串
         pos_idx = self.selected_position if isinstance(self.selected_position, int) else 8
         pos_str = self._POS_NAMES[pos_idx] if 0 <= pos_idx < 9 else "bottom-right"
 
-        return {
+        data = {
             "watermark_type": "image",
             "logo_path": self.logo_path or "",
             "scale_ratio": int(self.scale_slider.get()) / 100.0,
             "logo_opacity": int(self.opacity_slider.get()),
             "logo_position": pos_str,
             "logo_position_mode": self.pos_mode_var.get() if hasattr(self, 'pos_mode_var') else "grid",
-            "logo_custom_x": self._safe_int(self.custom_x_var.get(), 50) if hasattr(self, 'custom_x_var') else 50,
-            "logo_custom_y": self._safe_int(self.custom_y_var.get(), 50) if hasattr(self, 'custom_y_var') else 50,
+            # 自定义坐标/间距传原始文本，交由 validators 解析并夹取
+            "logo_custom_x": self.custom_x_var.get() if hasattr(self, 'custom_x_var') else 50,
+            "logo_custom_y": self.custom_y_var.get() if hasattr(self, 'custom_y_var') else 50,
             "logo_margin": int(self.margin_slider.get()),
             "logo_tile": self.tile_var.get(),
-            "logo_spacing_x": self._safe_int(self.spacing_x_entry.get(), 100),
-            "logo_spacing_y": self._safe_int(self.spacing_y_entry.get(), 100),
+            "logo_spacing_x": self.spacing_x_entry.get(),
+            "logo_spacing_y": self.spacing_y_entry.get(),
             "logo_angle": int(self.angle_slider.get()),
         }
+
+        data, self.last_notices = normalize_fields(data, IMAGE_FIELD_SPECS)
+        return data
 
     def set_from_config(self, cfg):
         """
@@ -475,11 +488,3 @@ class ImageWatermarkPanel(ctk.CTkFrame):
 
         self._loading = False
         self._notify_change()
-
-    @staticmethod
-    def _safe_int(value, default):
-        """安全转换为整数"""
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return default

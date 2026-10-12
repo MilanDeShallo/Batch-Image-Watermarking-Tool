@@ -8,10 +8,10 @@ echo.
 cd /d "%~dp0"
 
 echo [1/4] 检查依赖...
-python -c "import customtkinter, tkinterdnd2, PIL" 2>nul
+python -c "import customtkinter, tkinterdnd2, PIL, reportlab, pypdf, pypdfium2" 2>nul
 if errorlevel 1 (
     echo [错误] 缺少依赖，正在安装...
-    pip install customtkinter tkinterdnd2 pillow pyinstaller
+    pip install customtkinter tkinterdnd2 pillow reportlab pypdf pypdfium2 pyinstaller
 )
 
 echo [2/4] 清理旧构建...

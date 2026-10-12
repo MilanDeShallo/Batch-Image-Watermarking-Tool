@@ -279,7 +279,12 @@ class FileList(ctk.CTkScrollableFrame):
 
         def _load():
             try:
-                img = Image.open(path)
+                if path.lower().endswith(".pdf"):
+                    # PDF：渲染首页作为缩略图
+                    from src.pdf_engine import render_pdf_page
+                    img = render_pdf_page(path, page_num=0, scale=0.3)
+                else:
+                    img = Image.open(path)
                 img.thumbnail((32, 32), Image.LANCZOS)
                 if img.mode != "RGBA":
                     img = img.convert("RGBA")

@@ -390,8 +390,14 @@ class TextWatermarkPanel(ctk.CTkFrame):
 
         返回的键与 WatermarkConfig 的字段对应，
         由调用方组装成完整的 WatermarkConfig。
+
+        所有数值字段统一经 validators 校验：
+        越界值夹取到合法区间、非法值回退默认值，并把修正说明写入
+        self.last_notices（由主窗口在状态栏提示用户）。
         """
-        return {
+        from src.validators import TEXT_FIELD_SPECS, normalize_fields
+
+        data = {
             "watermark_type": "text",
             "text": self._text_box.get("1.0", "end").strip(),
             "font_path": self._font_path,
@@ -400,15 +406,21 @@ class TextWatermarkPanel(ctk.CTkFrame):
             "opacity": self._opacity_var.get(),
             "position": self._selected_position,
             "position_mode": self._pos_mode_var.get(),  # "grid" 或 "custom"
-            "custom_x": self._safe_int(self._custom_x_var.get(), 50),
-            "custom_y": self._safe_int(self._custom_y_var.get(), 50),
+            "custom_x": self._custom_x_var.get(),
+            "custom_y": self._custom_y_var.get(),
             "margin": self._margin_var.get(),
             "angle": self._angle_var.get(),
             "tile": self._tile_var.get(),
-            "spacing_x": self._spacing_x_var.get() if hasattr(self, '_spacing_x_var') else 100,
-            "spacing_y": self._spacing_y_var.get() if hasattr(self, '_spacing_y_var') else 100,
+            # 间距直接读 Entry 文本而非 IntVar：
+            # IntVar 绑定 textvariable 后，输入非数字/清空时 .get() 会抛 TclError，
+            # 异常被主窗口吞掉后整个配置变成 None，表现为预览停滞、导出无反应
+            "spacing_x": self._spacing_x_entry.get() if hasattr(self, '_spacing_x_entry') else 100,
+            "spacing_y": self._spacing_y_entry.get() if hasattr(self, '_spacing_y_entry') else 100,
             "stagger": self._stagger_var.get() if hasattr(self, '_stagger_var') else True,
         }
+
+        data, self.last_notices = normalize_fields(data, TEXT_FIELD_SPECS)
+        return data
 
     def set_from_config(self, cfg) -> None:
         """从 WatermarkConfig 恢复面板状态（暂停通知，恢复后只刷新一次）"""
@@ -479,11 +491,3 @@ class TextWatermarkPanel(ctk.CTkFrame):
 
         self._loading = False  # 恢复通知
         self._notify_change()  # 只刷新一次
-
-    @staticmethod
-    def _safe_int(value, default):
-        """安全转换为整数"""
-        try:
-            return int(float(value))
-        except (ValueError, TypeError):
-            return default
