@@ -30,8 +30,20 @@ from src.ui.text_watermark_panel import TextWatermarkPanel
 from src.ui.image_watermark_panel import ImageWatermarkPanel
 from src.ui.preview_canvas import PreviewCanvas
 from src.ui.scope_selector import ScopeSelector
-from src.file_manager import collect_files, is_image_file, is_pdf_file
-from src.config import WatermarkConfig
+from src.file_manager import (
+    collect_files,
+    is_image_file,
+    is_pdf_file,
+    resolve_output_target,
+)
+from src.config import (
+    CONFLICT_LABELS,
+    CONFLICT_RENAME,
+    DEFAULT_FILENAME_TEMPLATE,
+    DEFAULT_JPEG_QUALITY,
+    WatermarkConfig,
+)
+from src.logger import log_error, log_exception, log_info, log_path
 from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_PAGE, ScopeStore
 
 # 布局配置文件：存到用户 AppData 目录，与水印预设完全分离
@@ -75,6 +87,8 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 内部状态
         self._cancel_requested = False
         self._completion_dialog = None   # 完成对话框单例
+        self._last_failure_report = ""   # 最近一次批处理的失败清单路径
+        self._last_output_dir = ""       # 最近一次批处理的实际输出位置
 
         # 三层参数作用域：全局默认 / 本文件专属 / 本页专属
         self._scopes = ScopeStore()
@@ -246,29 +260,51 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         self._settings_tabview.configure(command=lambda x: self._request_preview_refresh())
 
-        # ---- 底部操作栏 ----
-        bottom_bar = ctk.CTkFrame(self._vpaned, height=50)
-        self._vpaned.add(bottom_bar, minsize=MIN_BOTTOM, height=50)
+        # ---- 底部操作栏（两行：输出设置 / 执行控制）----
+        # 输出设置项变多之后单行放不下：文件名模板、同名冲突策略、覆盖原图
+        # 都是"导出结果长什么样"的一部分，藏进二级对话框反而更难发现
+        bottom_bar = ctk.CTkFrame(self._vpaned, height=88)
+        self._vpaned.add(bottom_bar, minsize=88, height=88)
 
-        ctk.CTkLabel(bottom_bar, text="输出目录:").pack(side="left", padx=5)
+        # ===== 第一行：输出位置 / 文件名 / 格式 =====
+        self._row1 = ctk.CTkFrame(bottom_bar, fg_color="transparent")
+        self._row1.pack(fill="x", padx=6, pady=(5, 0))
+
+        ctk.CTkLabel(self._row1, text="输出目录:").pack(side="left", padx=(2, 2))
         self._output_dir_var = ctk.StringVar(value="")
-        self._output_dir_entry = ctk.CTkEntry(bottom_bar, textvariable=self._output_dir_var, width=220)
+        self._output_dir_entry = ctk.CTkEntry(
+            self._row1, textvariable=self._output_dir_var, width=170
+        )
         self._output_dir_entry.pack(side="left", padx=2)
-        self._output_dir_btn = ctk.CTkButton(bottom_bar, text="浏览...", width=60, command=self._browse_output_dir)
+        self._output_dir_btn = ctk.CTkButton(
+            self._row1, text="浏览...", width=58, command=self._browse_output_dir
+        )
         self._output_dir_btn.pack(side="left", padx=2)
+
         self._output_hint_label = ctk.CTkLabel(
-            bottom_bar, text="留空→原图目录\\watermarked_output",
+            self._row1, text="留空 → 源目录\\watermarked_output",
             text_color="gray", font=("Microsoft YaHei", 9)
         )
-        self._output_hint_label.pack(side="left", padx=2)
+        self._output_hint_label.pack(side="left", padx=(4, 8))
 
-        ctk.CTkFrame(bottom_bar, width=1, fg_color=("gray70", "gray30")).pack(side="left", fill="y", padx=8)
+        ctk.CTkLabel(self._row1, text="文件名模板:").pack(side="left", padx=(0, 2))
+        self._template_var = ctk.StringVar(value=DEFAULT_FILENAME_TEMPLATE)
+        self._template_entry = ctk.CTkEntry(
+            self._row1, textvariable=self._template_var, width=168
+        )
+        self._template_entry.pack(side="left", padx=2)
+        # 失焦时归一化：空模板会生成没有主名的文件，必须回落到默认
+        self._template_entry.bind("<FocusOut>", lambda e: self._on_template_changed())
 
-        ctk.CTkLabel(bottom_bar, text="格式:").pack(side="left", padx=5)
+        ctk.CTkFrame(self._row1, width=1, fg_color=("gray70", "gray30")).pack(
+            side="left", fill="y", padx=8
+        )
+
+        ctk.CTkLabel(self._row1, text="格式:").pack(side="left", padx=(0, 2))
         self._format_var = ctk.StringVar(value="自动")
         self._format_menu = ctk.CTkOptionMenu(
-            bottom_bar, variable=self._format_var,
-            values=["自动", "PNG", "JPEG", "PDF"], width=80,
+            self._row1, variable=self._format_var,
+            values=["自动", "PNG", "JPEG", "PDF"], width=78,
             command=self._on_format_changed,
         )
         self._format_menu.pack(side="left", padx=2)
@@ -276,44 +312,69 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 仅格式=PDF 时出现：把整批合成一个多页 PDF
         self._merge_pdf_var = ctk.BooleanVar(value=False)
         self._merge_pdf_cb = ctk.CTkCheckBox(
-            bottom_bar, text="合并为单个 PDF", variable=self._merge_pdf_var,
-            width=118, font=("Microsoft YaHei", 11),
+            self._row1, text="合并为单个 PDF", variable=self._merge_pdf_var,
+            width=112, font=("Microsoft YaHei", 11),
         )
         self._merge_pdf_cb.pack(side="left", padx=(6, 2))
         self._merge_pdf_cb.pack_forget()  # 非 PDF 格式时隐藏
 
-        ctk.CTkLabel(bottom_bar, text="质量:").pack(side="left", padx=5)
-        self._quality_var = ctk.IntVar(value=90)
+        # ===== 第二行：同名策略 / 覆盖原图 / 质量 / 进度 / 执行 =====
+        row2 = ctk.CTkFrame(bottom_bar, fg_color="transparent")
+        row2.pack(fill="x", padx=6, pady=(3, 5))
+
+        ctk.CTkLabel(row2, text="同名文件:").pack(side="left", padx=(2, 2))
+        self._conflict_var = ctk.StringVar(value=CONFLICT_LABELS[CONFLICT_RENAME])
+        self._conflict_menu = ctk.CTkOptionMenu(
+            row2, variable=self._conflict_var,
+            values=list(CONFLICT_LABELS.values()), width=112,
+        )
+        self._conflict_menu.pack(side="left", padx=2)
+
+        # 覆盖原图：危险操作，勾选后开始处理时还会再确认一次
+        self._overwrite_original_var = ctk.BooleanVar(value=False)
+        self._overwrite_original_cb = ctk.CTkCheckBox(
+            row2, text="覆盖原图", variable=self._overwrite_original_var,
+            width=92, font=("Microsoft YaHei", 11),
+            fg_color="#ef4444", hover_color="#dc2626",
+        )
+        self._overwrite_original_cb.pack(side="left", padx=(8, 2))
+
+        self._template_hint_label = ctk.CTkLabel(
+            row2, text="模板变量: {original} {date} {time} {seq}",
+            text_color="gray", font=("Microsoft YaHei", 9)
+        )
+        self._template_hint_label.pack(side="left", padx=(8, 2))
+
+        ctk.CTkLabel(row2, text="质量:").pack(side="left", padx=(8, 2))
+        self._quality_var = ctk.IntVar(value=DEFAULT_JPEG_QUALITY)
         self._quality_slider = ctk.CTkSlider(
-            bottom_bar, from_=60, to=100, variable=self._quality_var, width=80,
+            row2, from_=60, to=100, variable=self._quality_var, width=70,
             command=lambda v: self._quality_value_label.configure(text=str(int(v)))
         )
         self._quality_slider.pack(side="left", padx=2)
-        self._quality_value_label = ctk.CTkLabel(bottom_bar, text="90", width=25, font=("Microsoft YaHei", 11))
+        self._quality_value_label = ctk.CTkLabel(
+            row2, text=str(DEFAULT_JPEG_QUALITY), width=24,
+            font=("Microsoft YaHei", 11)
+        )
         self._quality_value_label.pack(side="left", padx=2)
-        ctk.CTkLabel(
-            bottom_bar, text="(JPEG/PDF)", text_color="gray", font=("Microsoft YaHei", 9)
-        ).pack(side="left", padx=2)
 
-        ctk.CTkFrame(bottom_bar, width=1, fg_color=("gray70", "gray30")).pack(side="left", fill="y", padx=8)
-
-        self._progress_bar = ctk.CTkProgressBar(bottom_bar, width=200)
+        self._progress_bar = ctk.CTkProgressBar(row2, width=170)
         self._progress_bar.pack(side="left", padx=5)
         self._progress_bar.set(0)
         self._progress_bar.pack_forget()
 
-        self._status_label = ctk.CTkLabel(bottom_bar, text="")
+        self._status_label = ctk.CTkLabel(row2, text="", anchor="w")
         self._status_label.pack(side="left", padx=5)
 
         self._start_btn = ctk.CTkButton(
-            bottom_bar, text="开始处理", width=100,
+            row2, text="开始处理", width=100,
             command=self._on_start_processing,
             fg_color="#22c55e", hover_color="#16a34a",
         )
         self._start_btn.pack(side="right", padx=5)
 
         self._cancel_btn = ctk.CTkButton(
-            bottom_bar, text="取消", width=70,
+            row2, text="取消", width=70,
             command=self._on_cancel_processing,
             fg_color="#ef4444", hover_color="#dc2626",
         )
@@ -1195,112 +1256,373 @@ class AppWindow(ctk.CTk, DnDWrapper):
         d = askdirectory(title="选择输出目录")
         if d:
             self._output_dir_var.set(d)
+            self._refresh_output_hint()
+
+    # ---------- 输出设置（文件名模板 / 同名策略 / 覆盖原图） ----------
+
+    def _on_template_changed(self):
+        """
+        归一化文件名模板。
+
+        模板留空会生成"只有扩展名的文件"（例如 .jpg），用户在资源管理器里
+        根本看不出这是哪张图。这里直接回落到默认模板并提示。
+        """
+        raw = self._template_var.get().strip()
+        if not raw:
+            self._template_var.set(DEFAULT_FILENAME_TEMPLATE)
+            self._status_label.configure(
+                text=f"文件名模板不能为空，已回落到 {DEFAULT_FILENAME_TEMPLATE}"
+            )
+        elif raw != self._template_var.get():
+            self._template_var.set(raw)
+
+    def _conflict_mode(self) -> str:
+        """当前同名冲突策略（内部标识）"""
+        label = self._conflict_var.get()
+        for key, text in CONFLICT_LABELS.items():
+            if text == label:
+                return key
+        return CONFLICT_RENAME
+
+    def _is_overwrite_original(self) -> bool:
+        """是否勾选了"覆盖原图" """
+        try:
+            return bool(self._overwrite_original_var.get())
+        except Exception:
+            return False
+
+    def _refresh_output_hint(self):
+        """
+        刷新输出目录提示，使提示文案与实际行为一致。
+
+        以前提示固定写「留空→原图目录\\watermarked_output」，但多目录输入时
+        实际会被统一丢到桌面「水印输出」—— 用户按提示理解就会找错地方。
+        现在直接问 resolve_output_target 要结论，提示与执行同源。
+        """
+        try:
+            files = self._file_list.files
+            chosen = self._output_dir_var.get().strip()
+            merge = bool(self._merge_pdf_var.get())
+            _, message = resolve_output_target(files, chosen, merge)
+            if not message:
+                message = "输出到指定目录"
+                if self._is_overwrite_original():
+                    message = "⚠ 覆盖原图：输出即源文件（会先确认）"
+                elif merge:
+                    message = "输出到指定目录（合并为单个 PDF）"
+            self._output_hint_label.configure(text=message)
+        except Exception:
+            pass
+
+    def _confirm_overwrite_original(self, files) -> bool:
+        """
+        「覆盖原图」的二次确认。
+
+        为什么要两道确认：
+        这个选项是**不可逆**的 —— 水印一旦写回源文件，原图就没有了。
+        批量场景下一次误勾可能毁掉整批素材，所以既要列出数量与目录，
+        还要用户确认所选的存储位置确实是自己的素材（而不是产出的成品）。
+        """
+        from tkinter import messagebox
+
+        count = len(files)
+        groups = {}
+        for f in files:
+            groups[os.path.dirname(f)] = groups.get(os.path.dirname(f), 0) + 1
+        dirs = "\n".join(f"  {d}（{n} 张）" for d, n in list(groups.items())[:8])
+        if len(groups) > 8:
+            dirs += f"\n  ... 另外 {len(groups) - 8} 个目录"
+
+        first = messagebox.askyesno(
+            "确认覆盖原图",
+            f"你勾选了「覆盖原图」。\n\n"
+            f"即将处理的 {count} 个文件的**原图会被直接改写**，"
+            f"处理完成后无法还原：\n\n{dirs}\n\n"
+            f"确认要继续吗？",
+            parent=self,
+        )
+        if not first:
+            return False
+
+        second = messagebox.askyesno(
+            "最后确认",
+            "请再确认一次：\n\n原图将被覆盖，没有备份。\n\n"
+            "如果这批文件本身就是需要长期保存的素材，建议先取消，"
+            "改成输出到单独目录。\n\n确定继续覆盖吗？",
+            parent=self,
+        )
+        return bool(second)
 
     def _update_count(self):
         """更新文件计数显示"""
         count = self._file_list.count
         self._count_label.configure(text=f"共 {count} 个文件")
+        self._refresh_output_hint()
+
+    def _write_failure_report(self, output_dir: str, failures: list) -> str:
+        """
+        把失败清单写到输出目录，返回文件路径（无失败返回空字符串）。
+
+        为什么单独落一个文件：
+        exe 没有控制台，状态栏一行字几秒后就被下一次操作覆盖，
+        用户想回头查"到底是哪几张失败了、为什么"时无从查起。
+        """
+        if not failures:
+            return ""
+        try:
+            from datetime import datetime
+
+            target_dir = output_dir or os.path.expanduser("~")
+            os.makedirs(target_dir, exist_ok=True)
+            name = f"失败清单_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            path = os.path.join(target_dir, name)
+
+            lines = [
+                "批量图片水印工具 — 失败清单",
+                f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"失败数量: {len(failures)}",
+                f"日志文件: {log_path()}",
+                "-" * 60,
+            ]
+            for index, (filename, reason) in enumerate(failures, start=1):
+                lines.append(f"{index}. {filename}")
+                lines.append(f"   原因: {reason}")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            return path
+        except Exception as exc:
+            log_exception("写失败清单失败", exc)
+            return ""
 
     def _on_start_processing(self):
-        """开始处理按钮回调 — ThreadPoolExecutor 多核并行版本"""
-        import os
-        import time
+        """开始处理按钮回调 — 有界任务队列 + 原子写出 + 资源预检"""
         import gc
         import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from src.file_manager import generate_output_path, get_default_output_dir
+        import time
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+        from concurrent.futures import wait as futures_wait
+        from tkinter import messagebox
 
-        # 1. 前置检查
+        from src import resource_budget
+        from src.batch_planner import (
+            TaskCancelled,
+            execute_task,
+            plan_output_paths,
+        )
+
+        # ---------- 1. 前置检查 ----------
         files = self._file_list.files
         if not files:
             self._show_message("请先添加图片文件")
             return
 
-        output_dir = self._output_dir_var.get().strip()
-        if not output_dir or not os.path.isdir(output_dir):
-            output_dir = get_default_output_dir(files)
-            if not output_dir:
-                output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "水印输出")
-            os.makedirs(output_dir, exist_ok=True)
+        # 输出目录的行为统一由 resolve_output_target 决定：
+        # 返回空字符串 = 每个文件写到各自源目录下的 watermarked_output/
+        # （旧实现会把多目录输入统一丢到桌面「水印输出」，与界面提示不符）
+        chosen_dir = self._output_dir_var.get().strip()
+        if chosen_dir and not os.path.isdir(chosen_dir):
+            chosen_dir = ""
+        merge_pdf = bool(self._merge_pdf_var.get()) and self._format_var.get() == "PDF"
+        output_dir, output_note = resolve_output_target(files, chosen_dir, merge_pdf)
+
+        if output_dir:
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except Exception as exc:
+                self._show_message(f"无法创建输出目录：\n{output_dir}\n\n{exc}")
+                return
             self._output_dir_var.set(output_dir)
+
+        if output_note:
+            self._status_label.configure(text=output_note)
+        self._last_output_dir = output_dir or "（各源文件目录）"
 
         config = self._get_current_config()
         if config is None:
             self._show_message("配置错误，无法获取水印设置")
             return
 
-        # 磁盘空间预检
+        template = (self._template_var.get() or DEFAULT_FILENAME_TEMPLATE).strip()
+        conflict = self._conflict_mode()
+        overwrite_original = self._is_overwrite_original()
+
+        # ---------- 2. 覆盖原图：两次确认（不可逆操作） ----------
+        if overwrite_original and not self._confirm_overwrite_original(files):
+            self._status_label.configure(text="已取消：未覆盖原图")
+            return
+
+        # ---------- 3. 像素上限：超限直接剔除，不交给 Pillow 去撞内存 ----------
+        oversized = resource_budget.oversized_files(files)
+        if oversized:
+            detail = "\n".join(
+                f"  {os.path.basename(p)} — {px / 1e6:.0f} 百万像素"
+                for p, px in oversized[:10]
+            )
+            if len(oversized) > 10:
+                detail += f"\n  ... 另外 {len(oversized) - 10} 个"
+            self._show_message(
+                "以下文件超过安全像素上限"
+                f"（{resource_budget.MAX_IMAGE_PIXELS / 1e6:.0f} 百万像素），已跳过：\n\n"
+                f"{detail}\n\n"
+                "这类文件解码后需要数 GB 内存，处理它极可能让程序直接崩溃。"
+            )
+            log_info(f"超限跳过 {len(oversized)} 个文件")
+            blocked = {p for p, _ in oversized}
+            files = [f for f in files if f not in blocked]
+            if not files:
+                self._status_label.configure(text="全部文件都超过像素上限，未处理")
+                return
+
+        # ---------- 3.1 大图预警：给量级，让用户自己决定 ----------
+        large = resource_budget.large_images(files)
+        if large:
+            peak_gb = sum(item[3] for item in large) * (
+                resource_budget.BYTES_PER_PIXEL * resource_budget.TASK_SLACK
+            ) / (1024 ** 3)
+            detail = "\n".join(
+                f"  {os.path.basename(p)} — {w}×{h}（{px / 1e6:.0f} 百万像素）"
+                for p, w, h, px in large[:8]
+            )
+            if len(large) > 8:
+                detail += f"\n  ... 另外 {len(large) - 8} 个"
+            if not messagebox.askyesno(
+                "大图内存预警",
+                f"这批文件里有 {len(large)} 张高分辨率图片：\n\n{detail}\n\n"
+                f"处理这些图预计峰值内存约 {peak_gb:.1f} GB。\n"
+                "程序会按可用内存自动降低并行度，但仍可能需要较长时间。\n\n"
+                "是否继续？",
+                parent=self,
+            ):
+                self._status_label.configure(text="已取消（大图内存预警）")
+                return
+
+        # ---------- 3.2 磁盘空间预检 ----------
         import shutil
         try:
+            space_root = output_dir or os.path.expanduser("~")
             total_input_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
             needed_size = int(total_input_size * 1.2)  # 预留 20% 余量
-            free_space = shutil.disk_usage(output_dir).free
+            free_space = shutil.disk_usage(space_root).free
             if free_space < needed_size:
-                free_mb = free_space / (1024 * 1024)
-                needed_mb = needed_size / (1024 * 1024)
                 self._show_message(
                     f"磁盘空间不足！\n\n"
-                    f"预计需要: {needed_mb:.0f} MB\n"
-                    f"可用空间: {free_mb:.0f} MB\n"
-                    f"输出目录: {output_dir}"
+                    f"预计需要: {needed_size / (1024 * 1024):.0f} MB\n"
+                    f"可用空间: {free_space / (1024 * 1024):.0f} MB\n"
+                    f"输出位置: {space_root}"
                 )
                 return
         except Exception:
             pass  # 检查失败不阻止处理
 
-        # 整批处理计划：每个文件的生效参数 + 输出格式 + 是否合并
-        # （决策逻辑见 src/batch_planner.py，可被测试直接覆盖）
+        # ---------- 3.3 PDF 数字签名预检 ----------
+        # 加水印是改写文件，签名必然失效。必须先说清楚，不能悄悄弄坏
+        try:
+            from src.pdf_engine import signed_pdf_files
+            signed = signed_pdf_files(files)
+        except Exception:
+            signed = []
+        if signed:
+            detail = "\n".join(f"  {os.path.basename(p)}" for p in signed[:8])
+            if len(signed) > 8:
+                detail += f"\n  ... 另外 {len(signed) - 8} 个"
+            if not messagebox.askyesno(
+                "PDF 数字签名将失效",
+                f"以下 {len(signed)} 个 PDF 带数字签名：\n\n{detail}\n\n"
+                "处理后的文件签名会失效，阅读器会提示「文档已被修改」。\n"
+                "这是无法避免的（重新签名需要你的私钥）。\n\n"
+                "是否继续处理？",
+                parent=self,
+            ):
+                self._status_label.configure(text="已取消（保留 PDF 签名）")
+                return
+
+        # ---------- 4. 生成任务计划与输出路径 ----------
+        # 决策逻辑全部在 src/batch_planner.py（无 GUI 依赖，可被测试直接覆盖）
         plan = self._build_batch_plan(files)
         specs = plan.tasks
         out_format = plan.out_format
         merge_pdf = plan.merge
         quality = self._quality_var.get()
 
-        # 2. 更新 UI 状态
+        output_paths, merged_path = plan_output_paths(
+            plan, output_dir,
+            filename_template=template,
+            on_conflict=conflict,
+            overwrite_original=overwrite_original,
+        )
+
+        if merge_pdf and not merged_path:
+            self._show_message("无法确定合并输出的目标路径")
+            return
+
+        # 冲突策略 = 跳过时，部分任务会被标成 None（不处理）
+        skipped = sum(1 for p in output_paths if not p)
+        active = [
+            (index, task)
+            for index, (task, path) in enumerate(zip(specs, output_paths))
+            if path
+        ]
+        if not merge_pdf and not active:
+            self._show_message("所有输出文件都已存在，且当前策略是「跳过」。")
+            return
+
+        log_info(
+            "批次开始：文件 %d 个，输出 %s，格式 %s，模板 %s，同名策略 %s%s"
+            % (
+                len(files), self._last_output_dir, out_format, template, conflict,
+                "，覆盖原图" if overwrite_original else "",
+            )
+        )
+
+        # ---------- 5. 并行度：按解码后的像素内存预算决定 ----------
+        # 旧实现按"压缩文件大小"分档（>15MB 限 2 线程）。文件大小与内存占用
+        # 并没有稳定关系：200KB 的 10000×7000 JPEG 解出来就是 280MB，
+        # 而 5MB 的 1080p PNG 只有 8MB —— 按大小分档会在高分辨率场景下
+        # 开出过多线程，几张大图并发就能把内存吃光。
+        estimates = [
+            resource_budget.file_memory_estimate(task.path) for _, task in active
+        ]
+        num_workers, worker_reason = resource_budget.plan_workers(estimates)
+        log_info(f"并行度决策：{worker_reason}")
+
+        # ---------- 6. 更新 UI 状态 ----------
         self._start_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
         self._progress_bar.pack()
         self._progress_bar.set(0)
-        self._status_label.configure(text="合并中..." if merge_pdf else "处理中...")
+        hint = "合并中..." if merge_pdf else "处理中..."
+        if skipped:
+            hint += f"（{skipped} 个同名文件将跳过）"
+        self._status_label.configure(text=hint)
 
-        # 3. 动态线程池大小：基于文件大小调整，避免大图内存占满
-        avg_size_mb = sum(os.path.getsize(f) for f in files if os.path.exists(f)) / max(len(files), 1) / (1024 * 1024)
-        cpu_workers = max(2, (os.cpu_count() or 4) - 1)
-        if avg_size_mb > 15:
-            num_workers = min(2, cpu_workers)  # 大图限制 2 线程
-        elif avg_size_mb > 5:
-            num_workers = min(3, cpu_workers)  # 中等图限制 3 线程
-        else:
-            num_workers = cpu_workers  # 小图全速
+        # ---------- 7. 会话与进度状态 ----------
+        self._cancel_requested = False
+        self._last_failure_report = ""
+        self._save_session()
+        self._batch_start_time = time.time()
 
-        # 3.5 预生成输出路径（避免多线程竞争 + 重名检测）
-        # - 合并模式只有一个输出文件，用时间戳命名避免与逐文件结果撞名
-        existing_names: set[str] = set()
-        output_paths: list[str] = []
-        merged_path = ""
-        if merge_pdf:
-            from src.file_manager import generate_merged_output_path
-            merged_path = generate_merged_output_path(output_dir, existing_names)
-        else:
-            for i, task in enumerate(specs):
-                out_path = generate_output_path(
-                    task.path, output_dir,
-                    output_format=task.output_format,
-                    seq_counter=i + 1,
-                    existing_names=existing_names
-                )
-                output_paths.append(out_path)
+        # 任务结果三态：取消不算失败，否则用户分不清"我取消了"和"程序出错了"
+        STATUS_OK = "ok"
+        STATUS_CANCELLED = "cancelled"
+        STATUS_FAILED = "failed"
 
-        # 4. 单个文件处理函数（在工作线程中执行）
+        # ---------- 8. 单个文件处理函数（在工作线程中执行） ----------
         #    具体的分支决策在 src/batch_planner.execute_task 里，这里只管调度与异常
-        def _process_one(task):
-            idx, src_path = task
+        def _process_one(index, out_path):
+            task = specs[index]
+            name = os.path.basename(task.path)
             try:
-                from src.batch_planner import execute_task
-                execute_task(specs[idx], output_paths[idx], quality)
-                return (idx, True, None, os.path.basename(src_path))
-            except Exception as e:
-                return (idx, False, str(e), os.path.basename(src_path))
+                execute_task(
+                    task, out_path, jpeg_quality=quality,
+                    should_cancel=lambda: self._cancel_requested,
+                )
+                return (index, STATUS_OK, None, name)
+            except TaskCancelled:
+                # 用户在可中断点退出：原子写出已保证不留半成品，这里不计入失败
+                return (index, STATUS_CANCELLED, None, name)
+            except Exception as exc:
+                log_exception(f"处理失败 {name}", exc)
+                return (index, STATUS_FAILED, str(exc), name)
 
         # 4.5 合并模式：把所有输入按列表顺序拼成一个多页 PDF
         #     图片一图一页，PDF 逐页并入；每个输入用各自的文件层/页层参数。
@@ -1336,110 +1658,149 @@ class AppWindow(ctk.CTk, DnDWrapper):
                     should_cancel=lambda: self._cancel_requested,
                 )
             except MergeCancelled:
-                # 用户取消：不写出任何文件
-                elapsed = time.time() - start_time
-                self.after(0, lambda: _on_done(0, 0, elapsed, None, True, 0))
+                # 用户取消：原子写出保证不留半成品
+                _elapsed = time.time() - start_time
+                self.after(0, lambda e=_elapsed: _on_done(
+                    0, elapsed=e, was_cancelled=True, merged_pages=0,
+                    output_dir=output_dir,
+                ))
                 return
-            except Exception as e:
-                elapsed = time.time() - start_time
-                self.after(0, lambda msg=str(e): _on_done(0, total, elapsed, msg, False, 0))
+            except Exception as exc:
+                log_exception("合并 PDF 失败", exc)
+                _elapsed = time.time() - start_time
+                self.after(0, lambda e=_elapsed, m=str(exc): _on_done(
+                    0, elapsed=e, merged_pages=0, fatal=m, output_dir=output_dir,
+                ))
                 return
 
-            elapsed = time.time() - start_time
-            self.after(0, lambda: _on_done(total, 0, elapsed, None, False, pages))
+            _elapsed = time.time() - start_time
+            self.after(0, lambda e=_elapsed, p=pages: _on_done(
+                total, elapsed=e, merged_pages=p, output_dir=output_dir,
+            ))
 
-        # 5. 调度器线程 — 提交任务 + 收集结果 + 更新 UI
+        # ---------- 9. 调度器线程 — 有界滑动窗口 + 结果收集 + 进度更新 ----------
         def _dispatcher():
             if merge_pdf:
                 _merge_all()
                 return
 
-            total = len(files)
+            total_active = len(active)
             success_count = 0
-            fail_count = 0
-            first_error = None
+            cancelled_count = 0
+            failures = []            # [(文件名, 原因)]
             start_time = time.time()
+
+            # 失败清单落盘位置：优先用户指定目录；多目录模式落到第一个源文件所在目录
+            report_dir = output_dir or (
+                os.path.dirname(active[0][1].path) if active else ""
+            )
 
             # 进度节流：双阈值（200ms OR 10 张）
             last_progress_time = time.time()
-            last_progress_idx = 0
+            last_progress_done = 0
             PROGRESS_TIME_MS = 200
             PROGRESS_COUNT = 10
 
-            tasks = list(enumerate(files))
+            def _report_progress(done, filename):
+                nonlocal last_progress_time, last_progress_done
+                now = time.time()
+                if (now - last_progress_time) * 1000 >= PROGRESS_TIME_MS \
+                        or done - last_progress_done >= PROGRESS_COUNT \
+                        or done >= total_active:
+                    progress = done / total_active if total_active else 1.0
+                    self.after(0, lambda p=progress, d=done, fn=filename:
+                               self._update_progress(p, d, total_active, fn))
+                    last_progress_time = now
+                    last_progress_done = done
 
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # 提交所有任务
-                future_to_task = {
-                    executor.submit(_process_one, task): task
-                    for task in tasks
-                }
-                cancelled_pending = False
+            # 有界滑动窗口：在飞任务数始终不超过并行度。
+            # 旧实现一次性 submit 全部任务，队列里排队的任务在取消后仍会被逐个启动，
+            # 于是"取消"要等整批跑完才生效 —— 大批量高分辨率图下会白烧几十分钟。
+            inflight = max(1, num_workers)
+            pending = set()
+            cursor = 0
 
-                for future in as_completed(future_to_task):
-                    # 取消：只取消尚未开始的任务，等待已运行的完成
-                    if self._cancel_requested and not cancelled_pending:
-                        for f in future_to_task:
-                            f.cancel()
-                        cancelled_pending = True
-                        self.after(0, lambda: self._status_label.configure(text="正在等待已处理的图片完成..."))
+            def _fill_window(executor):
+                nonlocal cursor
+                while cursor < total_active and len(pending) < inflight:
+                    if self._cancel_requested:
+                        return          # 取消后不再提交任何新任务
+                    index, _task = active[cursor]
+                    cursor += 1
+                    pending.add(executor.submit(_process_one, index, output_paths[index]))
 
-                    # 跳过被取消的任务
-                    if future.cancelled():
-                        continue
+            with ThreadPoolExecutor(max_workers=inflight) as executor:
+                _fill_window(executor)
+                while pending:
+                    done_set, pending = futures_wait(
+                        pending, return_when=FIRST_COMPLETED
+                    )
+                    for future in done_set:
+                        try:
+                            _index, status, error, name = future.result()
+                        except Exception as exc:      # 兜底：_process_one 自身崩了
+                            log_exception("任务执行异常", exc)
+                            status, error, name = STATUS_FAILED, str(exc), "?"
+                        if status == STATUS_OK:
+                            success_count += 1
+                        elif status == STATUS_CANCELLED:
+                            cancelled_count += 1
+                        else:
+                            failures.append((name, error))
+                        processed = success_count + len(failures) + cancelled_count
+                        _report_progress(processed, name)
+                        # GC 控制：每 10 张手动回收
+                        if processed % 10 == 0:
+                            gc.collect()
+                    _fill_window(executor)
 
-                    idx, success, error, filename = future.result()
-
-                    if success:
-                        success_count += 1
-                    else:
-                        fail_count += 1
-                        if first_error is None:
-                            first_error = f"{filename}: {error}"
-                        print(f"[Process Error] {filename}: {error}")
-
-                    done = success_count + fail_count
-
-                    # 进度节流：超过 200ms 或超过 10 张才更新 UI
-                    now = time.time()
-                    if (now - last_progress_time) * 1000 >= PROGRESS_TIME_MS \
-                            or done - last_progress_idx >= PROGRESS_COUNT \
-                            or done == total:
-                        progress = done / total
-                        self.after(0, lambda p=progress, d=done, fn=filename: self._update_progress(p, d, total, fn))
-                        last_progress_time = now
-                        last_progress_idx = done
-
-                    # GC 控制：每 10 张手动回收
-                    if done % 10 == 0:
-                        gc.collect()
-
-            # 最终 GC
             gc.collect()
 
             elapsed = time.time() - start_time
-            was_cancelled = self._cancel_requested
-            self.after(0, lambda: _on_done(success_count, fail_count, elapsed, first_error, was_cancelled))
+            self.after(0, lambda: _on_done(
+                success_count,
+                failures=failures,
+                elapsed=elapsed,
+                was_cancelled=self._cancel_requested,
+                skipped=skipped,
+                cancelled=cancelled_count,
+                output_dir=report_dir,
+                total=len(files),
+            ))
 
-        def _on_done(success, fail, elapsed, first_error, was_cancelled=False, merged_pages=None):
+        def _on_done(success, failures=(), elapsed=0.0, was_cancelled=False,
+                     merged_pages=None, skipped=0, cancelled=0, fatal=None,
+                     output_dir="", total=0):
             """处理完成回调（主线程）
 
-            merged_pages 为 None 表示逐文件模式；
-            为整数（可为 0）表示合并模式的收尾，此时 success 记的是参与合并的输入数。
+            merged_pages 为 None 表示逐文件模式；为整数表示合并模式收尾，
+            此时 success 记的是参与合并的输入数。
+            failures: [(文件名, 原因)]；cancelled: 因取消而中断的数量；
+            skipped: 因同名冲突策略而跳过的数量。
             """
             self._start_btn.configure(state="normal")
             self._cancel_btn.configure(state="disabled")
             self._cancel_requested = False
             self._clear_session()  # 正常完成，清除会话
 
+            failures = list(failures or [])
+            fail = len(failures)
+            first_error = f"{failures[0][0]}: {failures[0][1]}" if failures else fatal
+
+            # 失败清单落盘：exe 没有控制台，状态栏一行字转头就被覆盖，
+            # 用户回头想查"哪几张失败了、为什么"只能靠这个文件
+            self._last_failure_report = self._write_failure_report(output_dir, failures)
+            if failures:
+                log_info(f"批次结束：失败 {fail} 个，清单 {self._last_failure_report}")
+
             # ---------------- 合并模式收尾 ----------------
             if merged_pages is not None:
                 if was_cancelled:
                     self._status_label.configure(text=f"已取消合并 ({elapsed:.1f}s)")
                     return
-                if first_error:
-                    self._status_label.configure(text=f"合并失败: {first_error}")
-                    self._show_message(f"合并失败：\n\n{first_error}")
+                if fatal:
+                    self._status_label.configure(text=f"合并失败: {fatal}")
+                    self._show_message(f"合并失败：\n\n{fatal}")
                     return
                 self._progress_bar.set(1)
                 self._status_label.configure(
@@ -1452,31 +1813,43 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 return
 
             # ---------------- 逐文件模式收尾 ----------------
+            bits = [f"成功 {success} 张"]
+            if fail:
+                bits.append(f"失败 {fail} 张")
+            if cancelled:
+                bits.append(f"已取消 {cancelled} 张")
+            if skipped:
+                bits.append(f"跳过 {skipped} 张")
+            summary = ", ".join(bits)
+
             if was_cancelled:
-                self._status_label.configure(
-                    text=f"已取消! 成功 {success} 张, 失败 {fail} 张 ({elapsed:.1f}s)"
-                )
+                self._status_label.configure(text=f"已取消! {summary} ({elapsed:.1f}s)")
                 if success > 0:
-                    self._show_completion_dialog(output_dir, success, fail)
+                    self._show_completion_dialog(
+                        output_dir, success, fail,
+                        note=f"{summary}（已取消）",
+                        report=self._last_failure_report,
+                    )
                 return
 
             if success > 0:
-                self._status_label.configure(
-                    text=f"完成! 成功 {success} 张, 失败 {fail} 张 ({elapsed:.1f}s)"
+                self._status_label.configure(text=f"完成! {summary} ({elapsed:.1f}s)")
+                self._show_completion_dialog(
+                    output_dir, success, fail,
+                    note=summary, report=self._last_failure_report,
                 )
-                self._show_completion_dialog(output_dir, success, fail)
+                self._progress_bar.set(1)
             else:
                 if first_error:
                     self._status_label.configure(text=f"全部失败: {first_error}")
+                    extra = (f"\n\n完整失败清单：\n{self._last_failure_report}"
+                             if self._last_failure_report else "")
+                    self._show_message(f"没有成功处理的文件。\n\n首个错误：\n{first_error}{extra}")
                 else:
                     self._status_label.configure(text="处理失败")
                     self._show_message("没有成功处理的文件")
 
-        # 初始化取消标志并启动调度器线程
-        self._cancel_requested = False
-        self._save_session()  # 保存会话（崩溃恢复用）
-        import time as _time
-        self._batch_start_time = _time.time()
+        # 启动调度器线程（取消标志与会话已在第 7 步初始化）
         t = threading.Thread(target=_dispatcher, daemon=True)
         t.start()
 
@@ -1513,11 +1886,13 @@ class AppWindow(ctk.CTk, DnDWrapper):
         messagebox.showinfo("提示", message)
 
     def _show_completion_dialog(self, output_dir: str, success: int, fail: int,
-                                note: str = None):
+                                note: str = None, report: str = None):
         """显示完成对话框，包含"打开文件夹"按钮
 
         :param note: 可选补充说明，会替换默认的「成功 N 张 | 失败 M 张」那行
                      （合并模式用它来显示输出页数）
+        :param report: 可选失败清单路径；有失败时给用户一个明确的入口，
+                       否则状态栏那行字被覆盖后就没法回溯了
 
         为什么不用模态抓取（grab_set）：
         - CTkToplevel 在构造时为了刷新标题栏颜色，会先 withdraw() 自己、
@@ -1543,14 +1918,14 @@ class AppWindow(ctk.CTk, DnDWrapper):
         dialog = ctk.CTkToplevel(self)
         self._completion_dialog = dialog
         dialog.title("处理完成")
-        dialog.geometry("400x200")
+        dialog.geometry("400x230")
         dialog.resizable(False, False)
         dialog.transient(self)
 
         # 居中显示
         dialog.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() // 2) - 200
-        y = self.winfo_y() + (self.winfo_height() // 2) - 100
+        y = self.winfo_y() + (self.winfo_height() // 2) - 115
         dialog.geometry(f"+{x}+{y}")
 
         # 没有抓取，就靠 lift 保证它不被主窗口挡在后面
@@ -1569,24 +1944,42 @@ class AppWindow(ctk.CTk, DnDWrapper):
         ).pack(pady=(25, 10))
 
         detail = note if note else f"成功: {success} 张  |  失败: {fail} 张"
+        lines = [detail, f"输出目录: {output_dir}"]
+        if report:
+            lines.append(f"失败清单: {os.path.basename(report)}")
         ctk.CTkLabel(
             dialog,
-            text=f"{detail}\n输出目录: {output_dir}",
+            text="\n".join(lines),
             font=ctk.CTkFont(size=12),
-            text_color=("gray20", "gray80")
+            text_color=("gray20", "gray80"),
+            justify="left",
+            wraplength=360,
         ).pack(pady=5)
 
         # 按钮区
         btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_frame.pack(pady=20)
 
-        ctk.CTkButton(
-            btn_frame, text="打开输出文件夹", width=140,
-            command=lambda: (
-                os.startfile(os.path.abspath(output_dir)) if os.name == 'nt'
-                else subprocess.run(["xdg-open", output_dir])
-            )
-        ).pack(side="left", padx=10)
+        # 输出目录可能是空字符串（多目录输入 + 留空），此时不提供"打开文件夹"
+        open_dir = output_dir if output_dir and os.path.isdir(output_dir) else ""
+        if open_dir:
+            ctk.CTkButton(
+                btn_frame, text="打开输出文件夹", width=140,
+                command=lambda d=open_dir: (
+                    os.startfile(os.path.abspath(d)) if os.name == 'nt'
+                    else subprocess.run(["xdg-open", d])
+                )
+            ).pack(side="left", padx=10)
+
+        if report and os.path.exists(report):
+            ctk.CTkButton(
+                btn_frame, text="查看失败清单", width=120,
+                fg_color="#8B3A3A", hover_color="#A04545",
+                command=lambda p=report: (
+                    os.startfile(os.path.abspath(p)) if os.name == 'nt'
+                    else subprocess.run(["xdg-open", p])
+                )
+            ).pack(side="left", padx=10)
 
         ctk.CTkButton(
             btn_frame, text="关闭", width=80,

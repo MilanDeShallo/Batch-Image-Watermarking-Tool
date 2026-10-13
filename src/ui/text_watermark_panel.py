@@ -23,6 +23,8 @@ from __future__ import annotations
 import customtkinter as ctk
 from typing import Callable, Optional
 
+from src.config import WatermarkConfig, opacity_to_alpha
+
 # 九宫格位置定义
 _POSITIONS = [
     ("top-left", "左上"), ("top-center", "上中"), ("top-right", "右上"),
@@ -65,7 +67,6 @@ class TextWatermarkPanel(ctk.CTkFrame):
             font=ctk.CTkFont(family="Microsoft YaHei", size=12),
         )
         self._text_box.pack(fill="x", padx=10, pady=(0, 8))
-        self._text_box.insert("1.0", "内部资料\nConfidential")
         self._text_box.bind("<KeyRelease>", lambda e: self._notify_change())
 
         # ---- 字体选择 ----
@@ -289,6 +290,12 @@ class TextWatermarkPanel(ctk.CTkFrame):
             except Exception:
                 pass
 
+        # 所有控件初值统一取自 WatermarkConfig 的默认值，面板里不再各写一份硬编码。
+        # 这正是"配置写 Logo 缩放 10%、界面初值 15%"这类不一致的来源。
+        # 默认文字为空：不会一打开就已经配好水印却没人注意到
+        # （这是"意外批量水印"最主要的成因）。
+        self.set_from_config(WatermarkConfig())
+
     # ============================================================
     # 控件回调
     # ============================================================
@@ -327,7 +334,7 @@ class TextWatermarkPanel(ctk.CTkFrame):
         if color:
             # color 是 (R, G, B) 元组，范围 0-1 或 0-255
             r, g, b = [int(c) for c in color]
-            a = int(self._opacity_var.get() * 255 / 100)  # 百分比 → alpha
+            a = opacity_to_alpha(self._opacity_var.get())  # 唯一换算口径
             self._color_rgba = (r, g, b, a)
             # 更新按钮背景色显示（近似）
             hex_color = f"#{r:02x}{g:02x}{b:02x}"
@@ -335,11 +342,13 @@ class TextWatermarkPanel(ctk.CTkFrame):
             self._notify_change()
 
     def _on_opacity_changed(self, value):
-        """透明度滑块变更 — 百分比(0-100)映射到 alpha(0-255)"""
+        """不透明度滑块变更 — 百分比(0-100)映射到 alpha(0-255)"""
         self._opacity_label.configure(text=f"{int(value)}%")
         r, g, b = self._color_rgba[:3]
-        alpha = int(value * 255 / 100)  # 0-100 → 0-255
-        self._color_rgba = (r, g, b, alpha)
+        # 用 config.opacity_to_alpha 而不是就地 int(v*255/100)：
+        # 就地截断会与配置类的四舍五入差 1/255，
+        # 造成"面板算出的 alpha"和"配置里的 alpha"对不上
+        self._color_rgba = (r, g, b, opacity_to_alpha(value))
         self._notify_change()
 
     def _on_tile_toggled(self):
@@ -456,14 +465,18 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._font_ratio_label.configure(text=f"{ratio:.1f}%")
 
         # 颜色 + 不透明度
-        # 以 opacity 为准重建 color_rgba 的 alpha：历史预设里这两者可能各自独立，
-        # 若只回填滑块，会出现「滑块显示 80% 但渲染用的是 alpha=128」的错位
-        self._color_rgba = getattr(cfg, 'color_rgba', (255, 255, 255, 128))
-        r, g, b = self._color_rgba[:3]
+        # 不透明度以 cfg.opacity 为唯一权威来源，color_rgba 只提供 RGB。
+        # 历史预设里这两者可能各写一个值，若直接用 color_rgba 的 alpha，
+        # 就会出现「滑块显示 80% 但实际按 128 渲染」的错位。
+        rgba = getattr(cfg, 'color_rgba', (255, 255, 255, 128))
+        try:
+            r, g, b = [int(v) for v in list(rgba)[:3]]
+        except (TypeError, ValueError):
+            r, g, b = 255, 255, 255
         self._color_btn.configure(fg_color=f"#{r:02x}{g:02x}{b:02x}")
 
         opacity = int(getattr(cfg, 'opacity', 50))
-        self._color_rgba = (r, g, b, max(0, min(255, int(opacity * 255 / 100))))
+        self._color_rgba = (r, g, b, opacity_to_alpha(opacity))
         self._opacity_var.set(opacity)
         self._opacity_label.configure(text=f"{opacity}%")
 

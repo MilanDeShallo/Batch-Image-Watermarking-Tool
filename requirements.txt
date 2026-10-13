@@ -1,7 +1,17 @@
-pillow>=12.3.0
-customtkinter>=5.2.2
-tkinterdnd2>=0.6.2
-reportlab>=4.0.0
-pypdf>=4.0.0
-pypdfium2>=4.30.0
-pyinstaller>=6.21.0
+# 运行依赖（版本已固定 —— 见 README「已验证版本组合」）
+# 固定而非范围区间：本工具的产物是"文件"，不同 Pillow 大版本的编码器
+# 与重采样实现都可能让同一套参数产出不同字节；出问题时要能精确复现。
+pillow==12.3.0
+customtkinter==6.0.0
+tkinterdnd2==0.6.2
+
+# PDF 功能（仅做图片水印时可不装）
+reportlab==5.0.1
+pypdf==6.16.2
+pypdfium2==5.13.0
+
+# 内存预算与进度显示：拿不到时程序会回落到保守值，不会崩
+psutil>=5.9.0
+
+# 仅打包时需要
+pyinstaller==6.21.0

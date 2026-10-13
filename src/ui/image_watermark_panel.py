@@ -11,6 +11,8 @@ from tkinter import filedialog, messagebox
 import os
 from PIL import Image, ImageTk
 
+from src.config import WatermarkConfig
+
 
 class ImageWatermarkPanel(ctk.CTkFrame):
     """图片水印设置面板"""
@@ -251,6 +253,11 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             except Exception:
                 pass
 
+        # 所有控件初值统一取自 WatermarkConfig 的默认值。
+        # 面板里原先硬编码"缩放 15% / 边距 5px"，而配置类写的是 10% / 20px ——
+        # 两套默认值，用户看到的就是"和文档写的不一样"。
+        self.set_from_config(WatermarkConfig())
+
     # ==================== 回调方法 ====================
 
     def _browse_logo(self):
@@ -265,17 +272,32 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         if path:
             self._load_logo(path)
 
-    def _clear_logo(self):
-        """清除已选 Logo"""
+    def _clear_logo(self, notify: bool = True):
+        """
+        清除已选 Logo。
+
+        :param notify: 是否触发变更通知。加载预设 / 回填面板期间传 False，
+                       由调用方统一刷新一次，避免重复渲染。
+        """
         self.logo_path = None
         self.logo_path_label.configure(text="未选择", text_color="gray")
-        if self.logo_preview_tk:
-            self.logo_preview_label.configure(image="", text="")
-            self.logo_preview_tk = None
-        self._notify_change()  # 清除后必须刷新预览
+        # 无条件清掉预览图：曾经写成 `if self.logo_preview_tk:` 才清理，
+        # 而该字段为 None 时就会跳过 —— 界面上残留上一张 Logo 的缩略图，
+        # 用户以为已经清掉了
+        self.logo_preview_label.configure(image="", text="")
+        self.logo_preview_tk = None
+        if notify:
+            self._notify_change()
 
-    def _load_logo(self, path):
-        """加载并预览 Logo"""
+    def _load_logo(self, path, silent: bool = False) -> bool:
+        """
+        加载并预览 Logo。
+
+        :param silent: True 时不弹错误框，只返回 False。
+                       预设加载走静默路径 —— 用户只是想换个预设，
+                       不该被一个模态错误框拦住
+        :return: 是否加载成功
+        """
         try:
             # with 确保源文件句柄及时释放（Windows 下否则 Logo 文件无法移动/删除）
             with Image.open(path) as src:
@@ -293,8 +315,14 @@ class ImageWatermarkPanel(ctk.CTkFrame):
                 text_color=("gray10", "#e0e0e0")
             )
             self._notify_change()
+            return True
         except Exception as e:
-            messagebox.showerror("Logo 加载失败", f"无法打开图片:\n{e}")
+            if not silent:
+                messagebox.showerror("Logo 加载失败", f"无法打开图片:\n{e}")
+            # 加载失败不能留着旧 Logo：否则界面显示的是"上一次那张"，
+            # 导出却按新的 logo_path 渲染 —— 两者对不上
+            self._clear_logo(notify=False)
+            return False
 
     def _on_tile_toggle(self):
         """平铺模式切换时的联动禁用"""
@@ -433,10 +461,17 @@ class ImageWatermarkPanel(ctk.CTkFrame):
                 "logo_angle": getattr(cfg, 'logo_angle', 0),
             }
 
-        # Logo 路径
-        logo_path = data.get("logo_path", "")
+        # Logo 路径 —— 无论预设有没有带 Logo，都必须**显式落地一次**。
+        #
+        # 只在"路径有效"时加载、其余情况什么都不做，会把上一次选中的 Logo
+        # 留在面板上：加载一个纯文字预设（或 Logo 已失效的预设）之后，
+        # 类型会被推导成 both，导出依旧带着旧 Logo ——
+        # 用户以为是纯文字，实际发出去的是带旧 Logo 的图。
+        logo_path = data.get("logo_path", "") or ""
         if logo_path and os.path.exists(logo_path):
-            self._load_logo(logo_path)
+            self._load_logo(logo_path, silent=True)
+        else:
+            self._clear_logo(notify=False)
 
         # 缩放比例：WatermarkConfig 用小数 (0.10)，滑块用整数 (10)
         scale_val = data.get("scale_ratio", 0.10)

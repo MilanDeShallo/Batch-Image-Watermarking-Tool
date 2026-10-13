@@ -590,7 +590,16 @@ class PreviewCanvas(ctk.CTkFrame):
         scale = 工作图宽度 / 参考宽度，交给引擎换算绝对像素类参数，
         使预览与导出的水印几何一致。
         """
-        key = (path, int(pdf_page), int(target_dim))
+        is_pdf = path.lower().endswith(".pdf")
+        # 覆盖层倍率也进缓存键：调过 set_overlay_scale 之后参考尺寸会变，
+        # 不带上它就会命中一份"口径已经过期"的底图，
+        # 表现为改了倍率但预览纹丝不动（导出却变了）
+        overlay_scale = None
+        if is_pdf:
+            from src.pdf_engine import get_overlay_scale
+            overlay_scale = get_overlay_scale()
+
+        key = (path, int(pdf_page), int(target_dim), overlay_scale)
         with self._base_lock:
             if self._base_key == key and self._base_work is not None:
                 return self._base_work, self._base_ref, self._base_scale
@@ -598,10 +607,10 @@ class PreviewCanvas(ctk.CTkFrame):
         from src.watermark_engine import safe_open_image
 
         page_count = None
-        if path.lower().endswith(".pdf"):
+        if is_pdf:
             from src.pdf_engine import (
                 get_pdf_page_count, pdf_page_reference_size,
-                render_pdf_page, OVERLAY_SCALE,
+                render_pdf_page,
             )
             try:
                 page_count = get_pdf_page_count(path)
@@ -613,7 +622,7 @@ class PreviewCanvas(ctk.CTkFrame):
                 pdf_page = max(0, pdf_page)
             ref_size = pdf_page_reference_size(path, pdf_page)
             # 渲染倍率按参考尺寸折算：目标工作尺寸 ÷ 覆盖层底图尺寸 × 覆盖层倍率
-            render_scale = OVERLAY_SCALE * (target_dim / max(ref_size))
+            render_scale = overlay_scale * (target_dim / max(ref_size))
             img = render_pdf_page(path, page_num=pdf_page, scale=render_scale)
         else:
             img = safe_open_image(path)

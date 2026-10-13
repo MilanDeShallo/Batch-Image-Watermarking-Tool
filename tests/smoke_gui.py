@@ -50,6 +50,13 @@ from reportlab.pdfgen import canvas as rl_canvas  # noqa: E402
 import customtkinter as ctk  # noqa: E402
 
 from src.config import WatermarkConfig  # noqa: E402
+from src.config import (  # noqa: E402
+    CONFLICT_LABELS,
+    CONFLICT_OVERWRITE,
+    CONFLICT_RENAME,
+    CONFLICT_SKIP,
+    DEFAULT_FILENAME_TEMPLATE,
+)
 from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_PAGE  # noqa: E402
 from src.pdf_engine import (  # noqa: E402
     get_pdf_page_count,
@@ -596,6 +603,128 @@ def main():
     app._image_panel.set_from_config(WatermarkConfig(watermark_type="image", logo_path=""))
     app._text_panel.set_from_config(base_cfg)
     app.update()
+
+    # ============================================================
+    # 预设加载：Logo 必须显式落地（无 Logo / 失效 Logo 都要清空）
+    # ============================================================
+    head("加载预设：无 Logo / Logo 失效时必须清空旧 Logo")
+    # 先让面板处于「有 Logo」状态
+    app._image_panel.set_from_config(
+        WatermarkConfig(watermark_type="image", logo_path=logo_path)
+    )
+    app._text_panel.set_from_config(WatermarkConfig(watermark_type="text", text="文字"))
+    app.update()
+    check("前置条件：面板已装上 Logo",
+          app._image_panel.logo_path == logo_path, app._image_panel.logo_path)
+
+    # 1) 加载「纯文字」预设（logo_path 为空）→ 旧 Logo 必须被清掉。
+    #    旧实现只在「路径存在」时才动作，其余情况什么都不做，于是面板上
+    #    仍留着上一张 Logo，导出结果变成「以为纯文字、实际带 Logo」。
+    app._image_panel.set_from_config(WatermarkConfig(watermark_type="text", logo_path=""))
+    app.update()
+    check("加载无 Logo 预设后 logo_path 被清空",
+          not app._image_panel.logo_path, app._image_panel.logo_path)
+    check("加载无 Logo 预设后预览缩略图同步清掉",
+          app._image_panel.logo_preview_tk is None, app._image_panel.logo_preview_tk)
+    check("加载无 Logo 预设后水印类型回落 text",
+          app._get_current_config().watermark_type == "text",
+          app._get_current_config().watermark_type)
+
+    # 2) 加载 Logo 路径失效的预设 → 同样不能沿用上一张
+    app._image_panel.set_from_config(
+        WatermarkConfig(watermark_type="image", logo_path=logo_path)
+    )
+    app.update()
+    check("前置条件：重新装上 Logo", app._image_panel.logo_path == logo_path)
+
+    missing_logo = os.path.join(src_dir, "logo-does-not-exist.png")
+    app._image_panel.set_from_config(
+        WatermarkConfig(watermark_type="image", logo_path=missing_logo)
+    )
+    app.update()
+    check("加载失效 Logo 预设后不保留旧 Logo",
+          app._image_panel.logo_path != logo_path, app._image_panel.logo_path)
+    check("失效 Logo 不会污染最终配置",
+          app._get_current_config().logo_path != logo_path,
+          app._get_current_config().logo_path)
+
+    # ============================================================
+    # 界面初值必须来自配置类（不再各处硬编码）
+    # ============================================================
+    head("界面初值取自配置类（唯一来源）")
+    from src.ui.image_watermark_panel import ImageWatermarkPanel  # noqa: E402
+    from src.ui.text_watermark_panel import TextWatermarkPanel  # noqa: E402
+
+    defaults = WatermarkConfig()
+    fresh_text = TextWatermarkPanel(app)
+    fresh_image = ImageWatermarkPanel(app)
+    app.update()
+    try:
+        t0 = fresh_text.get_config_dict()
+        i0 = fresh_image.get_config_dict()
+        check("文字面板初值文本 = 配置类默认（不再预填「内部资料」）",
+              t0.get("text") == defaults.text, repr(t0.get("text")))
+        check("文字面板初值不透明度 = 配置类默认",
+              t0.get("opacity") == defaults.opacity, t0.get("opacity"))
+        check("文字面板初值边距 = 配置类默认",
+              t0.get("margin") == defaults.margin, t0.get("margin"))
+        check("图片面板初值 Logo 缩放 = 配置类默认",
+              abs(float(i0.get("scale_ratio")) - defaults.scale_ratio) < 1e-9,
+              i0.get("scale_ratio"))
+        check("图片面板初值 Logo 边距 = 配置类默认",
+              i0.get("logo_margin") == defaults.logo_margin, i0.get("logo_margin"))
+    finally:
+        fresh_text.destroy()
+        fresh_image.destroy()
+        app.update()
+
+    # ============================================================
+    # 输出设置控件（文件名模板 / 同名策略 / 覆盖原图）
+    # ============================================================
+    head("输出设置：文件名模板 / 同名策略 / 覆盖原图")
+    check("存在文件名模板输入框", is_managed(app._template_entry))
+    check("存在同名冲突下拉", is_managed(app._conflict_menu))
+    check("存在「覆盖原图」勾选框", is_managed(app._overwrite_original_cb))
+    check("模板初值 = 配置类默认",
+          app._template_var.get() == DEFAULT_FILENAME_TEMPLATE, app._template_var.get())
+    check("同名策略初值 = 自动重命名",
+          app._conflict_mode() == CONFLICT_RENAME, app._conflict_mode())
+    check("覆盖原图默认不勾选", app._is_overwrite_original() is False)
+
+    mode_ok = []
+    for code in (CONFLICT_SKIP, CONFLICT_OVERWRITE, CONFLICT_RENAME):
+        app._conflict_var.set(CONFLICT_LABELS[code])
+        app.update()
+        mode_ok.append(app._conflict_mode() == code)
+    check("下拉三种策略都能正确映射成代码", all(mode_ok), mode_ok)
+
+    # 空模板必须回落默认，否则所有文件会撞成同一个名字
+    app._template_var.set("   ")
+    app._on_template_changed()
+    app.update()
+    check("空模板回落为默认模板",
+          app._template_var.get() == DEFAULT_FILENAME_TEMPLATE, app._template_var.get())
+    app._template_var.set("{original}_tpl")
+    app._on_template_changed()
+    app.update()
+    check("自定义模板被保留",
+          app._template_var.get() == "{original}_tpl", app._template_var.get())
+    app._template_var.set(DEFAULT_FILENAME_TEMPLATE)
+    app._on_template_changed()
+    app.update()
+
+    # 只切控件状态，不真正跑批处理 —— 覆盖原图会弹两次确认框
+    app._overwrite_original_var.set(True)
+    app._refresh_output_hint()
+    app.update()
+    check("勾选「覆盖原图」后状态为真", app._is_overwrite_original() is True)
+    check("勾选后输出提示出现覆盖警告",
+          "覆盖原图" in app._output_hint_label.cget("text"),
+          app._output_hint_label.cget("text"))
+    app._overwrite_original_var.set(False)
+    app._refresh_output_hint()
+    app.update()
+    check("取消勾选后恢复", app._is_overwrite_original() is False)
 
     # ---------- 收尾 ----------
     head("收尾")

@@ -1,0 +1,57 @@
+name: Tests
+
+# 为什么在 Windows 上跑：
+# 这是个 Windows 桌面工具 —— 打包产物、.bat 启动器、`os.startfile`、
+# APPDATA 下的日志与会话文件都是 Windows 专属行为。在 Linux 上跑绿了
+# 说明不了任何事。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==9.1.1
+
+      # 两个冒烟脚本文件名不是 test_*，pytest 不会自动收集它们，
+      # 必须显式跑：它们需要真实窗口与 mainloop，单元测试替代不了。
+      - name: Unit and integration tests
+        run: python -m pytest tests/ -q
+
+      - name: GUI smoke test
+        run: python -u tests/smoke_gui.py
+
+      - name: Preview pipeline smoke test
+        run: python -u tests/smoke_preview.py
+
+      # 失败时最有价值的是日志：崩溃钩子会把主线程与工作线程的异常都写进去
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watermark-tool-logs
+          path: ${{ env.APPDATA }}/WatermarkTool/
+          if-no-files-found: ignore

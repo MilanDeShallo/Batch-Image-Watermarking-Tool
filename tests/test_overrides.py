@@ -9,6 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.config import opacity_to_alpha
 from src.overrides import (
     SCOPE_ALL,
     SCOPE_FILE,
@@ -277,27 +278,54 @@ class TestPrune:
 class TestPersistence:
     def test_round_trip(self):
         store = ScopeStore()
-        store.update_base({"text": "全局", "color_rgba": (255, 0, 0, 200)})
+        # 历史写法：只用 alpha 表达不透明度。入口处应被翻译成 opacity=80
+        store.update_base({"text": "全局", "color_rgba": (255, 0, 0, 204)})
         store.update_file(B, {"text": "样片"})
         store.update_page(C, 4, {"text": "第5页", "opacity": 25})
 
         restored = ScopeStore.from_dict(store.to_dict())
 
         assert restored.base["text"] == "全局"
+        assert restored.base["opacity"] == 80   # alpha 204 → 80%，只此一个来源
         assert restored.config_for(B).text == "样片"
         assert restored.config_for(C, 4).text == "第5页"
         assert restored.config_for(C, 4).opacity == 25
-        # 颜色元组经 JSON 走一圈后要能还原成 tuple
-        assert restored.config_for(C, 4).color_rgba == (255, 0, 0, 200)
+        # 颜色元组经 JSON 走一圈后要能还原成 tuple；
+        # 本页只覆盖了不透明度，RGB 沿用全局，alpha 由 opacity 派生
+        assert restored.config_for(C, 4).color_rgba == (255, 0, 0, opacity_to_alpha(25))
 
     def test_round_trip_through_json(self):
         import json
         store = ScopeStore()
-        store.update_page(C, 2, {"text": "页", "color_rgba": (1, 2, 3, 4)})
+        store.update_page(C, 2, {"text": "页", "color_rgba": (1, 2, 3, 128)})
         text = json.dumps(store.to_dict(), ensure_ascii=False)
         restored = ScopeStore.from_dict(json.loads(text))
-        assert restored.config_for(C, 2).color_rgba == (1, 2, 3, 4)
+        cfg = restored.config_for(C, 2)
+        # tuple 经 JSON 走一圈后要还原成 tuple，
+        # 否则 _same_value 会把「其实没改」的字段误判成改动，平白多存一条补丁
+        assert isinstance(cfg.color_rgba, tuple)
+        assert cfg.color_rgba == (1, 2, 3, 128)
+        assert cfg.opacity == 50
         assert restored.page_numbers(C) == [2]
+
+    def test_alpha_only_patch_migrates_to_opacity(self):
+        """
+        只给 alpha 的历史补丁必须翻译成 opacity。
+
+        这是「不透明度只有一个权威源」的兼容面：内部认 opacity，
+        但外部脚本与旧会话文件一直用 color_rgba 的第 4 位，
+        入口不翻译的话它们会被默认值顶掉，半透明水印静默变淡。
+        """
+        assert strip_output_fields({"color_rgba": (10, 20, 30, 255)})["opacity"] == 100
+        assert strip_output_fields({"color_rgba": (10, 20, 30, 128)})["opacity"] == 50
+        # 显式给了 opacity 就以它为准，不再被 alpha 覆盖
+        both = strip_output_fields({"color_rgba": (10, 20, 30, 255), "opacity": 30})
+        assert both["opacity"] == 30
+
+        store = ScopeStore()
+        store.update_base({"text": "只给 alpha", "color_rgba": (255, 0, 0, 128)})
+        assert store.base["opacity"] == 50
+        assert store.config_for().color_rgba == (255, 0, 0, 128)
 
     def test_from_dict_tolerates_garbage(self):
         assert ScopeStore.from_dict(None).override_paths() == []

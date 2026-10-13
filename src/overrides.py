@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from src.config import opacity_from_color
+
 # 作用范围取值
 SCOPE_ALL = "all"    # 全局默认：所有文件共用
 SCOPE_FILE = "file"  # 仅本文件：只记给选中的文件
@@ -41,6 +43,7 @@ OUTPUT_FIELDS = frozenset({
     "output_format",
     "jpeg_quality",
     "filename_template",
+    "on_conflict",
     "overwrite_original",
     "version",
 })
@@ -52,7 +55,13 @@ def strip_output_fields(data: dict) -> dict:
 
     作用域只管"水印长什么样"，不管"存到哪、存成什么格式"。
     """
-    return {k: v for k, v in dict(data or {}).items() if k not in OUTPUT_FIELDS}
+    clean = {k: v for k, v in dict(data or {}).items() if k not in OUTPUT_FIELDS}
+    # 历史写法：用 color_rgba 的第 4 位表达不透明度。
+    # 在这里翻译成 opacity，作用域层里就只剩一个不透明度来源 ——
+    # 否则「本页设了 opacity=25」会被同一份补丁里的旧 alpha 顶回去。
+    if "color_rgba" in clean and "opacity" not in clean:
+        clean["opacity"] = opacity_from_color(clean["color_rgba"])
+    return clean
 
 
 def _same_value(a: Any, b: Any) -> bool:

@@ -14,8 +14,12 @@
 import os
 from dataclasses import dataclass, field
 
-from src.config import WatermarkConfig
-from src.file_manager import is_pdf_file
+from src.config import (
+    CONFLICT_RENAME,
+    DEFAULT_FILENAME_TEMPLATE,
+    WatermarkConfig,
+)
+from src.file_manager import DESKTOP_FALLBACK_DIRNAME, is_pdf_file
 
 
 # 界面下拉文案 / 格式名 → 内部格式标识
@@ -94,6 +98,60 @@ class BatchPlan:
         return [t.to_merge_item() for t in self.tasks]
 
 
+def plan_output_paths(
+    plan: "BatchPlan",
+    output_dir: str,
+    filename_template: str = DEFAULT_FILENAME_TEMPLATE,
+    on_conflict: str = CONFLICT_RENAME,
+    overwrite_original: bool = False,
+) -> tuple[list, str]:
+    """
+    为整批任务分配输出路径（纯逻辑，可单测）。
+
+    :param plan: plan_batch 产出的计划
+    :param output_dir: 输出目录；空字符串表示"按各源文件所在目录分别输出"
+    :param filename_template: 文件名模板，支持 {original}/{date}/{time}/{seq}
+    :param on_conflict: 同名冲突策略 rename / overwrite / skip
+    :param overwrite_original: 就地覆盖原图（此时输出路径就是源路径）
+    :return: (与 plan.tasks 一一对应的路径列表, 合并输出路径)
+            列表元素为 None 表示该任务应被跳过。
+
+    为什么要单独成函数：
+    「哪个文件写到哪个名字」是导出方案的一部分，以前这段循环埋在
+    AppWindow._on_start_processing 里，测试根本碰不到 ——
+    于是模板参数写了、冲突策略实现了，却因为没人传进去而长期失效。
+    """
+    from src.file_manager import generate_merged_output_path, generate_output_path
+
+    existing_names: set[str] = set()
+
+    if plan.merge:
+        merged_dir = output_dir or os.path.join(
+            os.path.expanduser("~"), "Desktop", DESKTOP_FALLBACK_DIRNAME
+        )
+        return [], generate_merged_output_path(merged_dir, existing_names)
+
+    paths: list = []
+    for index, task in enumerate(plan.tasks, start=1):
+        path = generate_output_path(
+            task.path,
+            output_dir,
+            filename_template=filename_template,
+            output_format=task.output_format,
+            seq_counter=index,
+            existing_names=existing_names,
+            on_conflict=on_conflict,
+            overwrite_original=overwrite_original,
+        )
+        if path and overwrite_original:
+            # 就地覆盖模式下 generate_output_path 直接返回源路径，
+            # 这里补登记，避免同一批里两个任务落到同一个源文件上
+            existing_names.add(path)
+        paths.append(path)
+
+    return paths, ""
+
+
 def plan_batch(files, scopes, out_format: str = "auto", merge_pdf: bool = False) -> BatchPlan:
     """
     生成整批处理计划。
@@ -131,38 +189,60 @@ def plan_batch(files, scopes, out_format: str = "auto", merge_pdf: bool = False)
     return BatchPlan(tasks=tasks, merge=merge, out_format=norm)
 
 
-def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90) -> int:
+class TaskCancelled(Exception):
+    """用户在任务开始前取消了处理（尚未写出任何文件）"""
+
+
+def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
+                 should_cancel=None) -> int:
     """
     执行单个文件任务，结果写到 output_path。
 
     :param task: plan_batch 产出的单个任务
     :param output_path: 输出文件路径
     :param jpeg_quality: JPEG / PDF 内图片的编码质量
+    :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled
     :return: 写出的页数（图片恒为 1）
 
     分支说明：
     - PDF 源 → 覆盖层合并，原文保留可选可搜，逐页参数生效
     - 图片 + 输出 pdf → 单页 PDF，页面尺寸按像素比例换算
     - 图片 + 输出 png/jpeg/auto → Pillow 引擎直接存图
+
+    两个安全约定：
+    1. **入口取消检查**：取消后不再启动新的解码/渲染。
+       已经跑起来的那个任务无法安全中断（Pillow 合成没有中断点），
+       但至少不会再开新的，也不必等队列里剩余的任务跑完。
+    2. **原子写出**：所有分支都先写临时文件、再 os.replace 到最终路径。
+       中途异常 / 进程被杀都不会留下"看着存在、其实是坏文件"的半成品。
+       覆盖原图模式尤其依赖这一点 —— 否则一次失败就能把源文件毁掉。
     """
+    if should_cancel is not None and should_cancel():
+        raise TaskCancelled("用户取消")
+
+    from src.file_manager import atomic_output
+
     if task.is_pdf_source:
         from src.pdf_engine import apply_pdf_watermark
-        return apply_pdf_watermark(
-            task.path, task.config, output_path, task.page_configs or None
-        )
+        with atomic_output(output_path) as tmp:
+            return apply_pdf_watermark(
+                task.path, task.config, tmp, task.page_configs or None
+            )
 
     if task.output_format == "pdf":
         from src.pdf_engine import image_file_to_pdf_bytes
         data = image_file_to_pdf_bytes(task.path, task.config, jpeg_quality)
-        with open(output_path, "wb") as f:
-            f.write(data)
+        with atomic_output(output_path) as tmp:
+            with open(tmp, "wb") as f:
+                f.write(data)
         return 1
 
     from src.watermark_engine import apply_watermark, safe_open_image, save_with_format
 
     img = safe_open_image(task.path)
     result = apply_watermark(img, task.config)
-    save_with_format(result, output_path, jpeg_quality)
+    with atomic_output(output_path) as tmp:
+        save_with_format(result, tmp, jpeg_quality)
     # 显式释放，避免批量处理时大图堆积
     del img, result
     return 1

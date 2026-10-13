@@ -14,7 +14,7 @@ import shutil
 # 确保项目根目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import WatermarkConfig
+from src.config import WatermarkConfig, opacity_to_alpha
 from src.file_manager import generate_output_path, get_default_output_dir, collect_files
 from src.preset_manager import PresetManager
 from src.watermark_engine import safe_open_image, apply_watermark, custom_anchor_position
@@ -46,8 +46,10 @@ class TestConfig:
 
         assert cfg2.text == "测试水印"
         assert cfg2.font_ratio == 0.05
-        assert cfg2.color_rgba == (255, 0, 0, 200)  # tuple 恢复
         assert cfg2.opacity == 80
+        # alpha 是派生值：唯一权威源是 opacity，同一次构造里两者必须自洽。
+        # 旧实现把 alpha 当输入、opacity 当摆设，会出现「滑块 80%、渲染按 128」
+        assert cfg2.color_rgba == (255, 0, 0, opacity_to_alpha(80))
         assert cfg2.position == "top-left"
         assert cfg2.position_mode == "custom"
         assert cfg2.custom_x == 30

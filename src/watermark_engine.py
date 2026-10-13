@@ -28,8 +28,20 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 # ============================================================
 # 全局安全设置
 # ============================================================
-# 关闭 Pillow 的 DecompressionBombError 限制（支持超高分辨率大图）
-Image.MAX_IMAGE_PIXELS = None
+# 图片像素上限。
+#
+# 历史实现把它设成 None（完全关掉 Pillow 的解压炸弹保护）—— 那等于放弃
+# 最后一道防线：几十 KB 的畸形文件可以声称自己是 10 万×10 万，一 open 就要
+# 40GB 内存，直接拖垮整个进程。现在恢复成**有限**的保护，只是把阈值提到
+# 正常业务用不到的量级：
+#   - 超过 3 亿像素        → Pillow 发警告（仍可处理）
+#   - 超过 6 亿像素(2×)    → Pillow 抛 DecompressionBombError，
+#                            safe_open_image 转成带文件名的明确错误，
+#                            只失败这一个文件，不影响整批
+#   - 超过 5000 万像素     → 批处理前由 resource_budget 给出内存预警，
+#                            由用户决定是否继续（见 src/resource_budget.py）
+MAX_IMAGE_PIXELS_LIMIT = 300_000_000   # 约 1.2GB RGBA
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS_LIMIT
 
 # EXIF Orientation 标签编号 (274 = 0x0112)
 ORIENTATION_TAG = 0x0112
@@ -110,14 +122,24 @@ def safe_open_image(path: str) -> Image.Image:
 
     1. ImageOps.exif_transpose() - 自动校正手机/相机竖拍照片的旋转方向
     2. 色彩空间归一化 - CMYK/P/La 等非标准模式转为 RGB
-    3. 大图安全保障 - MAX_IMAGE_PIXELS 已在模块级设为 None
+    3. 解压炸弹保护 - 像素数超过 MAX_IMAGE_PIXELS_LIMIT 的文件被 Pillow 拒绝，
+       这里转成带文件名的明确错误。否则整批只会看到一个陌生的异常类型，
+       用户既不知道是哪个文件、也不知道为什么
 
     文件句柄释放（Windows 关键）：
     - Image.open() 返回惰性对象并持有文件句柄，只有 load()/convert() 之后才释放
     - 若在 open 与 load 之间抛异常，句柄会一直被占用，源图片无法重命名/删除
     - 因此用 with 包住整个读取过程，并返回完全脱离文件的对象副本
     """
-    with Image.open(path) as src:
+    try:
+        opener = Image.open(path)
+    except Image.DecompressionBombError as e:
+        raise ValueError(
+            f"图片像素数超过安全上限（{MAX_IMAGE_PIXELS_LIMIT:,} 像素），已拒绝处理："
+            f"{os.path.basename(path)}"
+        ) from e
+
+    with opener as src:
         src.load()  # 强制加载像素数据，尽早发现损坏文件
 
         # 1. EXIF 方向自动校正（返回脱离文件的新对象）
@@ -422,7 +444,13 @@ def add_text_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Imag
     font, is_warning = load_font_with_fallback(cfg.font_path or None, font_size)
 
     # 渲染文字 sprite
-    sprite = _render_text_sprite(cfg.text, font, cfg.color_rgba, cfg.angle)
+    # 不透明度只有一个来源：opacity。这里取派生出的 alpha，
+    # 而不是直接用 cfg.color_rgba —— 后者可能与滑块值不一致
+    rgba = cfg.color_rgba
+    resolver = getattr(cfg, "resolved_color_rgba", None)
+    if callable(resolver):
+        rgba = resolver()
+    sprite = _render_text_sprite(cfg.text, font, rgba, cfg.angle)
 
     # 创建透明覆盖层
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -651,11 +679,13 @@ if __name__ == "__main__":
     print(f"[引擎测试] 输出: {output_path}")
 
     # 使用默认配置
+    # 不透明度只通过 opacity 指定 —— color_rgba 的 alpha 由它派生。
+    # 这里若再另写一个 alpha，只会和 opacity 打架（构造时也会被覆盖掉）。
     from src.config import WatermarkConfig
     default_cfg = WatermarkConfig(
         watermark_type="text",
         text="内部资料\nConfidential",
-        color_rgba=(255, 255, 255, 80),
+        opacity=50,
         font_ratio=0.04,
         angle=30,
         tile=True,

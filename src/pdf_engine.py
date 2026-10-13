@@ -29,23 +29,56 @@ from reportlab.lib.utils import ImageReader
 from pypdf import PdfReader, PdfWriter
 
 # 覆盖层渲染倍率（相对 PDF 页面点数）。
-# 2.0 ≈ 144 DPI，保证文字在 200% 缩放下依然清晰
+# 2.0 ≈ 144 DPI，保证文字在 200% 缩放下依然清晰。
+# 注意：覆盖层是整页位图，输出体积与倍率的平方成正比，
+# 所以这也是"清晰度 ↔ 体积/内存"的旋钮（见 set_overlay_scale）。
 OVERLAY_SCALE = 2.0
+OVERLAY_SCALE_MIN = 1.0
+OVERLAY_SCALE_MAX = 4.0
+
+
+def set_overlay_scale(value) -> float:
+    """
+    调整覆盖层渲染倍率，返回生效值。
+
+    必须在生成任何覆盖层之前调用：预览用的"导出参考尺寸"与覆盖层生成
+    共用同一个倍率，中途改变会让已经算好的参考尺寸失效，
+    表现为预览与导出重新不一致。
+    """
+    global OVERLAY_SCALE
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return OVERLAY_SCALE
+    OVERLAY_SCALE = max(OVERLAY_SCALE_MIN, min(OVERLAY_SCALE_MAX, parsed))
+    return OVERLAY_SCALE
+
+
+def get_overlay_scale() -> float:
+    """当前覆盖层渲染倍率"""
+    return OVERLAY_SCALE
 
 
 # ============================================================
 # 页面渲染（预览/缩略图用）
 # ============================================================
 
-def render_pdf_page(pdf_path: str, page_num: int = 0, scale: float = OVERLAY_SCALE) -> Image.Image:
+def render_pdf_page(pdf_path: str, page_num: int = 0, scale: float | None = None) -> Image.Image:
     """
     渲染 PDF 指定页为 PIL 图像（RGB）。
 
     :param pdf_path: PDF 文件路径
     :param page_num: 页码（0 起）
-    :param scale: 渲染倍率（1.0 = 72 DPI）
+    :param scale: 渲染倍率（1.0 = 72 DPI），默认取当前 OVERLAY_SCALE。
+
+    为什么默认值是 None 而不是 OVERLAY_SCALE：
+    函数默认参数在 def 时求值，写死 OVERLAY_SCALE 之后，
+    再调 set_overlay_scale 也不会生效。
     """
     import pypdfium2 as pdfium
+
+    if scale is None:
+        scale = OVERLAY_SCALE
 
     doc = pdfium.PdfDocument(pdf_path)
     try:
@@ -249,6 +282,110 @@ class MergeCancelled(Exception):
 # 主入口
 # ============================================================
 
+# 产出工具标识（写进输出 PDF 的 /Producer）
+APP_PRODUCER = "批量图片水印工具"
+
+# 原文档元数据里应当原样带走的键
+_PRESERVED_META_KEYS = ("/Title", "/Author", "/Subject", "/Keywords", "/Creator")
+
+
+def has_digital_signature(pdf_path: str) -> bool:
+    """
+    判断 PDF 是否带数字签名。
+
+    为什么必须在处理前判断：
+    加水印是改写文件，而数字签名覆盖的是"原始字节"。任何修改都会让签名失效，
+    阅读器会弹出「签名无效 / 文档已被修改」。这不是工具能修的（重新签名需要
+    用户的私钥），但必须**明确告警**，而不是悄悄把签名弄坏。
+    """
+    try:
+        reader = _open_reader(pdf_path)
+    except Exception:
+        return False
+
+    try:
+        root = reader.trailer.get("/Root")
+        if root is None:
+            return False
+
+        # 1) 文档级签名权限（DocMDP / 使用权签名）
+        perms = root.get("/Perms")
+        if perms is not None:
+            try:
+                if any(str(k).startswith(("/DocMDP", "/UR3", "/UR")) for k in perms.keys()):
+                    return True
+            except Exception:
+                pass
+
+        # 2) 表单里的签名字段（最常见的可见签名）
+        try:
+            fields = reader.get_fields() or {}
+            for value in fields.values():
+                try:
+                    if str(value.get("/FT")) == "/Sig":
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 3) AcroForm 的签名标志位
+        acro = root.get("/AcroForm")
+        if acro is not None:
+            try:
+                if int(acro.get("/SigFlags") or 0) & 1:
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+    return False
+
+
+def signed_pdf_files(paths) -> list[str]:
+    """输入中带数字签名的 PDF 列表（供界面批量预检并告警）"""
+    out = []
+    for path in paths or []:
+        if not str(path).lower().endswith(".pdf"):
+            continue
+        try:
+            if has_digital_signature(path):
+                out.append(path)
+        except Exception:
+            continue
+    return out
+
+
+def _copy_metadata(writer, reader) -> dict:
+    """
+    把原文档元数据带到输出，并标记产出工具。
+
+    策略：
+    - 原文档已有的 Title / Author / Subject / Keywords / Creator **原样保留**
+      （用户的信息不该被工具抹掉）
+    - /Producer 改为本工具：它描述的是"由谁生成这个文件"，确实是我们
+    :return: 实际写入的元数据字典
+    """
+    meta: dict[str, str] = {}
+    try:
+        src = reader.metadata
+        if src:
+            for key in _PRESERVED_META_KEYS:
+                value = src.get(key)
+                if value:
+                    meta[key] = str(value)
+    except Exception:
+        pass
+
+    meta["/Producer"] = APP_PRODUCER
+    try:
+        writer.add_metadata(meta)
+    except Exception:
+        pass
+    return meta
+
+
 def _open_reader(pdf_path: str) -> PdfReader:
     """
     打开 PDF 并做前置校验：存在性、可解析性、加密、空文件。
@@ -284,6 +421,7 @@ def watermark_pdf_bytes(
     pdf_path: str,
     cfg,
     page_configs: dict | None = None,
+    should_cancel=None,
 ) -> tuple[bytes, int]:
     """
     给 PDF 加水印，返回 (输出字节, 页数)。
@@ -292,7 +430,14 @@ def watermark_pdf_bytes(
     - page_configs 形如 {页码(0 起): WatermarkConfig}
     - 命中该页码的页面用专属参数，其余页面用 cfg（文件层/全局默认）
 
+    :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled。
+        检查点在**每一页之间** —— 一本几百页的 PDF 取消后不必等它跑完。
+        覆盖层缓存命中时单页成本很低，但页面渲染本身仍可能很慢。
     :raises FileNotFoundError / ValueError: 见 _open_reader
+    :raises TaskCancelled: 用户取消（尚未返回任何字节，调用方不会写出半成品）
+
+    注意：本函数会改写 PDF 字节。若源文件带数字签名，输出后签名必然失效
+    （见 has_digital_signature）。调用方有义务在处理前告警。
     """
     reader = _open_reader(pdf_path)
 
@@ -300,10 +445,18 @@ def watermark_pdf_bytes(
     writer = PdfWriter()
     writer.append(reader)
 
+    # 元数据：原文的 Title/Author 等原样带走，/Producer 标记为本工具
+    _copy_metadata(writer, reader)
+
     # 按「尺寸 + 旋转角 + 配置指纹」缓存覆盖层（同规格同参数只生成一次）
     overlay_cache: dict[tuple, bytes] = {}
 
     for index, page in enumerate(writer.pages):
+        if should_cancel is not None and should_cancel():
+            # 延迟导入：batch_planner 依赖本模块，模块级互相 import 会绕成环
+            from src.batch_planner import TaskCancelled
+            raise TaskCancelled(f"用户取消（已处理 {index} 页）")
+
         page_cfg = cfg
         if page_configs:
             page_cfg = page_configs.get(index, cfg)
@@ -336,6 +489,7 @@ def apply_pdf_watermark(
     cfg,
     output_path: str,
     page_configs: dict | None = None,
+    should_cancel=None,
 ) -> int:
     """
     给 PDF 每一页加水印，输出到 output_path。
@@ -344,10 +498,16 @@ def apply_pdf_watermark(
     :param cfg: 默认 WatermarkConfig
     :param output_path: 输出 PDF 路径
     :param page_configs: 可选的逐页参数 {页码(0 起): WatermarkConfig}
+    :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled
     :return: 处理的页数
     :raises ValueError: PDF 加密或损坏
+    :raises TaskCancelled: 用户取消（不会写出文件）
+
+    本函数只负责"把字节写到给定路径"；**原子替换由调用方负责**
+    （见 file_manager.atomic_output），这样覆盖原图模式下
+    一次失败也不会毁掉源文件。
     """
-    data, pages = watermark_pdf_bytes(pdf_path, cfg, page_configs)
+    data, pages = watermark_pdf_bytes(pdf_path, cfg, page_configs, should_cancel)
     with open(output_path, "wb") as f:
         f.write(data)
     return pages
@@ -467,7 +627,26 @@ def build_merged_pdf(
     if progress:
         progress(total, total, "")
 
-    with open(output_path, "wb") as f:
-        writer.write(f)
+    # 合并结果没有"某一份原始文档"可言，取第一份的元数据做底，
+    # 再把 /Producer 标成本工具
+    try:
+        first = items[0]["path"] if items else ""
+        if first:
+            meta = _copy_metadata(writer, PdfReader(first))
+            if meta.get("/Title"):
+                # 单个合并文件的默认标题意义不大，去掉以免误导
+                meta.pop("/Title", None)
+                writer.add_metadata(meta)
+    except Exception:
+        try:
+            writer.add_metadata({"/Producer": APP_PRODUCER})
+        except Exception:
+            pass
+
+    # 原子写出：异常 / 取消都不留半成品
+    from src.file_manager import atomic_output
+    with atomic_output(output_path) as tmp:
+        with open(tmp, "wb") as f:
+            writer.write(f)
 
     return len(writer.pages)

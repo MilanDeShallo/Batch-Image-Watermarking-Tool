@@ -84,3 +84,69 @@ def log_error(msg: str, exc: Exception | None = None):
 def log_debug(msg: str):
     """记录 DEBUG 级别日志"""
     get_logger().debug(msg)
+
+
+def log_exception(msg: str, exc: BaseException | None = None):
+    """
+    记录异常并附带完整 traceback。
+
+    打包成 exe 后没有控制台，`print()` 出去的错误信息用户永远看不到，
+    必须落到文件里才可能被排查。
+    """
+    try:
+        get_logger().error(msg, exc_info=exc if exc is not None else True)
+    except Exception:
+        pass
+
+
+def log_path() -> str:
+    """日志文件路径（供界面「打开日志」入口使用）"""
+    return _LOG_FILE
+
+
+def log_dir() -> str:
+    """日志目录"""
+    return _LOG_DIR
+
+
+def install_excepthook():
+    """
+    把未捕获异常写进日志。
+
+    默认行为是把 traceback 打到 stderr —— exe 没有 stderr，异常就此消失。
+    """
+    import sys
+    import threading
+
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        log_exception(
+            "未捕获异常",
+            exc_value if exc_value is not None else exc_type,
+        )
+        try:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+    # 线程里的异常不会被 sys.excepthook 捕获
+    try:
+        _original = threading.excepthook
+
+        def _thread_hook(args):
+            if not issubclass(args.exc_type, SystemExit):
+                log_exception(
+                    f"工作线程未捕获异常 ({getattr(args.thread, 'name', '?')})",
+                    args.exc_value,
+                )
+            try:
+                _original(args)
+            except Exception:
+                pass
+
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
