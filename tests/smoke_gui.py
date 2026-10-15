@@ -24,6 +24,14 @@ import sys
 import tempfile
 import time
 
+# CI（英文 Windows）的 stdout 默认是 cp1252 —— 第一句中文就会 UnicodeEncodeError
+# 直接崩掉、一条检查都跑不到。与 build_exe.py 同一处理：显式切成 UTF-8。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
