@@ -5,6 +5,14 @@ import os
 import sys
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
+# CI（英文 Windows）的 stdout 默认是 cp1252 —— 中文输出会 UnicodeEncodeError。
+# 与 build_exe.py / 冒烟脚本同一处理：显式切成 UTF-8。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 block_cipher = None
 
 # 版本号唯一来源：src/__init__.py。
