@@ -194,7 +194,7 @@ class TaskCancelled(Exception):
 
 
 def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
-                 should_cancel=None) -> int:
+                 should_cancel=None, overlay_scale: float | None = None) -> int:
     """
     执行单个文件任务，结果写到 output_path。
 
@@ -202,6 +202,8 @@ def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
     :param output_path: 输出文件路径
     :param jpeg_quality: JPEG / PDF 内图片的编码质量
     :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled
+    :param overlay_scale: 覆盖层渲染倍率快照（PDF 源使用）；
+        None 表示由 pdf_engine 取当时的全局值
     :return: 写出的页数（图片恒为 1）
 
     分支说明：
@@ -210,9 +212,10 @@ def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
     - 图片 + 输出 png/jpeg/auto → Pillow 引擎直接存图
 
     两个安全约定：
-    1. **入口取消检查**：取消后不再启动新的解码/渲染。
-       已经跑起来的那个任务无法安全中断（Pillow 合成没有中断点），
-       但至少不会再开新的，也不必等队列里剩余的任务跑完。
+    1. **取消检查分两级**：入口检查一次（不再启动新的解码/渲染），
+       PDF 源还会在**每页之间**再检查一次 —— 所以 800 页的 PDF 点取消能立刻停下，
+       而不是把整本跑完。已经进入 Pillow 合成的那一页无法安全中断
+       （合成过程没有中断点），但不会再开新的一页/一个新文件。
     2. **原子写出**：所有分支都先写临时文件、再 os.replace 到最终路径。
        中途异常 / 进程被杀都不会留下"看着存在、其实是坏文件"的半成品。
        覆盖原图模式尤其依赖这一点 —— 否则一次失败就能把源文件毁掉。
@@ -225,8 +228,13 @@ def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
     if task.is_pdf_source:
         from src.pdf_engine import apply_pdf_watermark
         with atomic_output(output_path) as tmp:
+            # should_cancel 必须透传：apply_pdf_watermark 在每页之间检查取消，
+            # 漏掉这一个参数会让逐页取消在批处理路径永远不触发 ——
+            # 机制写好了却没接上线，表现就是"点了取消没反应"。
             return apply_pdf_watermark(
-                task.path, task.config, tmp, task.page_configs or None
+                task.path, task.config, tmp, task.page_configs or None,
+                should_cancel=should_cancel,
+                overlay_scale=overlay_scale,
             )
 
     if task.output_format == "pdf":

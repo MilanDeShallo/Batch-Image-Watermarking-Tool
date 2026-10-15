@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import os
+from collections import OrderedDict
 
 from PIL import Image
 from reportlab.pdfgen import canvas
@@ -33,6 +34,16 @@ from pypdf import PdfReader, PdfWriter
 # 注意：覆盖层是整页位图，输出体积与倍率的平方成正比，
 # 所以这也是"清晰度 ↔ 体积/内存"的旋钮（见 set_overlay_scale）。
 OVERLAY_SCALE = 2.0
+
+# 覆盖层缓存上限。
+#
+# 为什么必须设上限：逐页参数会让每一页的缓存指纹都不同，缓存于是退化成
+# 「把整本 PDF 每一页的覆盖层 PNG 都留在内存里」—— 800 页就是 800 张
+# 整页位图。那种情况下命中率本来就是 0，留着只剩内存代价。
+# 双约束（条数 + 字节数）比单看条数稳：同样 24 条，
+# A4 与 A0 页面的占用能差两个数量级。
+OVERLAY_CACHE_MAX_ITEMS = 24
+OVERLAY_CACHE_MAX_BYTES = 192 * 1024 * 1024    # 192MB
 OVERLAY_SCALE_MIN = 1.0
 OVERLAY_SCALE_MAX = 4.0
 
@@ -154,16 +165,23 @@ def visual_size(media_w: float, media_h: float, rotate: int) -> tuple[float, flo
     return media_w, media_h
 
 
-def overlay_reference_size(media_w: float, media_h: float, rotate: int) -> tuple[int, int]:
+def overlay_reference_size(media_w: float, media_h: float, rotate: int,
+                           overlay_scale: float | None = None) -> tuple[int, int]:
     """
     覆盖层底图的像素尺寸 —— 也就是该页的「导出分辨率」。
 
     这是预览一致性的口径来源：预览渲染的图相对这个尺寸缩小了多少，
     就要把同样的比例交给引擎去换算间距/边距（见 watermark_engine.scaled_px）。
     覆盖层生成与预览参考尺寸都从这里取，避免两处算法漂移。
+
+    :param overlay_scale: 渲染倍率；None 表示取当前全局值（预览用）。
+        批处理会把「一批开始时」的倍率快照一路传进来 —— 否则用户在处理中途
+        拖动倍率滑块，同一份 PDF 的不同页会按不同参考尺寸渲染，
+        水印大小在同一个文件内部就不一致了。
     """
     vis_w, vis_h = visual_size(media_w, media_h, rotate)
-    return max(1, int(vis_w * OVERLAY_SCALE)), max(1, int(vis_h * OVERLAY_SCALE))
+    scale = OVERLAY_SCALE if overlay_scale is None else float(overlay_scale)
+    return max(1, int(vis_w * scale)), max(1, int(vis_h * scale))
 
 
 def _overlay_placement(media_w: float, media_h: float, rotate: int) -> tuple[float, float, int]:
@@ -197,6 +215,7 @@ def _make_overlay_pdf(
     rotate: int,
     cfg,
     origin: tuple[float, float] = (0.0, 0.0),
+    overlay_scale: float | None = None,
 ) -> bytes:
     """
     生成与页面同尺寸的透明覆盖 PDF（单页，含水印 PNG）。
@@ -206,6 +225,7 @@ def _make_overlay_pdf(
     :param rotate: 页面显示旋转角（0/90/180/270）
     :param cfg: WatermarkConfig
     :param origin: MediaBox 左下角坐标
+    :param overlay_scale: 渲染倍率快照；None 表示用当前全局值
     :return: 覆盖 PDF 的字节内容
     """
     from src.watermark_engine import apply_watermark, bleed_rgb_under_alpha
@@ -214,7 +234,7 @@ def _make_overlay_pdf(
     vis_w, vis_h = visual_size(media_w, media_h, rotate)
 
     # 1. 全透明底图（可视尺寸 × 渲染倍率，尺寸口径统一由 overlay_reference_size 定义）
-    img_w, img_h = overlay_reference_size(media_w, media_h, rotate)
+    img_w, img_h = overlay_reference_size(media_w, media_h, rotate, overlay_scale)
     base = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
 
     # 2. 现有引擎渲染水印（相对几何与预览一致）
@@ -422,6 +442,7 @@ def watermark_pdf_bytes(
     cfg,
     page_configs: dict | None = None,
     should_cancel=None,
+    overlay_scale: float | None = None,
 ) -> tuple[bytes, int]:
     """
     给 PDF 加水印，返回 (输出字节, 页数)。
@@ -433,6 +454,9 @@ def watermark_pdf_bytes(
     :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled。
         检查点在**每一页之间** —— 一本几百页的 PDF 取消后不必等它跑完。
         覆盖层缓存命中时单页成本很低，但页面渲染本身仍可能很慢。
+    :param overlay_scale: 覆盖层渲染倍率快照；None 表示取调用时的全局值。
+        批处理传入「一批开始时」取的值，确保同一个 PDF 的每一页用同一口径 ——
+        否则用户在处理中途拖动倍率滑块，同一个文件内会出现两种水印尺寸。
     :raises FileNotFoundError / ValueError: 见 _open_reader
     :raises TaskCancelled: 用户取消（尚未返回任何字节，调用方不会写出半成品）
 
@@ -448,8 +472,35 @@ def watermark_pdf_bytes(
     # 元数据：原文的 Title/Author 等原样带走，/Producer 标记为本工具
     _copy_metadata(writer, reader)
 
-    # 按「尺寸 + 旋转角 + 配置指纹」缓存覆盖层（同规格同参数只生成一次）
-    overlay_cache: dict[tuple, bytes] = {}
+    # 倍率在本次调用内固定：批处理走快照，预览走当前全局值。
+    # 不这么做的话，线程池里的任务会在读了半个文件之后看到新的倍率。
+    eff_scale = get_overlay_scale() if overlay_scale is None else float(overlay_scale)
+
+    # 按「尺寸 + 旋转角 + 倍率 + 配置指纹」缓存覆盖层（同规格同参数只生成一次）。
+    # 用 OrderedDict + 上限实现 LRU：逐页参数时缓存几乎不会命中，
+    # 没有上限就等于把整本 PDF 的覆盖层全留在内存里。
+    overlay_cache: OrderedDict = OrderedDict()
+    cache_bytes = 0
+
+    def _cache_get(cache_key):
+        """命中时把它挪到末尾（最近使用）"""
+        data = overlay_cache.get(cache_key)
+        if data is not None:
+            overlay_cache.move_to_end(cache_key)
+        return data
+
+    def _cache_put(cache_key, data):
+        nonlocal cache_bytes
+        overlay_cache[cache_key] = data
+        cache_bytes += len(data)
+        while (
+            len(overlay_cache) > OVERLAY_CACHE_MAX_ITEMS
+            or cache_bytes > OVERLAY_CACHE_MAX_BYTES
+        ):
+            if len(overlay_cache) <= 1:
+                break       # 单条就超限时也留一条，否则会陷入反复生成
+            _evicted_key, evicted = overlay_cache.popitem(last=False)
+            cache_bytes -= len(evicted)
 
     for index, page in enumerate(writer.pages):
         if should_cancel is not None and should_cancel():
@@ -466,14 +517,17 @@ def watermark_pdf_bytes(
             round(media_w, 1),
             round(media_h, 1),
             rotate,
+            eff_scale,
             config_fingerprint(page_cfg),
         )
-        if key not in overlay_cache:
-            overlay_cache[key] = _make_overlay_pdf(
-                media_w, media_h, rotate, page_cfg, (origin_x, origin_y)
+        overlay_png = _cache_get(key)
+        if overlay_png is None:
+            overlay_png = _make_overlay_pdf(
+                media_w, media_h, rotate, page_cfg, (origin_x, origin_y), eff_scale
             )
+            _cache_put(key, overlay_png)
 
-        overlay_reader = PdfReader(io.BytesIO(overlay_cache[key]))
+        overlay_reader = PdfReader(io.BytesIO(overlay_png))
         # merge_page：覆盖层内容叠加在原内容之上。
         # 这里不改目标页的 /Rotate —— 覆盖层已按同一角度反向旋转，
         # 两段内容仍在同一个未旋转坐标系里，显示方向自然一致。
@@ -490,6 +544,7 @@ def apply_pdf_watermark(
     output_path: str,
     page_configs: dict | None = None,
     should_cancel=None,
+    overlay_scale: float | None = None,
 ) -> int:
     """
     给 PDF 每一页加水印，输出到 output_path。
@@ -499,6 +554,7 @@ def apply_pdf_watermark(
     :param output_path: 输出 PDF 路径
     :param page_configs: 可选的逐页参数 {页码(0 起): WatermarkConfig}
     :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled
+    :param overlay_scale: 覆盖层渲染倍率快照；None 表示用当前全局值
     :return: 处理的页数
     :raises ValueError: PDF 加密或损坏
     :raises TaskCancelled: 用户取消（不会写出文件）
@@ -507,7 +563,9 @@ def apply_pdf_watermark(
     （见 file_manager.atomic_output），这样覆盖原图模式下
     一次失败也不会毁掉源文件。
     """
-    data, pages = watermark_pdf_bytes(pdf_path, cfg, page_configs, should_cancel)
+    data, pages = watermark_pdf_bytes(
+        pdf_path, cfg, page_configs, should_cancel, overlay_scale
+    )
     with open(output_path, "wb") as f:
         f.write(data)
     return pages
@@ -590,6 +648,7 @@ def build_merged_pdf(
     jpeg_quality: int = 90,
     progress=None,
     should_cancel=None,
+    overlay_scale: float | None = None,
 ) -> int:
     """
     把多个输入合成一个多页 PDF：图片一图一页，PDF 逐页并入。
@@ -600,11 +659,15 @@ def build_merged_pdf(
     :param jpeg_quality: 图片编码质量
     :param progress: 可选回调 progress(index, total, filename)
     :param should_cancel: 可选回调，返回 True 时抛出 MergeCancelled
+    :param overlay_scale: 覆盖层渲染倍率快照；None 表示用当前全局值
     :return: 输出总页数
     :raises MergeCancelled: 用户取消（不写出文件）
     """
     writer = PdfWriter()
     total = len(items)
+
+    # 倍率快照：合并任务可能跑很久，中途改倍率不该让前后两页尺寸不同
+    eff_scale = get_overlay_scale() if overlay_scale is None else float(overlay_scale)
 
     for index, item in enumerate(items):
         if should_cancel and should_cancel():
@@ -616,7 +679,8 @@ def build_merged_pdf(
 
         if path.lower().endswith(".pdf"):
             data, _ = watermark_pdf_bytes(
-                path, item.get("config"), item.get("page_configs")
+                path, item.get("config"), item.get("page_configs"),
+                overlay_scale=eff_scale,
             )
         else:
             data = image_file_to_pdf_bytes(

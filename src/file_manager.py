@@ -22,10 +22,8 @@ from src.config import (
     CONFLICT_RENAME,
     CONFLICT_SKIP,
     DEFAULT_FILENAME_TEMPLATE,
+    SUPPORTED_EXTENSIONS,
 )
-
-# 支持的文件扩展名（小写）— 图片 + PDF
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".pdf"}
 
 # 路径清洗正则
 _PATH_CLEAN_RE = re.compile(r'^[\'\"{\s]+|[\'\"}\s]+$')

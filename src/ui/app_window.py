@@ -49,6 +49,26 @@ from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_PAGE, ScopeStore
 # 布局配置文件：存到用户 AppData 目录，与水印预设完全分离
 LAYOUT_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WatermarkTool", "ui_layout.json")
 
+# 主题与布局同存一份：都是"界面偏好"，没必要再开一个文件
+APPEARANCE_KEY = "appearance"
+
+
+def read_saved_appearance(default: str = "Dark") -> str:
+    """
+    读取上次保存的主题（"Dark" / "Light"）。
+
+    必须在构建 UI **之前**调用，所以对"文件不存在 / 内容损坏 / 值不认识"
+    一律返回默认值 —— 主题若等到 UI 建好之后再设置，用户会先看到一帧深色
+    再跳变；而且两道 PanedWindow 分隔线是我们自己画的，不随
+    set_appearance_mode 变化，浅色模式下会留下一道深色条纹。
+    """
+    try:
+        with open(LAYOUT_FILE, 'r', encoding='utf-8') as f:
+            value = json.load(f).get(APPEARANCE_KEY)
+    except Exception:
+        return default
+    return value if value in ("Dark", "Light") else default
+
 # 崩溃恢复会话文件
 SESSION_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WatermarkTool", "session.json")
 
@@ -77,8 +97,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self.minsize(950, 620)
 
         # CustomTkinter 内置 DPI 机制
-        ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
+        # 主题沿用上次的选择（与布局同存一份），构建 UI 之前就要定下来
+        ctk.set_appearance_mode(read_saved_appearance())
 
         # 恢复窗口大小和位置（优先于居中）
         if not self._restore_window_geometry():
@@ -86,6 +107,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # 内部状态
         self._cancel_requested = False
+        self._processing = False         # 是否有批处理在跑（关窗确认用）
         self._completion_dialog = None   # 完成对话框单例
         self._last_failure_report = ""   # 最近一次批处理的失败清单路径
         self._last_output_dir = ""       # 最近一次批处理的实际输出位置
@@ -403,7 +425,25 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._layout_save_timer = self.after(500, self._save_layout)
 
     def _on_window_close(self):
-        """窗口关闭时保存布局 + 清理会话"""
+        """窗口关闭时保存布局 + 清理会话。
+
+        处理中必须先确认：调度器跑在 daemon 线程上，直接 destroy 会把线程
+        连同未完成的任务一起截断 —— 用户以为"关掉就停了"，实际上刚写了一半的
+        文件可能还在，剩下的静默消失，而且不会有任何提示。
+        """
+        if getattr(self, "_processing", False):
+            if not messagebox.askyesno(
+                "正在处理",
+                "批处理还没有结束。\n\n"
+                "现在关闭会中断剩余任务：已经写出的文件会保留，"
+                "正在处理的那个不会留下半成品。\n\n"
+                "确定要退出吗？",
+                parent=self,
+            ):
+                return
+            # 先请求取消再退出，让运行中的任务在可中断点尽早收手
+            self._cancel_requested = True
+
         self._save_layout()
         self._clear_session()
         self.destroy()
@@ -490,6 +530,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 self._merge_pdf_var.set(bool(session.get("merge_pdf", False)))
                 quality = session.get("quality", 90)
                 self._quality_var.set(quality)
+                # 同理：IntVar.set 不会触发 CTkSlider 的 command，
+                # 不手动同步的话滑块已经动了、旁边的数字还停在 90
+                self._quality_value_label.configure(text=str(int(quality)))
 
                 # 恢复配置到面板
                 config_dict = session.get("config", {})
@@ -510,7 +553,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
                         self._scopes = ScopeStore.from_dict(scopes_dict)
                         self._scopes.prune(self._file_list.files)
                     except Exception as e:
-                        print(f"[Scope Restore Error] {e}")
+                        log_exception("恢复参数作用域失败", e)
                         self._init_scope_base()
                 else:
                     self._init_scope_base()
@@ -522,7 +565,11 @@ class AppWindow(ctk.CTk, DnDWrapper):
             # 无论是否恢复，都清除会话文件
             self._clear_session()
 
-        except Exception:
+        except Exception as exc:
+            # 以前这里是静默吞掉的：恢复失败与"没有可恢复的会话"对用户来说
+            # 看着一模一样，但日志里必须留下痕迹 —— 否则用户反馈
+            # "提示说恢复了、结果什么都没有"时完全无从查证
+            log_exception("恢复上次会话失败", exc)
             self._clear_session()
 
     def _save_session(self):
@@ -633,34 +680,50 @@ class AppWindow(ctk.CTk, DnDWrapper):
             pass
 
     def _save_layout(self):
-        """保存当前布局比例到 ui_layout.json"""
+        """保存当前布局比例与主题到 ui_layout.json"""
         try:
             total_w = self._hpaned.winfo_width()
             total_h = self._vpaned.winfo_height()
-            if total_w <= 1 or total_h <= 1:
-                return
 
             layout = {}
 
-            # 窗口大小和位置
-            layout["win_width"] = self.winfo_width()
-            layout["win_height"] = self.winfo_height()
-            layout["win_x"] = self.winfo_x()
-            layout["win_y"] = self.winfo_y()
+            # 窗口尺寸还没确定时（隐藏、最小化、首次布局之前，winfo 返回 1）
+            # 跳过几何部分 —— 但主题必须照常写入：它和窗口大小无关，
+            # 不该因为"面板还没量出宽度"就一起丢掉。
+            # 旧实现是直接 return，于是"只切主题、不动面板就关窗"时选择留不下来。
+            if total_w > 1 and total_h > 1:
+                layout["win_width"] = self.winfo_width()
+                layout["win_height"] = self.winfo_height()
+                layout["win_x"] = self.winfo_x()
+                layout["win_y"] = self.winfo_y()
 
-            if len(self._hpaned.panes()) >= 2:
-                sash1 = self._hpaned.sash_coord(0)[0]
-                layout["left_ratio"] = round(max(MIN_LEFT, sash1) / total_w, 4)
-            if len(self._hpaned.panes()) >= 3:
-                sash2 = self._hpaned.sash_coord(1)[0]
-                layout["center_ratio"] = round(max(MIN_CENTER, sash2 - sash1) / total_w, 4)
-            if len(self._vpaned.panes()) >= 2:
-                v_sash = self._vpaned.sash_coord(0)[1]
-                layout["bottom_ratio"] = round(max(MIN_BOTTOM, total_h - v_sash) / total_h, 4)
+                if len(self._hpaned.panes()) >= 2:
+                    sash1 = self._hpaned.sash_coord(0)[0]
+                    layout["left_ratio"] = round(max(MIN_LEFT, sash1) / total_w, 4)
+                if len(self._hpaned.panes()) >= 3:
+                    sash2 = self._hpaned.sash_coord(1)[0]
+                    layout["center_ratio"] = round(max(MIN_CENTER, sash2 - sash1) / total_w, 4)
+                if len(self._vpaned.panes()) >= 2:
+                    v_sash = self._vpaned.sash_coord(0)[1]
+                    layout["bottom_ratio"] = round(max(MIN_BOTTOM, total_h - v_sash) / total_h, 4)
+
+            # 主题与布局同存一份，都是"下次启动该恢复的界面偏好"
+            layout[APPEARANCE_KEY] = ctk.get_appearance_mode()
+
+            # 读-改-写：几何被跳过时不能把上一次存下来的窗口大小/位置抹掉
+            merged = {}
+            try:
+                with open(LAYOUT_FILE, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    merged = loaded
+            except Exception:
+                merged = {}
+            merged.update(layout)
 
             os.makedirs(os.path.dirname(LAYOUT_FILE), exist_ok=True)
             with open(LAYOUT_FILE, 'w') as f:
-                json.dump(layout, f)
+                json.dump(merged, f)
         except Exception:
             pass
 
@@ -689,7 +752,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             try:
                 data = panel.get_config_dict()
             except Exception as e:
-                print(f"[Panel Read Error] {e}")
+                log_exception("读取面板参数失败", e)
                 continue
             if not data:
                 continue
@@ -761,7 +824,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             else:
                 self._scopes.update_base(data)
         except Exception as e:
-            print(f"[Scope Commit Error] {e}")
+            log_exception("提交参数到作用域失败", e)
             return
 
         # 只刷新受影响的那一行：滑块拖动时每帧全量刷新会在上千文件时卡住
@@ -799,7 +862,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
             return WatermarkConfig.from_dict(data)
         except Exception as e:
-            print(f"[Config Error] {e}")
+            log_exception("读取水印配置失败", e)
             return None
 
     def _init_scope_base(self):
@@ -815,7 +878,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             if data:
                 self._scopes.set_base(data)
         except Exception as e:
-            print(f"[Scope Init Error] {e}")
+            log_exception("初始化参数作用域失败", e)
         self._refresh_scope_ui()
 
     # ---------- 作用范围：档位切换、面板回填与标记 ----------
@@ -894,7 +957,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             self._text_panel.set_from_config(cfg)
             self._image_panel.set_from_config(cfg)
         except Exception as e:
-            print(f"[Scope Sync Error] {e}")
+            log_exception("同步参数到面板失败", e)
         finally:
             self._syncing = False
 
@@ -988,16 +1051,18 @@ class AppWindow(ctk.CTk, DnDWrapper):
     # 事件处理
     # ============================================================
 
-    def _toggle_theme(self):
-        """切换深色/浅色主题 + 同步原生控件颜色"""
-        current = ctk.get_appearance_mode()
-        if current == "Dark":
-            ctk.set_appearance_mode("Light")
-        else:
-            ctk.set_appearance_mode("Dark")
+    def _apply_theme(self, mode: str, save: bool = True):
+        """
+        应用主题并同步所有依赖颜色的自绘部件。
+
+        customtkinter 只负责自己的控件：PanedWindow 的分隔线和预览画布底色
+        都是我们自己的，必须手动跟随 —— 否则浅色模式下会留下一道深色分隔线。
+        """
+        mode = "Light" if str(mode).lower().startswith("light") else "Dark"
+        ctk.set_appearance_mode(mode)
 
         # 同步 PanedWindow 分隔线颜色
-        paned_bg = "#f0f0f0" if ctk.get_appearance_mode() == "Light" else "#2b2b2b"
+        paned_bg = "#f0f0f0" if mode == "Light" else "#2b2b2b"
         try:
             self._vpaned.configure(bg=paned_bg)
             self._hpaned.configure(bg=paned_bg)
@@ -1007,6 +1072,15 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 同步预览画布颜色
         if hasattr(self, '_preview_canvas'):
             self._preview_canvas.update_theme()
+
+        if save:
+            # 立即落盘：否则"切了主题但没正常关窗"（崩溃 / 强杀）就白切了
+            self._save_layout()
+
+    def _toggle_theme(self):
+        """切换深色/浅色主题 + 同步原生控件颜色"""
+        target = "Light" if ctk.get_appearance_mode() == "Dark" else "Dark"
+        self._apply_theme(target)
 
     # ============================================================
     # 预设管理
@@ -1395,7 +1469,67 @@ class AppWindow(ctk.CTk, DnDWrapper):
             return ""
 
     def _on_start_processing(self):
-        """开始处理按钮回调 — 有界任务队列 + 原子写出 + 资源预检"""
+        """
+        开始处理 —— 先在后台把慢 IO 预检跑完，再进入批处理。
+
+        为什么分两步：预检要逐个读文件头（判断像素规模），还要检查每个 PDF
+        的数字签名，上千个文件时是几秒的纯 IO。放在主线程会直接冻结界面，
+        用户只会看到"点了没反应"。
+        """
+        import threading
+
+        from src import resource_budget
+
+        files = list(self._file_list.files)
+        if not files:
+            self._show_message("请先添加图片文件")
+            return
+
+        # 预检期间先禁掉开始按钮，避免连点导致并发预检；
+        # 同时打开取消按钮 —— 检查上千个文件也要几秒，中途应该能反悔
+        self._cancel_requested = False
+        self._processing = True          # 预检也算"在处理"，关窗时要拦一下
+        self._start_btn.configure(state="disabled")
+        self._cancel_btn.configure(state="normal")
+        self._status_label.configure(text=f"正在检查 {len(files)} 个文件…")
+        self.update_idletasks()
+
+        chosen_dir = self._output_dir_var.get().strip()
+        merge_pdf = (
+            bool(self._merge_pdf_var.get()) and self._format_var.get() == "PDF"
+        )
+        scan_dir, _note = resolve_output_target(files, chosen_dir, merge_pdf)
+
+        def _scan_worker():
+            import shutil
+
+            report = {
+                "oversized": resource_budget.oversized_files(files),
+                "large": resource_budget.large_images(files),
+                "signed": [],
+                "total_input_size": 0,
+                "free_space": None,
+            }
+            try:
+                from src.pdf_engine import signed_pdf_files
+                report["signed"] = signed_pdf_files(files)
+            except Exception as exc:
+                log_exception("PDF 签名预检失败", exc)
+            try:
+                space_root = scan_dir or os.path.expanduser("~")
+                report["total_input_size"] = sum(
+                    os.path.getsize(f) for f in files if os.path.exists(f)
+                )
+                report["free_space"] = shutil.disk_usage(space_root).free
+            except Exception:
+                pass        # 预检失败不阻止处理，后面的分支会各自兜底
+
+            self.after(0, lambda r=report: self._run_batch(files, r))
+
+        threading.Thread(target=_scan_worker, daemon=True).start()
+
+    def _run_batch(self, files, preflight):
+        """批处理主流程（此时预检结果已就绪）"""
         import gc
         import threading
         import time
@@ -1410,11 +1544,22 @@ class AppWindow(ctk.CTk, DnDWrapper):
             plan_output_paths,
         )
 
-        # ---------- 1. 前置检查 ----------
-        files = self._file_list.files
-        if not files:
-            self._show_message("请先添加图片文件")
+        # 预检期间临时禁用了开始按钮，这里先恢复 ——
+        # 下面的 early return 分支依赖"按钮处于可用状态"这个前提，
+        # 不恢复的话任何一次提前返回都会让按钮永久卡在 disabled
+        self._start_btn.configure(state="normal")
+        # 预检阶段到此结束：真正的"处理中"由第 7 步重新标记，
+        # 这样下面任何一次 early return 都不会把状态卡在"处理中"
+        self._processing = False
+
+        # 预检期间用户可能已经点了取消，那就别再往下走
+        if self._cancel_requested:
+            self._cancel_requested = False
+            self._cancel_btn.configure(state="disabled")
+            self._status_label.configure(text="已取消（尚未开始处理）")
             return
+
+        # ---------- 1. 前置检查 ----------
 
         # 输出目录的行为统一由 resolve_output_target 决定：
         # 返回空字符串 = 每个文件写到各自源目录下的 watermarked_output/
@@ -1452,7 +1597,8 @@ class AppWindow(ctk.CTk, DnDWrapper):
             return
 
         # ---------- 3. 像素上限：超限直接剔除，不交给 Pillow 去撞内存 ----------
-        oversized = resource_budget.oversized_files(files)
+        #    扫描已在后台预检里完成（见 _on_start_processing），这里只处理结果
+        oversized = preflight.get("oversized") or []
         if oversized:
             detail = "\n".join(
                 f"  {os.path.basename(p)} — {px / 1e6:.0f} 百万像素"
@@ -1474,7 +1620,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 return
 
         # ---------- 3.1 大图预警：给量级，让用户自己决定 ----------
-        large = resource_budget.large_images(files)
+        large = preflight.get("large") or []
         if large:
             peak_gb = sum(item[3] for item in large) * (
                 resource_budget.BYTES_PER_PIXEL * resource_budget.TASK_SLACK
@@ -1497,13 +1643,13 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 return
 
         # ---------- 3.2 磁盘空间预检 ----------
-        import shutil
+        #    文件总大小与可用空间都在后台预检里量好了，这里只做判断
         try:
             space_root = output_dir or os.path.expanduser("~")
-            total_input_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+            total_input_size = preflight.get("total_input_size") or 0
+            free_space = preflight.get("free_space")
             needed_size = int(total_input_size * 1.2)  # 预留 20% 余量
-            free_space = shutil.disk_usage(space_root).free
-            if free_space < needed_size:
+            if free_space is not None and free_space < needed_size:
                 self._show_message(
                     f"磁盘空间不足！\n\n"
                     f"预计需要: {needed_size / (1024 * 1024):.0f} MB\n"
@@ -1516,11 +1662,8 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # ---------- 3.3 PDF 数字签名预检 ----------
         # 加水印是改写文件，签名必然失效。必须先说清楚，不能悄悄弄坏
-        try:
-            from src.pdf_engine import signed_pdf_files
-            signed = signed_pdf_files(files)
-        except Exception:
-            signed = []
+        # （扫描在后台预检里做：检查签名要解析 /Root/Perms 与 AcroForm）
+        signed = preflight.get("signed") or []
         if signed:
             detail = "\n".join(f"  {os.path.basename(p)}" for p in signed[:8])
             if len(signed) > 8:
@@ -1597,9 +1740,17 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # ---------- 7. 会话与进度状态 ----------
         self._cancel_requested = False
+        self._processing = True          # 关窗时要据此确认，别把工作线程无声截断
         self._last_failure_report = ""
         self._save_session()
         self._batch_start_time = time.time()
+
+        # 覆盖层倍率快照：整批固定用开始这一刻的值。
+        # 任务是在线程池里跑的，若让 pdf_engine 各自去读全局倍率，
+        # 用户在处理途中拖动倍率滑块就会让同一份 PDF 的不同页
+        # 按不同参考尺寸渲染 —— 同一个文件里出现两种水印大小。
+        from src.pdf_engine import get_overlay_scale
+        overlay_scale_snapshot = get_overlay_scale()
 
         # 任务结果三态：取消不算失败，否则用户分不清"我取消了"和"程序出错了"
         STATUS_OK = "ok"
@@ -1615,6 +1766,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 execute_task(
                     task, out_path, jpeg_quality=quality,
                     should_cancel=lambda: self._cancel_requested,
+                    overlay_scale=overlay_scale_snapshot,
                 )
                 return (index, STATUS_OK, None, name)
             except TaskCancelled:
@@ -1656,6 +1808,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
                     jpeg_quality=quality,
                     progress=_on_item,
                     should_cancel=lambda: self._cancel_requested,
+                    overlay_scale=overlay_scale_snapshot,
                 )
             except MergeCancelled:
                 # 用户取消：原子写出保证不留半成品
@@ -1680,6 +1833,25 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # ---------- 9. 调度器线程 — 有界滑动窗口 + 结果收集 + 进度更新 ----------
         def _dispatcher():
+            """
+            调度线程入口 —— 保证无论成功、失败还是异常，都一定走到 _on_done。
+
+            为什么外面还要再包一层：_on_done 是唯一把「开始」按钮恢复可用、
+            清掉取消标志的地方。工作线程里任何一个没被内层捕获的异常
+            （文件系统报错、内存不足、第三方库意外抛出）都会让它不执行 ——
+            界面从此停在「处理中」，用户只能重启程序，而且不知道发生了什么。
+            真正的调度逻辑在 _dispatch_impl，这里只负责兜底。
+            """
+            try:
+                _dispatch_impl()
+            except Exception as exc:
+                log_exception("批处理调度异常", exc)
+                self.after(0, lambda m=str(exc): _on_done(
+                    0, elapsed=0.0, fatal=f"处理中断：{m}",
+                    output_dir=self._last_output_dir or "",
+                ))
+
+        def _dispatch_impl():
             if merge_pdf:
                 _merge_all()
                 return
@@ -1781,6 +1953,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             self._start_btn.configure(state="normal")
             self._cancel_btn.configure(state="disabled")
             self._cancel_requested = False
+            self._processing = False
             self._clear_session()  # 正常完成，清除会话
 
             failures = list(failures or [])
@@ -1840,7 +2013,15 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 )
                 self._progress_bar.set(1)
             else:
-                if first_error:
+                if fatal and not failures:
+                    # 调度层崩溃 —— 与「每张都失败」是两回事，文案必须区分开，
+                    # 否则用户会去逐个检查文件，而问题其实出在程序自己身上
+                    self._status_label.configure(text=f"处理中断: {fatal}")
+                    self._show_message(
+                        f"处理中断：\n\n{fatal}\n\n"
+                        "已经写出的输出文件仍然保留，程序日志里有完整堆栈。"
+                    )
+                elif first_error:
                     self._status_label.configure(text=f"全部失败: {first_error}")
                     extra = (f"\n\n完整失败清单：\n{self._last_failure_report}"
                              if self._last_failure_report else "")

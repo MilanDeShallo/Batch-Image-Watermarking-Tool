@@ -37,3 +37,18 @@ test_output.jpg
 # 操作系统文件
 .DS_Store
 Thumbs.db
+
+# 用户预设：默认存到 %APPDATA%，但若有人把目录指回项目内，
+# 那些是个人配置，不该进仓库（空目录本身靠 .gitkeep 保留）
+presets/*.json
+!presets/.gitkeep
+
+# 原子写出的临时文件（写入被中断时可能残留）
+*.part
+*.part.*
+
+# 失败清单（每次运行都会生成，属于运行产物）
+失败清单_*.txt
+
+# 旧版把用户界面布局写在项目里（现已迁到 APPDATA）
+src/presets/

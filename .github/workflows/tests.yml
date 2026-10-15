@@ -33,11 +33,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest==9.1.1
+          pip install -r requirements.txt pytest==9.1.1
 
-      # 两个冒烟脚本文件名不是 test_*，pytest 不会自动收集它们，
-      # 必须显式跑：它们需要真实窗口与 mainloop，单元测试替代不了。
+      # 三个冒烟脚本文件名不是 test_*，pytest 不会自动收集它们，
+      # 必须显式跑：它们需要真实窗口 / mainloop / 打包产物，
+      # 单元测试替代不了。
       - name: Unit and integration tests
         run: python -m pytest tests/ -q
 
@@ -46,6 +46,18 @@ jobs:
 
       - name: Preview pipeline smoke test
         run: python -u tests/smoke_preview.py
+
+      # 打包 + 探产物。
+      # 为什么必须做：源码层面全绿不代表 exe 里就有这些改动 ——
+      # 漏了 hiddenimport、忘了重新打包，本地测试都发现不了。
+      # 这一步真跑一次 PyInstaller（约 1 分钟），再从 exe 的字节码里
+      # 抽符号做探测（只看产物时间戳是不够的）。
+      # CI 里不带 --launch：无头环境下启动 GUI 会引入不必要的不确定性。
+      - name: Build executable
+        run: python -m PyInstaller build.spec --noconfirm
+
+      - name: Packaged artifact smoke test
+        run: python -u tests/smoke_exe.py
 
       # 失败时最有价值的是日志：崩溃钩子会把主线程与工作线程的异常都写进去
       - name: Upload logs

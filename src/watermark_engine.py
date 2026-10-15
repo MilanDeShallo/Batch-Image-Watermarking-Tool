@@ -20,10 +20,23 @@ from __future__ import annotations
 
 import gc
 import os
-import re
 from typing import Optional
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
+
+from src.config import MAX_IMAGE_PIXELS, normalize_position
+from src.logger import log_warning
+
+# 合成管线是 8 位/通道，这些模式携带的位深无法保留 —— 转换时记一条日志，
+# 避免「高光全白却毫无提示」。Pillow 对 16 位灰度会返回带 "I;" 前缀的名字
+# （如 "I;16B"），所以按前缀匹配而不是写死集合。
+_HIGH_DEPTH_MODES = {"I", "F"}
+_HIGH_DEPTH_PREFIXES = ("I;", "F;")
+
+
+def _is_high_depth_mode(mode: str) -> bool:
+    """是否为 16/32 位灰度或浮点模式（转 8 位必然损失精度）"""
+    return mode in _HIGH_DEPTH_MODES or mode.startswith(_HIGH_DEPTH_PREFIXES)
 
 # ============================================================
 # 全局安全设置
@@ -40,14 +53,17 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 #                            只失败这一个文件，不影响整批
 #   - 超过 5000 万像素     → 批处理前由 resource_budget 给出内存预警，
 #                            由用户决定是否继续（见 src/resource_budget.py）
-MAX_IMAGE_PIXELS_LIMIT = 300_000_000   # 约 1.2GB RGBA
+# 数值来自 src/config.py（单一来源）。这里保留一个别名，
+# 是因为本模块的错误消息与注释都按"上限（limit）"表述，读起来更直白。
+MAX_IMAGE_PIXELS_LIMIT = MAX_IMAGE_PIXELS   # 约 1.2GB RGBA
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS_LIMIT
 
 # EXIF Orientation 标签编号 (274 = 0x0112)
 ORIENTATION_TAG = 0x0112
 
-# 支持的图片扩展名（小写）
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+# 注意：这里曾经还有一份 SUPPORTED_EXTENSIONS，与 file_manager 的那份
+# 内容不一致（少了 .pdf）且全项目无人引用 —— 已删除。
+# 输入扩展名的唯一来源是 src/config.SUPPORTED_EXTENSIONS。
 
 
 # ============================================================
@@ -131,32 +147,60 @@ def safe_open_image(path: str) -> Image.Image:
     - 若在 open 与 load 之间抛异常，句柄会一直被占用，源图片无法重命名/删除
     - 因此用 with 包住整个读取过程，并返回完全脱离文件的对象副本
     """
+    name = os.path.basename(path)
+
     try:
         opener = Image.open(path)
     except Image.DecompressionBombError as e:
         raise ValueError(
-            f"图片像素数超过安全上限（{MAX_IMAGE_PIXELS_LIMIT:,} 像素），已拒绝处理："
-            f"{os.path.basename(path)}"
+            f"图片像素数超过安全上限（{MAX_IMAGE_PIXELS_LIMIT:,} 像素），已拒绝处理：{name}"
         ) from e
+    except Exception as e:
+        # 文件头就损坏时 open() 阶段即失败（Pillow 抛 "Truncated File Read"），
+        # 这一步同样要补文件名 —— 否则失败清单里只剩一个陌生的异常名，
+        # 用户既不知道是哪个文件、也不知道该拿它怎么办
+        raise ValueError(f"无法读取图片 {name}：{e}") from e
 
-    with opener as src:
-        src.load()  # 强制加载像素数据，尽早发现损坏文件
+    # src.load() 必须包在异常处理里：损坏 / 截断的文件正是在这一步才暴露，
+    # 而 Pillow 抛出的 "Truncated File Read" 不带文件名 ——
+    # 批量失败清单里只会留下一句无从下手的报错，找不到是哪个文件出的问题
+    try:
+        with opener as src:
+            src.load()  # 强制加载像素数据，尽早发现损坏文件
 
-        # 1. EXIF 方向自动校正（返回脱离文件的新对象）
-        try:
-            detached = ImageOps.exif_transpose(src)
-        except Exception:
-            detached = None  # 某些图片可能无 EXIF 数据或解析失败，忽略
+            # 1. EXIF 方向自动校正（返回脱离文件的新对象）
+            try:
+                detached = ImageOps.exif_transpose(src)
+            except Exception:
+                detached = None  # 某些图片可能无 EXIF 数据或解析失败，忽略
 
-        # exif_transpose 未产生新对象时退化为副本，确保不持有句柄
-        if detached is None or detached is src:
-            detached = src.copy()
+            # exif_transpose 未产生新对象时退化为副本，确保不持有句柄
+            if detached is None or detached is src:
+                detached = src.copy()
+    except Exception as e:
+        raise ValueError(f"无法读取图片 {name}：{e}") from e
 
-        # 2. 色彩空间兼容：CMYK/P/La 等非标准模式统一转 RGB
-        if detached.mode not in ("RGB", "RGBA", "L"):
-            detached = detached.convert("RGB")
+    # 2. 色彩空间归一化
+    #    管线最终在 RGBA 上合成，所以「模式名里不带 A、实际却含透明通道」的两种
+    #    情况必须显式转 RGBA —— 一律 convert("RGB") 会把透明区域变成实心，
+    #    LA 的半透明 Logo、带 transparency 的调色板 PNG 都会中招，
+    #    导出的是一块黑底方块，而且没有任何报错。
+    mode = detached.mode
+    palette_alpha = mode == "P" and "transparency" in detached.info
 
-        return detached
+    if mode == "LA" or palette_alpha:
+        detached = detached.convert("RGBA")
+    elif mode not in ("RGB", "RGBA", "L"):
+        if _is_high_depth_mode(mode):
+            log_warning(
+                f"{name}：{mode} 为高位深/浮点模式，本工具按 8 位/通道合成，"
+                f"位深会被压缩，高光细节可能丢失"
+            )
+        elif mode == "CMYK":
+            log_warning(f"{name}：CMYK 将转换为 RGB（色彩空间转换不可逆）")
+        detached = detached.convert("RGB")
+
+    return detached
 
 
 # ============================================================
@@ -201,15 +245,20 @@ def anchor_position(
     - vertical: top / middle / bottom
     - horizontal: left / center / right
     特殊值："center" 等同于 "middle-center"
+    历史别名（center-left / center-right）会先归一化为 middle-*
     """
     bw, bh = base_size
     sw, sh = sprite_size
 
     # 解析位置字符串
+    # 先归一化别名：调用方可能来自旧预设、旧脚本或第三方代码，仍带着历史写法。
+    # 不翻译就会落进下面 y 字典的 .get() 默认值 —— 表现为「选了左中、
+    # 水印却渲染在正中」，而且不报错、界面按钮高亮也正常，很难被发现。
+    position = normalize_position(position, "middle-center")
     if position == "center":
         position = "middle-center"
 
-    parts = position.split("-")
+    parts = position.split("-", 1)
     v_pos = parts[0] if len(parts) >= 1 else "middle"
     h_pos = parts[1] if len(parts) >= 2 else "center"
 
@@ -642,21 +691,9 @@ def save_with_format(
     img.save(path, **kwargs)
 
 
-# ============================================================
-# 路径清洗工具
-# ============================================================
-
-_PATH_CLEAN_RE = re.compile(r'^[\'\"{\s]+|[\'\"}\s]+$')
-
-
-def sanitize_path(raw: str) -> str:
-    """
-    清洗 Windows 拖拽传入的路径。
-
-    问题：Windows 拖拽经常传入带 {} 包裹或引号的路径，
-          如 {C:/Program Files/img.jpg} 或 'C:\\Photos\\test.png'
-    """
-    return _PATH_CLEAN_RE.sub('', raw.strip())
+# 注意：这里曾经还有一份 sanitize_path 与 _PATH_CLEAN_RE，
+# 与 file_manager 的实现逐字相同、且全项目无人引用 —— 已删除。
+# 路径清洗的唯一实现是 src/file_manager.sanitize_path。
 
 
 # ============================================================

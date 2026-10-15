@@ -19,17 +19,24 @@ from __future__ import annotations
 
 import os
 
+from src.config import MAX_IMAGE_PIXELS      # 像素上限的单一来源（见下）
+
 # 解码后每像素字节数（RGBA）
 BYTES_PER_PIXEL = 4
 
-# 单任务峰值系数：源图 + 覆盖层 + 合成结果同时存在。
-# apply_watermark 至少要持有 base、overlay、合成结果三份，
-# 取 2.5 作为保守估计（宁可少开线程也不要 OOM）。
-TASK_SLACK = 2.5
-
-# 单张图片的像素上限：超过即明确拒绝，不再交给 Pillow 去撞内存
-# 3 亿像素 ≈ 1.2GB RGBA，已远超常见相机 / 扫描仪输出
-MAX_IMAGE_PIXELS = 300_000_000
+# 单任务峰值系数（相对"解码后的单份位图"）。
+#
+# 实测（Windows 工作集采样；both 类型 = 文字 + Logo，走导出路径）：
+#   6000×4000（24M px）→ 16.2 B/px
+#   8000×6000（48M px）→ 16.1 B/px
+# 两个量级结果一致，说明峰值取决于"同时存活的整图份数"而不是图本身大小：
+#   输入图 1 份 + 文字合成的 base/overlay/结果 3 份
+#   + Logo 再次合成的 base/overlay/结果 3 份 + 存 JPEG 时的白底 1 份
+#
+# 旧值 2.5（=10 B/px）是按"平均占用"估的，低于实测峰值 ——
+# 4 张 4000×3000 的图按旧值算能开 8 线程，实际峰值会冲出预算。
+# 取 5.0（=20 B/px），比实测值高约 25%：宁可少开线程，也不要 OOM。
+TASK_SLACK = 5.0
 
 # 超过此像素数给出显式预警（仍允许处理）
 LARGE_IMAGE_PIXELS = 50_000_000

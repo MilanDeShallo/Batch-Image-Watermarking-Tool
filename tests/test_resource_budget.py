@@ -11,7 +11,6 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PIL import Image
 
@@ -184,3 +183,32 @@ class TestEngineLimit:
             raised = exc
         assert isinstance(raised, ValueError)
         assert "bomb.png" in str(raised)
+
+
+class TestPeakFactorCalibration:
+    """
+    峰值系数与实测值的对照。
+
+    守护的是"别把系数调回平均值"：那种改动在本机不一定立刻出问题，
+    但会在别人的高分辨率图上 OOM，而且很难复现。
+    """
+
+    # 实测（Windows 工作集采样，both 类型走导出路径；
+    # 6000×4000 与 8000×6000 两次一致，说明与尺寸无关）
+    MEASURED_BOTH_BYTES_PER_PIXEL = 16.2
+
+    def test_factor_covers_measured_peak(self):
+        import src.resource_budget as rb
+
+        effective = rb.BYTES_PER_PIXEL * rb.TASK_SLACK
+        assert effective >= self.MEASURED_BOTH_BYTES_PER_PIXEL, (
+            f"峰值系数 {effective:.1f} B/px 低于实测 "
+            f"{self.MEASURED_BOTH_BYTES_PER_PIXEL} B/px，并行度会被算多"
+        )
+
+    def test_estimate_actually_uses_the_factor(self):
+        """防止"改了常量但估算函数没接线"这种假修复"""
+        import src.resource_budget as rb
+
+        expected = int(1000 * 1000 * rb.BYTES_PER_PIXEL * rb.TASK_SLACK)
+        assert rb.estimate_decoded_bytes(1000, 1000) == expected

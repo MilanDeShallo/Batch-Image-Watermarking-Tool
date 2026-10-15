@@ -11,8 +11,8 @@ import json
 import tempfile
 import shutil
 
-# 确保项目根目录在 path 中
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+
 
 from src.config import WatermarkConfig, opacity_to_alpha
 from src.file_manager import generate_output_path, get_default_output_dir, collect_files
@@ -174,7 +174,19 @@ class TestFileManager:
 # ==================== PresetManager 测试 ====================
 
 class TestPresetManager:
-    """预设管理测试"""
+    """
+    预设管理测试。
+
+    预设目录现在指向 %APPDATA%，测试必须把它改到临时目录 ——
+    否则会在用户真实的数据目录里增删文件。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_presets(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(PresetManager, "PRESETS_DIR", str(tmp_path / "presets"))
+        monkeypatch.setattr(PresetManager, "LEGACY_PRESETS_DIR", str(tmp_path / "legacy"))
+        monkeypatch.setattr(PresetManager, "_ready", False)
+        yield
 
     def test_save_load_delete(self):
         """保存→加载→删除"""
@@ -209,6 +221,86 @@ class TestPresetManager:
         assert PresetManager._sanitize_name("test:name") == "test_name"
         assert PresetManager._sanitize_name("") == "unnamed"
         assert PresetManager._sanitize_name("normal") == "normal"
+
+    def test_saving_creates_directory(self):
+        """首次保存要能自己建目录（全新安装的用户目录里没有 presets/）"""
+        assert not os.path.isdir(PresetManager.PRESETS_DIR)
+
+        PresetManager.save_preset("first", WatermarkConfig(text="x"))
+
+        assert os.path.isdir(PresetManager.PRESETS_DIR)
+
+    def test_legacy_presets_are_migrated(self):
+        """旧版存在项目 presets/ 的预设要复制到用户目录"""
+        legacy = PresetManager.LEGACY_PRESETS_DIR
+        os.makedirs(legacy, exist_ok=True)
+        WatermarkConfig(text="旧预设", opacity=70).save_to_json(
+            os.path.join(legacy, "legacy.json")
+        )
+
+        names = PresetManager.list_presets()
+
+        assert "legacy" in names
+        assert os.path.isfile(os.path.join(PresetManager.PRESETS_DIR, "legacy.json"))
+        # 是复制不是移动：旧目录保持原样，用户随时能退回旧版本
+        assert os.path.isfile(os.path.join(legacy, "legacy.json"))
+
+        cfg, _ = PresetManager.load_preset("legacy")
+        assert cfg.text == "旧预设"
+
+    def test_migration_ignores_non_json(self):
+        legacy = PresetManager.LEGACY_PRESETS_DIR
+        os.makedirs(legacy, exist_ok=True)
+        with open(os.path.join(legacy, "notes.txt"), "w") as f:
+            f.write("not a preset")
+
+        PresetManager.list_presets()
+
+        assert not os.path.exists(
+            os.path.join(PresetManager.PRESETS_DIR, "notes.txt")
+        )
+
+    def test_migration_does_not_overwrite_existing(self):
+        """同名时以用户目录里的那份为准（它可能更新）"""
+        PresetManager.save_preset("dup", WatermarkConfig(text="新版"))
+
+        legacy = PresetManager.LEGACY_PRESETS_DIR
+        os.makedirs(legacy, exist_ok=True)
+        WatermarkConfig(text="旧版").save_to_json(os.path.join(legacy, "dup.json"))
+
+        PresetManager._ready = False        # 允许再迁一次
+        PresetManager.list_presets()
+
+        cfg, _ = PresetManager.load_preset("dup")
+        assert cfg.text == "新版"
+
+
+class TestPresetStorageLocation:
+    """
+    预设的默认存放位置（不受上面 fixture 影响，拿到的是真实类属性）。
+
+    这是本项修复的核心：装到 Program Files 时安装目录只读，
+    预设若写在 _internal/ 下，用户一保存就失败。
+    """
+
+    def test_default_dir_is_under_user_appdata(self):
+        import src.preset_manager as pm
+
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        assert pm.PresetManager.PRESETS_DIR == os.path.join(
+            appdata, "WatermarkTool", "presets"
+        )
+
+    def test_legacy_dir_is_project_local_and_distinct(self):
+        import src.preset_manager as pm
+
+        project_root = os.path.dirname(
+            os.path.dirname(os.path.abspath(pm.__file__))
+        )
+        legacy = pm.PresetManager.LEGACY_PRESETS_DIR
+
+        assert legacy.startswith(project_root)
+        assert legacy != pm.PresetManager.PRESETS_DIR
 
 
 # ==================== watermark_engine 测试 ====================
@@ -304,6 +396,94 @@ class TestWatermarkEngine:
         x, y = custom_anchor_position((200, 200), (50, 50), 100, 100)
         assert x == 150  # 200-50
         assert y == 150
+
+
+class TestOpenImageModes:
+    """
+    读取阶段的静默损失，以及失败时必须能定位到文件。
+
+    1. LA / 带 transparency 的 P：模式名里不带 A，但确实有透明通道。
+       以前一律 convert("RGB")，透明区域变成实心 —— 半透明 Logo 导出来
+       是一块黑底方块，而且没有任何提示。
+    2. I;16 等高/浮点模式：合成管线是 8 位/通道，位深必然压缩，
+       至少要留下一条日志。
+    3. 损坏 / 截断 / 不存在的文件：Pillow 的原始报错不带文件名，
+       失败清单里只剩一个陌生的异常名，无从定位。
+    """
+
+    def test_la_keeps_alpha(self, tmp_path):
+        p = os.path.join(str(tmp_path), "la.png")
+        Image.new("LA", (4, 4), (200, 0)).save(p)
+
+        out = safe_open_image(p)
+
+        assert out.mode == "RGBA"
+        assert out.getpixel((0, 0))[3] == 0
+
+    def test_palette_with_transparency_becomes_rgba(self, tmp_path):
+        img = Image.new("P", (4, 4), 0)
+        img.putpalette([0, 0, 0, 255, 255, 255] + [0, 0, 0] * 254)
+        img.info["transparency"] = 0
+        p = os.path.join(str(tmp_path), "pal.png")
+        img.save(p)
+
+        out = safe_open_image(p)
+
+        assert out.mode == "RGBA"
+        assert out.getpixel((0, 0))[3] == 0, "透明调色板索引必须保留为 alpha=0"
+
+    def test_palette_without_transparency_stays_rgb(self, tmp_path):
+        img = Image.new("P", (4, 4), 1)
+        img.putpalette([0, 0, 0, 255, 255, 255] + [0, 0, 0] * 254)
+        p = os.path.join(str(tmp_path), "pal2.png")
+        img.save(p)
+
+        assert safe_open_image(p).mode == "RGB"
+
+    def test_gray_stays_gray(self, tmp_path):
+        """L 已能进管线，不该被无谓地转成三通道"""
+        p = os.path.join(str(tmp_path), "l.png")
+        Image.new("L", (4, 4), 128).save(p)
+
+        assert safe_open_image(p).mode == "L"
+
+    def test_16bit_gray_is_converted(self, tmp_path):
+        p = os.path.join(str(tmp_path), "g16.tiff")
+        Image.new("I;16", (4, 4), 60000).save(p)
+
+        # 管线是 8 位/通道，位深无法保留；这里钉住"转换确实发生了"，
+        # 用户可见的告警由 watermark_engine 写进日志
+        assert safe_open_image(p).mode == "RGB"
+
+    def test_truncated_file_error_contains_name(self, tmp_path):
+        full = os.path.join(str(tmp_path), "full.png")
+        Image.new("RGB", (200, 200), (255, 0, 0)).save(full)
+        data = open(full, "rb").read()
+
+        p = os.path.join(str(tmp_path), "half.png")
+        with open(p, "wb") as f:
+            f.write(data[: len(data) // 2])
+
+        with pytest.raises(ValueError) as exc:
+            safe_open_image(p)
+
+        assert "half.png" in str(exc.value)
+
+    def test_unreadable_header_error_contains_name(self, tmp_path):
+        p = os.path.join(str(tmp_path), "broken.jpg")
+        with open(p, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0" + os.urandom(6000))
+
+        with pytest.raises(ValueError) as exc:
+            safe_open_image(p)
+
+        assert "broken.jpg" in str(exc.value)
+
+    def test_missing_file_error_contains_name(self, tmp_path):
+        with pytest.raises(ValueError) as exc:
+            safe_open_image(os.path.join(str(tmp_path), "nope.png"))
+
+        assert "nope.png" in str(exc.value)
 
 
 # ==================== 运行入口 ====================

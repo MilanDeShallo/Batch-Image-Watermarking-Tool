@@ -726,6 +726,76 @@ def main():
     app.update()
     check("取消勾选后恢复", app._is_overwrite_original() is False)
 
+    # ---------- 位置口径 / 主题持久化 / 状态标志 ----------
+    head("位置口径 / 主题持久化 / 关窗保护")
+
+    import json as _json
+    import tempfile as _tempfile
+
+    import src.ui.app_window as aw
+    from src.ui.image_watermark_panel import ImageWatermarkPanel
+    from src.ui.text_watermark_panel import _POSITIONS
+
+    check(
+        "两面板九宫格键完全一致",
+        [k for k, _ in _POSITIONS] == list(ImageWatermarkPanel._POS_NAMES),
+        f"text={[k for k, _ in _POSITIONS]}",
+    )
+
+    # 旧预设里的 center-left 回填后必须归一化：
+    # 不归一化则按钮不高亮，渲染时还会滑到正中
+    try:
+        app._image_panel.set_from_config(
+            WatermarkConfig(logo_position="center-left")
+        )
+        _pos = app._image_panel.get_config_dict().get("logo_position")
+    except Exception as exc:
+        _pos = f"<异常 {exc}>"
+    check(
+        "center-left 回填后归一化为 middle-left",
+        _pos == "middle-left",
+        f"实际 {_pos!r}",
+    )
+
+    # 主题持久化：切主题要立刻落盘，下次启动才能读回。
+    # 冒烟会真的写盘，所以先把 LAYOUT_FILE 指到临时文件，别污染用户的界面偏好。
+    _orig_layout = aw.LAYOUT_FILE
+    aw.LAYOUT_FILE = os.path.join(
+        _tempfile.gettempdir(), "smoke_ui_layout.json"
+    )
+    try:
+        app._apply_theme("Light")
+        _saved = aw.read_saved_appearance()
+        check("切换浅色后写入布局文件", _saved == "Light", f"实际 {_saved!r}")
+
+        app._apply_theme("Dark")
+        check("切回深色同样落盘", aw.read_saved_appearance() == "Dark")
+
+        with open(aw.LAYOUT_FILE, encoding="utf-8") as _f:
+            _raw = _json.load(_f)
+        check(
+            "布局文件里同时保留布局与主题",
+            _raw.get("appearance") == "Dark",
+        )
+    finally:
+        try:
+            os.remove(aw.LAYOUT_FILE)
+        except Exception:
+            pass
+        aw.LAYOUT_FILE = _orig_layout
+
+    # 质量标签：IntVar.set 不触发 CTkSlider 的 command，必须手动同步
+    app._quality_var.set(72)
+    app._quality_value_label.configure(text="72")
+    check(
+        "质量数字标签可独立刷新",
+        app._quality_value_label.cget("text") == "72",
+    )
+
+    # 关窗保护靠这个标志；处理中为 True 时才会弹确认
+    check("空闲时不处于处理中", app._processing is False)
+    check("关窗回调已注册", callable(app._on_window_close))
+
     # ---------- 收尾 ----------
     head("收尾")
     app._clear_session()

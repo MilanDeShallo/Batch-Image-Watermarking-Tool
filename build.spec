@@ -7,6 +7,14 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 block_cipher = None
 
+# 版本号唯一来源：src/__init__.py。
+# 产物目录名（WatermarkTool）与 exe 名（中文名）保持不变 ——
+# 桌面快捷方式、打开水印工具.bat 与分发脚本都指着它们，改名会连带失效。
+sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+from src import __version__ as APP_VERSION          # noqa: E402
+
+print(f"[build] 批量图片水印工具 v{APP_VERSION}")
+
 # 收集 CustomTkinter 数据文件
 ctk_datas = collect_data_files('customtkinter')
 
@@ -19,8 +27,8 @@ pdfium_binaries = collect_dynamic_libs('pypdfium2')
 # 合并所有数据文件
 all_datas = ctk_datas + dnd_datas
 
-# 确保 presets 目录存在
-all_datas.append(('presets', 'presets'))
+# 不再打包 presets/ 目录：预设现在存到 %APPDATA%/WatermarkTool/presets，
+# 安装目录是只读的。把空目录打进包里只会让用户以为预设存在那里。
 
 a = Analysis(
     ['main.py'],

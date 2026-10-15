@@ -73,6 +73,28 @@ REQUIRED_SYMBOLS = [
      "失败清单落盘"),
     ("src.ui.app_window", "_release_stale_grab",
      "僵尸抓取安全网"),
+
+    # ---- v1.5：第二轮审计修复 ----
+    ("src.config", "normalize_position",
+     "位置别名归一化（center-left → middle-left）"),
+    ("src.config", "MAX_IMAGE_PIXELS",
+     "像素上限单一来源（引擎与内存预算共用）"),
+    ("src.config", "SUPPORTED_EXTENSIONS",
+     "输入扩展名单一来源"),
+    ("src.watermark_engine", "_is_high_depth_mode",
+     "高位深/浮点模式降位时写日志"),
+    ("src.pdf_engine", "OVERLAY_CACHE_MAX_ITEMS",
+     "覆盖层缓存上限（LRU 淘汰）"),
+    ("src.preset_manager", "_ensure_dirs",
+     "预设目录迁到用户目录 + 旧目录迁移"),
+    ("src.batch_planner", "overlay_scale",
+     "倍率快照透传到 PDF 引擎"),
+    ("src.ui.app_window", "read_saved_appearance",
+     "主题持久化"),
+    ("src.ui.app_window", "_dispatch_impl",
+     "调度器异常兜底（按钮不会卡在禁用态）"),
+    ("src.ui.app_window", "_run_batch",
+     "预检异步化后的批处理主体"),
 ]
 
 RESULTS: list[tuple[str, bool, str]] = []

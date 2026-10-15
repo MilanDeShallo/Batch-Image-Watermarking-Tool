@@ -8,7 +8,6 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PIL import Image, ImageChops, ImageStat
 from pypdf import PdfReader, PdfWriter
@@ -20,11 +19,14 @@ from src.pdf_engine import (
     apply_pdf_watermark,
     build_merged_pdf,
     config_fingerprint,
+    get_overlay_scale,
     get_pdf_page_count,
     image_page_size,
     image_to_pdf_bytes,
     image_file_to_pdf_bytes,
+    overlay_reference_size,
     render_pdf_page,
+    set_overlay_scale,
     watermark_pdf_bytes,
 )
 
@@ -370,6 +372,190 @@ class TestMergedPdf:
             reader = PdfReader(out)
             assert reader.is_encrypted is False
             assert len(reader.pages) == 1
+
+
+class TestOverlayScaleSnapshot:
+    """
+    覆盖层倍率必须是「一批一次」的快照。
+
+    背景：OVERLAY_SCALE 是模块级全局变量，而批处理跑在多个工作线程里。
+    如果每页都去读全局值，用户在处理途中拖动倍率滑块，
+    同一份 PDF 的前后几页就会按不同参考尺寸渲染 ——
+    同一个文件里出现两种水印大小，界面上完全看不出是哪一步出的问题。
+    修法是批处理入口取一次快照，一路传到最底层。
+    """
+
+    def setup_method(self):
+        self._before = get_overlay_scale()
+
+    def teardown_method(self):
+        # 全局值是进程级状态，测试必须还原，否则会污染同一进程里的其他用例
+        set_overlay_scale(self._before)
+
+    def test_reference_size_honours_explicit_scale(self):
+        set_overlay_scale(2.0)
+        assert overlay_reference_size(595, 842, 0, 1.0) == (595, 842)
+        assert overlay_reference_size(595, 842, 0, 3.0) == (1785, 2526)
+
+    def test_reference_size_falls_back_to_global(self):
+        set_overlay_scale(2.0)
+        assert overlay_reference_size(595, 842, 0) == \
+            overlay_reference_size(595, 842, 0, 2.0)
+
+    def test_explicit_scale_beats_global_change(self):
+        """关键回归：传了快照之后，全局值怎么变都不影响本次结果"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = os.path.join(tmp, "p.pdf")
+            _make_pdf(pdf, pages=2)
+            cfg = WatermarkConfig(text="SNAP", opacity=100)
+
+            set_overlay_scale(1.0)
+            baseline, _ = watermark_pdf_bytes(pdf, cfg)
+
+            set_overlay_scale(3.0)     # 模拟"处理途中用户拖了滑块"
+            with_snapshot, _ = watermark_pdf_bytes(pdf, cfg, overlay_scale=1.0)
+
+            assert with_snapshot == baseline, "快照没生效：全局倍率仍渗透进来了"
+
+    def test_scaling_actually_reaches_rendering(self):
+        """倍率确实是体积旋钮（顺带确认参数没被吞掉）"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = os.path.join(tmp, "p.pdf")
+            _make_pdf(pdf, pages=1)
+            cfg = WatermarkConfig(text="SIZE", opacity=100)
+
+            small, _ = watermark_pdf_bytes(pdf, cfg, overlay_scale=1.0)
+            large, _ = watermark_pdf_bytes(pdf, cfg, overlay_scale=3.0)
+
+            assert len(large) > len(small)
+
+    def test_execute_task_forwards_snapshot(self):
+        """批处理路径（execute_task）也要把快照带到底层"""
+        from src.batch_planner import execute_task, plan_batch
+        from src.overrides import ScopeStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = os.path.join(tmp, "p.pdf")
+            _make_pdf(pdf, pages=1)
+
+            store = ScopeStore()
+            store.set_base(WatermarkConfig(text="E2E", opacity=100).to_dict())
+            plan = plan_batch([pdf], store)
+
+            set_overlay_scale(1.0)
+            out_a = os.path.join(tmp, "a.pdf")
+            execute_task(plan.tasks[0], out_a, overlay_scale=1.0)
+
+            set_overlay_scale(3.0)
+            out_b = os.path.join(tmp, "b.pdf")
+            execute_task(plan.tasks[0], out_b, overlay_scale=1.0)
+
+            assert os.path.getsize(out_a) == os.path.getsize(out_b)
+
+    def test_snapshot_does_not_mutate_global(self):
+        """快照是只读的：批处理不该顺手把全局值改掉"""
+        set_overlay_scale(2.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = os.path.join(tmp, "p.pdf")
+            _make_pdf(pdf, pages=1)
+
+            watermark_pdf_bytes(
+                pdf, WatermarkConfig(text="X", opacity=100), overlay_scale=1.0
+            )
+
+        assert get_overlay_scale() == 2.5
+
+
+class TestOverlayCacheBounds:
+    """
+    覆盖层缓存必须有上限。
+
+    背景：缓存键包含「配置指纹」。逐页设了不同参数的 PDF 会让每页指纹都不同，
+    缓存于是退化成「把整本 PDF 每一页的覆盖层位图都留在内存里」——
+    800 页就是 800 张整页位图，命中率本来就是 0，留着只剩内存代价。
+    """
+
+    @staticmethod
+    def _count_overlay_builds(monkeypatch):
+        """替换 _make_overlay_pdf 计数，返回 (模块, 调用记录)"""
+        import src.pdf_engine as pe
+
+        calls = []
+        original = pe._make_overlay_pdf
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(pe, "_make_overlay_pdf", counting)
+        return pe, calls
+
+    @staticmethod
+    def _make_pdf_with_sizes(path, sizes):
+        """逐页不同页面尺寸的 PDF（用来制造不同的缓存指纹）"""
+        c = rl_canvas.Canvas(path)
+        for size in sizes:
+            c.setPageSize(size)
+            c.showPage()
+        c.save()
+
+    def test_same_size_pages_share_one_overlay(self, tmp_path, monkeypatch):
+        pe, calls = self._count_overlay_builds(monkeypatch)
+
+        pdf = str(tmp_path / "same.pdf")
+        self._make_pdf_with_sizes(pdf, [(595, 842)] * 6)
+
+        pe.watermark_pdf_bytes(pdf, WatermarkConfig(text="C", opacity=100))
+
+        assert len(calls) == 1, "同规格页面应共用同一张覆盖层"
+
+    def test_eviction_rebuilds_when_limit_exceeded(self, tmp_path, monkeypatch):
+        """上限 2 + 三种尺寸轮流：第 4 页必须重建 A —— 证明淘汰真的发生了"""
+        pe, calls = self._count_overlay_builds(monkeypatch)
+        monkeypatch.setattr(pe, "OVERLAY_CACHE_MAX_ITEMS", 2)
+
+        pdf = str(tmp_path / "mix.pdf")
+        self._make_pdf_with_sizes(
+            pdf, [(595, 842), (842, 595), (400, 600), (595, 842)]
+        )
+
+        pe.watermark_pdf_bytes(pdf, WatermarkConfig(text="C", opacity=100))
+
+        assert len(calls) == 4
+
+    def test_larger_limit_keeps_all_fingerprints(self, tmp_path, monkeypatch):
+        """上限够大时不该发生淘汰（对照组，防止"一律不缓存"也能过前面的用例）"""
+        pe, calls = self._count_overlay_builds(monkeypatch)
+        monkeypatch.setattr(pe, "OVERLAY_CACHE_MAX_ITEMS", 8)
+
+        pdf = str(tmp_path / "mix.pdf")
+        self._make_pdf_with_sizes(
+            pdf, [(595, 842), (842, 595), (400, 600), (595, 842)]
+        )
+
+        pe.watermark_pdf_bytes(pdf, WatermarkConfig(text="C", opacity=100))
+
+        assert len(calls) == 3
+
+    def test_output_correct_under_tiny_limit(self, tmp_path, monkeypatch):
+        """淘汰只影响速度，不影响正确性：每页都得有水印"""
+        pe, _ = self._count_overlay_builds(monkeypatch)
+        monkeypatch.setattr(pe, "OVERLAY_CACHE_MAX_ITEMS", 1)
+
+        pdf = str(tmp_path / "many.pdf")
+        self._make_pdf_with_sizes(pdf, [(595, 842), (842, 595), (400, 600)])
+
+        # 白底页面 + 黑字水印，才能用"最暗像素"判断水印在不在
+        data, pages = pe.watermark_pdf_bytes(
+            pdf, WatermarkConfig(text="MARK", color_rgba=(0, 0, 0), opacity=100)
+        )
+        assert pages == 3
+
+        out = tmp_path / "out.pdf"
+        out.write_bytes(data)
+        for i in range(3):
+            img = render_pdf_page(str(out), page_num=i, scale=1.0)
+            assert img.convert("L").getextrema()[0] < 200, f"第 {i + 1} 页没有水印"
 
 
 if __name__ == "__main__":

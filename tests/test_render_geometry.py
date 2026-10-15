@@ -14,7 +14,6 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PIL import Image, ImageChops
 from reportlab.pdfgen import canvas as rl_canvas
@@ -325,6 +324,69 @@ class TestRotatedPdfPages:
             assert box, "未检测到水印"
             assert box[0] < img.width * 0.25, f"水印未贴近显示区左侧: {box}"
             assert box[1] < img.height * 0.25, f"水印未贴近显示区上侧: {box}"
+
+
+class TestPositionNaming:
+    """
+    位置命名的单一口径。
+
+    历史问题：图片（Logo）面板用 center-left / center-right，文字面板用
+    middle-left / middle-right，而引擎只认 top / middle / bottom 作为垂直分量。
+    于是同一个「左中」，从图片面板出去会被引擎当成 v_pos="center"，
+    落进 y 字典的 .get() 默认值 → 水印渲染在正中。界面按钮高亮正常、不报错，
+    只有看图才发现不对 —— 所以这条必须有测试钉住。
+
+    面板在类内局部导入：pytest 收集时不必为几何测试加载 GUI 依赖。
+    """
+
+    BASE = (1000, 800)
+    SPRITE = (100, 50)
+    MARGIN = 20
+
+    def _anchor(self, pos):
+        from src.watermark_engine import anchor_position
+        return anchor_position(self.BASE, self.SPRITE, pos, self.MARGIN)
+
+    def test_both_panels_share_one_position_vocabulary(self):
+        """两个面板的九宫格键必须一字不差，否则同一个按钮两种表现"""
+        from src.ui.image_watermark_panel import ImageWatermarkPanel
+        from src.ui.text_watermark_panel import _POSITIONS
+
+        assert [k for k, _ in _POSITIONS] == list(ImageWatermarkPanel._POS_NAMES)
+
+    def test_legacy_center_left_renders_like_middle_left(self):
+        """旧写法 center-left / center-right 必须落到与 middle-* 相同的坐标"""
+        assert self._anchor("center-left") == self._anchor("middle-left")
+        assert self._anchor("center-right") == self._anchor("middle-right")
+
+    def test_left_is_not_center(self):
+        """回归核心：左中要真的靠左，不能滑到正中（垂直居中是对的）"""
+        x_left, y_left = self._anchor("middle-left")
+        x_mid, y_mid = self._anchor("center")
+
+        assert x_left < x_mid, "「左中」的水平位置跑到了正中"
+        assert y_left == y_mid, "「左中」的垂直位置应为居中"
+
+    def test_nine_positions_land_where_named(self):
+        """九个位置各自归位：横竖两轴都单调"""
+        from src.ui.text_watermark_panel import _POSITIONS
+
+        seen = {key: self._anchor(key) for key, _ in _POSITIONS}
+
+        assert seen["middle-left"][0] < seen["center"][0] < seen["middle-right"][0]
+        assert seen["top-left"][1] < seen["center"][1] < seen["bottom-left"][1]
+        assert len({seen["top-left"], seen["center"], seen["bottom-right"]}) == 3
+
+    def test_legacy_preset_is_migrated_on_load(self):
+        """旧预设文件里存的 center-* 反序列化后应已被翻译"""
+        cfg = WatermarkConfig.from_dict({
+            "text": "x",
+            "position": "center-left",
+            "logo_position": "center-right",
+        })
+
+        assert cfg.position == "middle-left"
+        assert cfg.logo_position == "middle-right"
 
 
 if __name__ == "__main__":

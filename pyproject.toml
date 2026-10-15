@@ -1,0 +1,24 @@
+# 工具配置（pytest / ruff）。
+#
+# 这个项目用 PyInstaller 打包（见 build.spec 与 build_exe.bat），
+# 不构建 wheel，所以这里没有 [build-system]。
+# 版本号的唯一来源是 src/__init__.py 里的 __version__。
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# tests/smoke_gui.py、tests/smoke_preview.py、tests/smoke_exe.py
+# 文件名不是 test_*，pytest 不会收集 —— 这是刻意的：
+# 它们需要真实窗口、真 mainloop 或打包产物，必须单独跑（见 README）。
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 冒烟脚本靠局部导入控制加载顺序，并且按执行顺序打印结果
+"tests/*" = ["E402"]

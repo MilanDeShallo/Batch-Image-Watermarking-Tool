@@ -38,6 +38,46 @@ DEFAULT_LOGO_MARGIN_PX = 20             # Logo 边距（像素）
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_FILENAME_TEMPLATE = "{original}_watermarked"
 
+# 单张图片的像素上限：超过即拒绝处理，不交给 Pillow 去撞内存。
+# 3 亿像素 ≈ 1.2GB RGBA，已远超常见相机 / 扫描仪输出。
+# watermark_engine（渲染引擎）与 resource_budget（内存预算）共用这一个值 ——
+# 以前两处各写一份 300_000_000，改一处忘一处会出现"预警了却没拦住"。
+MAX_IMAGE_PIXELS = 300_000_000
+
+# 可批量处理的输入扩展名（小写，含 PDF）。
+# 注意这里是"输入"而不是"图片"：PDF 也会被收集进来，
+# 只是走不同的处理分支（见 batch_planner）。
+SUPPORTED_EXTENSIONS = frozenset({
+    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".pdf",
+})
+
+# 九宫格位置的规范写法（垂直分量只有 top / middle / bottom）
+DEFAULT_POSITION = "bottom-right"
+
+# 位置别名 —— 引擎 anchor_position 只认 top / middle / bottom 作为垂直分量。
+# 历史版本的两个面板写法不一致：图片（Logo）面板用 center-left / center-right，
+# 文字面板用 middle-left / middle-right。于是同一个「左中」，经图片面板出去会变成
+# v_pos="center" → 落进引擎字典的 .get() 默认值 → 水印实际渲染在正中，
+# 而且没有任何报错。这里把别名收敛到规范值，面板 / 预设 / 引擎共用同一口径。
+POSITION_ALIASES = {
+    "center-left": "middle-left",
+    "center-right": "middle-right",
+}
+
+
+def normalize_position(value, default: str = DEFAULT_POSITION) -> str:
+    """
+    把位置字符串归一化成引擎认识的形式（"{垂直}-{水平}"）。
+
+    三个入口都会用到：面板读写配置、预设反序列化、引擎兜底。
+    只要这里口径唯一，旧预设里的 center-left 也能落到正确位置。
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    return POSITION_ALIASES.get(text, text)
+
+
 # 输出同名冲突策略
 CONFLICT_RENAME = "rename"        # 自动重命名（默认，绝不覆盖已有文件）
 CONFLICT_OVERWRITE = "overwrite"  # 覆盖同名输出文件
@@ -244,6 +284,13 @@ class WatermarkConfig:
 
         # 确保版本号为最新
         processed["version"] = 1
+
+        # 位置归一化：老版图片面板存的是 center-left / center-right，
+        # 引擎只认 middle-*。不在这里翻译的话，用户加载旧预设后
+        # 「左中」会在渲染时滑到正中，界面上却看不出任何异常。
+        for key in ("position", "logo_position"):
+            if key in processed:
+                processed[key] = normalize_position(processed[key])
 
         # 历史数据迁移：旧配置与旧脚本用 color_rgba 的第 4 位表达不透明度。
         # 这里不用显式搬运 —— opacity 字段缺省即 None，__post_init__ 会从

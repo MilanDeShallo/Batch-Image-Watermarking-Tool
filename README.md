@@ -333,6 +333,8 @@ print(get_pdf_page_count("input.pdf"))
 
 # 覆盖层渲染倍率（默认 2.0 ≈ 144 DPI）。调低换体积，调高换清晰度。
 # 提高倍率会让内存与输出体积同步上升，因为覆盖层是整页位图。
+# 注意：批处理会在开始时取一次快照并贯穿该批 —— 处理途中调它只影响下一批，
+# 否则同一份 PDF 的前后几页会按不同参考尺寸渲染，同一文件里出现两种水印大小。
 from src.pdf_engine import set_overlay_scale, get_overlay_scale
 set_overlay_scale(1.5)
 
@@ -436,10 +438,12 @@ for task, out_path in zip(plan.tasks, output_paths):
     if out_path is None:
         continue                   # 冲突策略判定为「跳过」
     execute_task(task, out_path, jpeg_quality=90,
-                 should_cancel=lambda: cancelled)   # 在文件入口与 PDF 页间退出
+                 should_cancel=lambda: cancelled,   # 文件入口 + PDF 每页之间都会查
+                 overlay_scale=snapshot)            # 本批固定倍率
 
 from src.pdf_engine import build_merged_pdf
-build_merged_pdf(plan.merge_items(), merged_path, jpeg_quality=90)
+build_merged_pdf(plan.merge_items(), merged_path, jpeg_quality=90,
+                 overlay_scale=snapshot)
 ```
 
 几点约定：
@@ -448,6 +452,7 @@ build_merged_pdf(plan.merge_items(), merged_path, jpeg_quality=90)
 - 所有输出路径都走原子写出（临时文件 → `os.replace()`），异常或中断时旧文件原封不动
 - `plan_output_paths()` 内部维护「本批已占用名字」集合，所以即使选「覆盖同名文件」，同一批里的两个文件也不会互相盖掉
 - `file_manager.generate_output_path()` 在冲突策略为「跳过」时返回 `None`（不是空字符串），调用方必须先判空
+- `overlay_scale` 是覆盖层渲染倍率快照：批处理入口取一次并贯穿整批，否则处理途中调倍率会让同一份 PDF 的前后几页尺寸不一致。不传则由 `pdf_engine` 取当时的全局值 —— 预览走的正是这条路，因为拖动滑块时预览应当立即跟着变
 
 `plan_batch` 的两条内置规则：PDF 源文件无论输出格式选什么都强制输出 PDF；`merge` 只在输出格式为 PDF 且显式勾选时才为真。
 
@@ -517,11 +522,23 @@ build_merged_pdf(plan.merge_items(), merged_path, jpeg_quality=90)
 
 示例：`top-left`、`middle-center`、`bottom-right`。
 
+旧版本曾用 `center-left` / `center-right` 表示「左中 / 右中」。这两个写法**仍被接受**，
+加载旧预设时会自动归一化为 `middle-left` / `middle-right`。原因：引擎的垂直分量只认
+`top / middle / bottom`，`center` 落到垂直分量上会命中字典默认值，让水印悄悄跑到正中，
+而且界面按钮高亮正常、不报任何错。
+
 ---
 
 ## 预设系统
 
-预设存储为 JSON 文件，位于项目根目录的 `presets/` 文件夹下，每个预设一个文件。
+预设存储为 JSON 文件，位于 **`%APPDATA%/WatermarkTool/presets/`**，每个预设一个文件。
+
+为什么放在用户目录：PyInstaller 打包后 `__file__` 落在 `_internal/` 下，程序若装到
+`Program Files`，那里是只读的 —— 用户一保存就报"保存预设失败"。界面布局与日志也都走
+`APPDATA`，这里是同一套口径。
+
+首次访问时会把旧版本留在项目 `presets/` 目录下的预设**复制**过来（是复制不是移动，
+旧目录保持原样，用户可以随时退回旧版本；同名文件不覆盖，以用户目录里的那份为准）。
 
 - **保存**：当前所有参数序列化为 `{预设名}.json`
 - **加载**：反序列化时自动过滤未知字段、恢复 tuple 类型、按 `version` 字段做版本迁移
@@ -554,14 +571,15 @@ PresetManager.delete_preset("品牌水印")
 ### 健壮性
 
 1. **EXIF 方向自动校正**：调用 `ImageOps.exif_transpose()` 实际旋转像素，并清除 EXIF 中的 `Orientation` 标记为 `1`，防止支持 EXIF 的查看器对已旋转图片二次旋转。
-2. **色彩空间归一化**：CMYK / P / La 等非标准模式统一转为 RGB，保证后续合成与保存的稳定性。
-3. **超大图有安全上限**：模块级 `Image.MAX_IMAGE_PIXELS = 300_000_000`（约 3 亿像素，解码后约 1.2GB RGBA）。旧实现把它设为 `None`，等于完全关掉 Pillow 的解压炸弹保护 —— 一张解压炸弹或超大 TIFF 就能把进程撑死。超限文件在批处理开始前被识别出来，**明确告知后跳过**，而不是交给 Pillow 去撞内存后崩掉。
-4. **字体多级回退**：用户指定路径 → 微软雅黑 → 黑体 → Pillow 内置字体，任一可用即停止，避免缺字崩溃。
-5. **空字符串容错**：文字为空或纯空白时直接返回原图，不报错。
-6. **路径清洗**：自动清除 Windows 拖拽传入的 `{}` 包裹与引号。
-7. **文件句柄释放**：所有图片读取路径使用 `with Image.open(...)` 并在加载后返回脱离文件的对象副本。若在打开与加载之间抛异常，句柄会被一直占用，导致源文件无法重命名 / 删除 —— 这在 Windows 上是常见故障。
-8. **输入值统一校验**：`src/validators.py` 对所有数值输入做解析与区间夹取（坐标百分比 0–100、间距 ≥ 1、透明度 0–100、缩放 1%–100%、旋转 -180°–180°），非法值回退默认值并在状态栏提示。同时兜底平铺步长，避免间距为 0 或负数时 `range()` 抛异常或静默返回空序列。
-9. **界面不会被自己的弹窗卡死**：完成提示框不再调用 `grab_set()`。
+2. **色彩空间归一化**：能直接进合成管线的模式原样保留（`RGB` / `RGBA` / `L`）；`LA` 与带 `transparency` 的调色板 PNG 一律转 `RGBA` —— 它们的模式名里不带 `A`，却确实携带透明通道，以前统一 `convert("RGB")` 会把透明区域变成实心（半透明 Logo 导出来是一块黑底方块，且没有任何报错）。16/32 位灰度与浮点模式无法在 8 位/通道的管线里保留位深，转换时**写一条日志**说明位深被压缩，不再无声降位。
+3. **读取失败带文件名**：`Image.open` 与 `src.load()` 的异常统一包装成 `ValueError("无法读取图片 xxx：…")`。Pillow 原始抛出的 `Truncated File Read` 不带文件名，批量失败清单里只会留下一句无从下手的报错。
+4. **超大图有安全上限**：`src/config.py` 里的 `MAX_IMAGE_PIXELS = 300_000_000`（约 3 亿像素，解码后约 1.2GB RGBA），渲染引擎与内存预算共用这一个值。旧实现把它设为 `None`，等于完全关掉 Pillow 的解压炸弹保护 —— 一张解压炸弹或超大 TIFF 就能把进程撑死。超限文件在批处理开始前被识别出来，**明确告知后跳过**，而不是交给 Pillow 去撞内存后崩掉。
+5. **字体多级回退**：用户指定路径 → 微软雅黑 → 黑体 → Pillow 内置字体，任一可用即停止，避免缺字崩溃。
+6. **空字符串容错**：文字为空或纯空白时直接返回原图，不报错。
+7. **路径清洗**：自动清除 Windows 拖拽传入的 `{}` 包裹与引号。
+8. **文件句柄释放**：所有图片读取路径使用 `with Image.open(...)` 并在加载后返回脱离文件的对象副本。若在打开与加载之间抛异常，句柄会被一直占用，导致源文件无法重命名 / 删除 —— 这在 Windows 上是常见故障。
+9. **输入值统一校验**：`src/validators.py` 对所有数值输入做解析与区间夹取（坐标百分比 0–100、间距 ≥ 1、透明度 0–100、缩放 1%–100%、旋转 -180°–180°），非法值回退默认值并在状态栏提示。同时兜底平铺步长，避免间距为 0 或负数时 `range()` 抛异常或静默返回空序列。
+10. **界面不会被自己的弹窗卡死**：完成提示框不再调用 `grab_set()`。
 
    根因值得记一笔：CustomTkinter 的 `CTkToplevel` 为了刷新标题栏颜色，构造时会先 `withdraw()` 自己、再 `after(5)` 调 `deiconify()`。在这个窗口上再叠加模态抓取，抓取就落在了一个「当时不可见」的窗口上。若主窗口此刻正好被最小化，子对话框会被连带置为 `withdrawn`，而输入抓取仍然攥在它手里 —— 表现就是**导出完把软件最小化后，再也点不醒**（实测 `grab_current` 始终指向那个 withdrawn 的对话框）。
 
@@ -589,9 +607,9 @@ reportlab 包成与页面同尺寸的覆盖 PDF
 pypdf merge_page 逐页叠加到原 PDF（原内容保留）
 ```
 
-- 覆盖层渲染倍率 `OVERLAY_SCALE = 2.0`（约 144 DPI），保证文字在 200% 缩放下依然清晰
+- 覆盖层渲染倍率 `OVERLAY_SCALE = 2.0`（约 144 DPI），保证文字在 200% 缩放下依然清晰；批处理在开始时取一次快照，整批固定同一倍率
 - 预览（`pypdfium2` 渲染当前页 + Pillow 叠加）与导出（透明底图 + 同一 Pillow 引擎）使用相同的相对几何计算，所见即所得
-- 覆盖层按「页面尺寸 + 旋转角」缓存，多页同规格时只生成一次
+- 覆盖层按「页面尺寸 + 旋转角 + 倍率 + 配置指纹」缓存，多页同规格时只生成一次。缓存有上限（条数 + 总字节双约束，超出按 LRU 淘汰）：逐页设了不同参数的 PDF 会让每页指纹都不同，没有上限等于把整本的覆盖层位图都留在内存里，而那种情况下命中率本来就是 0
 - `/Rotate` 页面按**显示方向**渲染覆盖层，再反向旋转同角度写入页面坐标系，与目标页的 `/Rotate` 合成后正好摆正。旧实现按未旋转 `mediabox` 创建覆盖层，90° 下横向 ×0.707、纵向 ×1.415，水印被拉伸约 2 倍
 
 **元数据与数字签名**
@@ -606,7 +624,7 @@ pypdf merge_page 逐页叠加到原 PDF（原内容保留）
 
 | 限制 | 说明 / 计划 |
 |------|-------------|
-| 覆盖层是整页位图 | A4 单页覆盖层约 1190×1684 RGBA，混合尺寸 PDF 会生成多份缓存，内存与输出体积随页数上升。可用 `set_overlay_scale()` 调低倍率来换体积 |
+| 覆盖层是整页位图 | A4 单页覆盖层约 1190×1684 RGBA，输出体积随页数线性上升；缓存已加上限（条数 + 字节双约束，LRU 淘汰），不会随页数无限增长。体积敏感时可用 `set_overlay_scale()` 调低倍率 |
 | 加密 PDF | 仅支持空密码（自动解密）；有密码的 PDF 会明确报错 |
 | 水印本身仍是位图 | 后续可升级为**矢量文字覆盖层**（在覆盖 PDF 里直接排文字而不是贴图），清晰度与体积都能显著改善；代价是要额外解决字体嵌入与中文子集化 |
 
@@ -636,13 +654,28 @@ pypdf merge_page 逐页叠加到原 PDF（原内容保留）
 | 项 | 值 | 说明 |
 |----|----|------|
 | `BYTES_PER_PIXEL` | 4 | RGBA |
-| `TASK_SLACK` | 2.5 | 解码 + 覆盖层 + 编码的峰值系数 |
+| `TASK_SLACK` | 5.0 | 单任务峰值系数，等效 20 B/px（**实测**，见下） |
 | `MEMORY_BUDGET_RATIO` | 0.5 | 最多用掉可用内存的一半 |
 | `MAX_WORKERS` | 8 | 并行度上限 |
 | `MAX_IMAGE_PIXELS` | 3 亿 | 超过即拒绝处理（Pillow 在 2× 阈值抛错，本工具捕获后转成带文件名的提示） |
 | `LARGE_IMAGE_PIXELS` | 5000 万 | 超过即触发开始前的内存预警 |
 
 `plan_workers()` 按**最坏单张**而不是平均值算并行度 —— 平均值会被一堆小图拉低，然后让某张大图在峰值时把内存顶爆。
+
+`TASK_SLACK` 的来由（Windows 工作集采样；`both` 类型 = 文字 + Logo，走导出路径）：
+
+| 输入 | 峰值增量 | 折算 |
+|------|----------|------|
+| 6000×4000（24M px） | 369.8 MB | 16.2 B/px |
+| 8000×6000（48M px） | 736.7 MB | 16.1 B/px |
+
+两者一致，说明峰值取决于「同时存活的整图份数」而不是图本身大小：输入图 1 份 + 文字合成的
+`base`/`overlay`/结果 3 份 + Logo 再次合成的 3 份 + 存 JPEG 时的白底 1 份。取 5.0（=20 B/px）
+比实测高约 25% 作余量。**不要按"平均值"把它调小** —— 旧值 2.5（=10 B/px）就是这么估出来的，
+低于实测峰值：本机不一定立刻出问题，但在别人的高分辨率图上会 OOM，而且很难复现。
+
+批处理开始前的预检（逐个读文件头判像素规模、检查 PDF 数字签名）跑在**后台线程**里，
+界面只显示"正在检查 N 个文件…"。上千个文件时这是几秒的纯 IO，放在主线程会让界面直接冻结。
 
 ### 日志系统
 
@@ -669,32 +702,37 @@ GUI 层 (src/ui/*)  ──仅持有──▶  WatermarkConfig (src/config.py)
 
 ```
 watermark_tool/
-├── main.py                    # 入口
-├── requirements.txt           # 依赖
+├── main.py                    # 入口（先装日志与异常钩子，再建窗口）
+├── requirements.txt           # 依赖（版本全部固定）
+├── pyproject.toml             # pytest / ruff 配置
+├── conftest.py                # 把项目根加进 sys.path，测试文件不必各自再写一遍
 ├── build.spec                 # PyInstaller 打包配置
-├── build_exe.bat              # 一键打包脚本
+├── build_exe.py               # 一键打包逻辑（中文输出与判断都在这里）
+├── build_exe.bat              # 纯 ASCII 启动器，只负责调 build_exe.py
 ├── 启动水印工具.bat            # 启动脚本
-├── presets/                  # 预设存储目录（JSON）
+├── presets/                   # 仅作占位；用户预设实际存 %APPDATA%/WatermarkTool/presets
 ├── assets/                    # 资源目录
 ├── hooks/                     # PyInstaller hooks
 │   └── hook-tkinterdnd2.py
 ├── tests/                     # 测试
-│   ├── test_core.py           # 配置 / 路径 / 预设 / 引擎
+│   ├── test_core.py           # 配置 / 路径 / 预设 / 引擎 / 图片读取模式
 │   ├── test_pdf.py            # PDF 水印引擎
-│   ├── test_pdf_output.py     # 逐页参数 / 图片转 PDF / 多合一
+│   ├── test_pdf_output.py     # 逐页参数 / 图片转 PDF / 多合一 / 覆盖层缓存上限
 │   ├── test_overrides.py      # 三层参数作用域
-│   ├── test_batch_pipeline.py # 作用域 → 规划 → 实际写出 的端到端
-│   ├── test_render_geometry.py # 合成正确性 / 平铺步长 / 旋转页几何
+│   ├── test_batch_pipeline.py # 作用域 → 规划 → 实际写出 的端到端（含取消传播）
+│   ├── test_render_geometry.py # 合成正确性 / 平铺步长 / 旋转页几何 / 位置命名
 │   ├── test_preview_consistency.py # 预览与导出的几何一致性（含 PDF 参考尺寸）
 │   ├── test_validators.py     # 输入校验 / 句柄释放 / 平铺兜底
 │   ├── test_output_settings.py # 文件名模板 / 同名策略 / 覆盖原图 / 原子写出 / 取消
-│   ├── test_resource_budget.py # 内存估算 / 并行度决策 / 像素上限
+│   ├── test_resource_budget.py # 内存估算 / 并行度决策 / 像素上限 / 峰值系数校准
 │   ├── smoke_gui.py           # 界面冒烟（独立脚本，不经 pytest 运行）
-│   └── smoke_preview.py       # 预览管线冒烟（真线程 + 真 mainloop）
+│   ├── smoke_preview.py       # 预览管线冒烟（真线程 + 真 mainloop）
+│   └── smoke_exe.py           # 打包产物冒烟：从 exe 字节码里探"只有本版本才有的符号"
 ├── .github/workflows/
-│   └── tests.yml              # CI：pytest + 两个冒烟
+│   └── tests.yml              # CI：pytest + 三个冒烟 + 打包 + 产物探测
 └── src/
-    ├── config.py              # WatermarkConfig 数据类 + 默认值唯一来源 + JSON 序列化
+    ├── __init__.py            # __version__ —— 全项目版本号的唯一来源
+    ├── config.py              # WatermarkConfig 数据类 + 默认值/常量唯一来源 + JSON 序列化
     ├── watermark_engine.py    # 图片水印引擎（无 GUI 依赖）
     ├── pdf_engine.py          # PDF 引擎（覆盖层合并 / 逐页参数 / 图片转 PDF / 多合一）
     ├── overrides.py           # 三层参数作用域（无 GUI 依赖）
@@ -702,7 +740,7 @@ watermark_tool/
     ├── validators.py          # 输入值校验与归一化（无 GUI 依赖）
     ├── resource_budget.py     # 内存估算 / 并行度决策 / 像素上限（无 GUI 依赖）
     ├── file_manager.py        # 文件收集 / 去重 / 输出路径生成 / 原子写出
-    ├── preset_manager.py      # 预设管理器
+    ├── preset_manager.py      # 预设管理器（存 %APPDATA%，含旧目录迁移）
     ├── logger.py              # 日志系统（轮转 + 全局异常钩子）
     └── ui/
         ├── app_window.py          # 主窗口
@@ -717,14 +755,17 @@ watermark_tool/
 ### 运行测试
 
 ```bash
-python -m pytest tests/ -q          # 单元与集成测试（219 项）
-python tests/smoke_gui.py           # 界面冒烟（98 项检查，退出码 0 表示全过）
+python -m pytest tests/ -q          # 单元与集成测试（253 项）
+python tests/smoke_gui.py           # 界面冒烟（106 项检查，退出码 0 表示全过）
 python tests/smoke_preview.py       # 预览管线冒烟（23 项检查）
+python tests/smoke_exe.py           # 打包产物冒烟（18 项检查，需先打包）
 ```
 
 依赖版本在 `requirements.txt` 中全部固定（含 `pyinstaller`），避免"今天能装、明天装不上"。
 
-CI 见 `.github/workflows/tests.yml`：在 Windows 上依次跑 `pytest` 与两个冒烟脚本。两个冒烟脚本文件名不是 `test_*`，**不会被 pytest 自动收集**，这是有意的 —— 它们需要真实窗口与 `mainloop`，比单元测试慢得多，由 CI 显式串行执行。
+CI 见 `.github/workflows/tests.yml`：在 Windows 上依次跑 `pytest`、三个冒烟脚本，再跑一次 PyInstaller 并对产物做符号探测。三个冒烟脚本文件名不是 `test_*`，**不会被 pytest 自动收集**，这是有意为之 —— 它们需要真实窗口、`mainloop` 或打包产物，比单元测试慢得多，由 CI 显式串行执行。
+
+打包 + 产物探测这一环不能省：源码层面全绿并不代表 exe 里就有这些改动（漏了 `hiddenimport`、忘了重新打包，本地测试都发现不了），而产物时间戳只能证明"重新打过"，证明不了"内容是对的"。
 
 测试覆盖配置序列化与版本迁移、不透明度的单一权威来源、输出路径与同名冲突策略、原子写出与残留清理、任务级取消、内存预算与并行度决策、预设增删改查、图片与 PDF 水印引擎、逐页参数与多合一输出、三层参数作用域、输入值校验、文件句柄释放、合成与平铺几何，以及**预览与导出的几何一致性**。
 
@@ -767,7 +808,13 @@ A：预设绑定的 Logo 路径失效时会被自动清空并提示，重新指�
 A：可以。水印以覆盖层形式叠加，原页面内容与文字层完整保留，可正常选中、复制与搜索。
 
 **Q：加了 PDF 支持后输出文件变大了？**
-A：覆盖层是整页位图（`OVERLAY_SCALE` 默认 2.0 ≈ 144 DPI），体积会有明显增加，且页面尺寸种类越多、每个尺寸的覆盖层都会各缓存一份。若体积敏感，可用 `set_overlay_scale(1.0)` 调低倍率换取体积。
+A：覆盖层是整页位图（`OVERLAY_SCALE` 默认 2.0 ≈ 144 DPI），体积会有明显增加，且同一份文件里页面尺寸种类越多、每种规格都要各生成一份覆盖层。若体积敏感，可用 `set_overlay_scale(1.0)` 调低倍率换取体积。缓存本身有上限（LRU），不会因为页数多而无限占用内存。
+
+**Q：预设保存在哪里？换台电脑会丢吗？**
+A：`%APPDATA%/WatermarkTool/presets/*.json`（在资源管理器地址栏输入 `%APPDATA%\WatermarkTool` 即可打开）。放在用户目录而不是安装目录，是因为装到 `Program Files` 时安装目录只读，保存在那里会失败。旧版本留在项目 `presets/` 里的预设会在首次访问时自动复制过来（复制不是移动，旧目录保持原样）。要迁移到新机器，把整个 `presets` 文件夹拷过去即可；预设里绑定的 Logo 按绝对路径记录，路径失效时会提示并清空，重新指定即可。
+
+**Q：处理还没结束就关窗口会怎样？**
+A：会先弹确认。确认退出后任务在可中断点停下：**已经写出的文件保留**，正在处理的那一个因为走原子写出不会留下半成品。就算直接强杀进程也一样 —— 源图绝不会被写坏。
 
 **Q：怎么让输出文件名带日期 / 序号？**
 A：用文件名模板。支持 `{original}`（原文件名，不含扩展名）、`{date}`、`{time}`、`{seq}`，例如 `{original}_{date}` → `DSC001_20261013.jpg`。模板清空或全是空格时会自动回落成默认的 `{original}_watermarked`，不会把整批文件写成同一个名字。

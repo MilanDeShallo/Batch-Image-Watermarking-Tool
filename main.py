@@ -14,11 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def main() -> int:
+    from src import __version__
     from src.logger import get_logger, install_excepthook, log_exception, log_path
 
     logger = get_logger()
     install_excepthook()
-    logger.info("=== 应用启动 ===")
+    # 版本写进日志：用户报问题时第一件事就是确认他跑的是哪一版
+    logger.info(f"=== 应用启动 v{__version__} ===")
 
     try:
         from src.ui.app_window import AppWindow

@@ -15,12 +15,14 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+
 
 from PIL import Image, ImageChops
 from reportlab.pdfgen import canvas as rl_canvas
 
 from src.batch_planner import (
+    TaskCancelled,
     execute_task,
     normalize_format,
     plan_batch,
@@ -354,6 +356,64 @@ class TestMergedOutput:
             build_merged_pdf(plan.merge_items(), low, jpeg_quality=30)
 
             assert os.path.getsize(low) < os.path.getsize(high)
+
+
+class TestCancellationPropagation:
+    """
+    取消必须真的传到底层引擎 —— 机制写好了却没接上线，表现就是"点了取消没反应"。
+
+    背景：execute_task 的 PDF 分支曾经只传 4 个位置参数，
+    should_cancel 没进 apply_pdf_watermark，于是 pdf_engine 里的逐页检查
+    在批处理路径形同虚设：800 页的 PDF 会把整本跑完才响应取消。
+    """
+
+    def test_pdf_branch_forwards_cancel_to_engine(self, tmp_path):
+        """入口放行 + 页间检查取消 → 抛 TaskCancelled，且不留任何半成品"""
+        ws = _Workspace(str(tmp_path)).build()
+        plan = plan_batch([ws.c], _scopes_for(ws.a, ws.b, ws.c))
+        task = plan.tasks[0]
+        out = os.path.join(ws.out_dir, "cancelled.pdf")
+
+        calls = []
+
+        def should_cancel():
+            calls.append(1)
+            # 第 1 次来自 execute_task 的入口检查（放行）；
+            # 第 2 次来自 apply_pdf_watermark 的页间检查 —— 只有透传成功才会出现
+            return len(calls) >= 2
+
+        with pytest.raises(TaskCancelled):
+            execute_task(task, out, should_cancel=should_cancel)
+
+        assert len(calls) >= 2, (
+            "should_cancel 没被透传到 apply_pdf_watermark："
+            "逐页取消在批处理路径失效"
+        )
+        assert not os.path.exists(out), "取消后不该留下输出文件"
+        leftovers = [n for n in os.listdir(ws.out_dir) if ".part" in n]
+        assert leftovers == [], f"原子写出应清理临时文件，残留：{leftovers}"
+
+    def test_cancel_at_entry_writes_nothing(self, tmp_path):
+        """入口就取消：一次都不该往下走"""
+        ws = _Workspace(str(tmp_path)).build()
+        plan = plan_batch([ws.c], _scopes_for(ws.a, ws.b, ws.c))
+        out = os.path.join(ws.out_dir, "never.pdf")
+
+        with pytest.raises(TaskCancelled):
+            execute_task(plan.tasks[0], out, should_cancel=lambda: True)
+
+        assert not os.path.exists(out)
+
+    def test_no_cancel_callback_still_completes(self, tmp_path):
+        """不传 should_cancel 时行为不变（向后兼容）"""
+        ws = _Workspace(str(tmp_path)).build()
+        plan = plan_batch([ws.c], _scopes_for(ws.a, ws.b, ws.c))
+        out = os.path.join(ws.out_dir, "done.pdf")
+
+        pages = execute_task(plan.tasks[0], out)
+
+        assert pages == 2
+        assert os.path.exists(out)
 
 
 if __name__ == "__main__":

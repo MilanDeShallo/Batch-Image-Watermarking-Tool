@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox
 import os
 from PIL import Image, ImageTk
 
-from src.config import WatermarkConfig
+from src.config import WatermarkConfig, normalize_position
 
 
 class ImageWatermarkPanel(ctk.CTkFrame):
@@ -394,9 +394,14 @@ class ImageWatermarkPanel(ctk.CTkFrame):
     # ==================== 公共接口 ====================
 
     # 位置索引 → 字符串映射
+    # 必须与 text_watermark_panel._POSITIONS 用同一套写法，也要与引擎
+    # anchor_position 对齐（垂直分量只有 top / middle / bottom）。
+    # 这里曾写作 center-left / center-right，同一个「左中」经本面板出去
+    # 会被引擎当成 v_pos="center" 而渲染在正中 —— 与文字面板的同一按钮
+    # 表现不一致，且界面高亮正常、完全看不出问题。
     _POS_NAMES = [
         "top-left", "top-center", "top-right",
-        "center-left", "center", "center-right",
+        "middle-left", "center", "middle-right",
         "bottom-left", "bottom-center", "bottom-right",
     ]
 
@@ -500,7 +505,9 @@ class ImageWatermarkPanel(ctk.CTkFrame):
 
         if pos_mode == "grid":
             # 字符串位置 → 索引
-            pos_str = data.get("logo_position", "bottom-right")
+            # 先归一化：旧预设里可能存着 center-left / center-right，
+            # 它们不在 _POS_NAMES 里，不翻译会静默回退到右下角
+            pos_str = normalize_position(data.get("logo_position"))
             pos_map = {name: i for i, name in enumerate(self._POS_NAMES)}
             pos_idx = pos_map.get(pos_str, 8)
             self.selected_position = pos_idx

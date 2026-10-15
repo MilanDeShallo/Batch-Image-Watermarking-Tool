@@ -23,7 +23,7 @@ from __future__ import annotations
 import customtkinter as ctk
 from typing import Callable, Optional
 
-from src.config import WatermarkConfig, opacity_to_alpha
+from src.config import WatermarkConfig, normalize_position, opacity_to_alpha
 
 # 九宫格位置定义
 _POSITIONS = [
@@ -486,7 +486,9 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._on_pos_mode_changed()  # 触发 UI 切换
 
         if pos_mode == "grid":
-            pos = getattr(cfg, 'position', 'bottom-right')
+            # 归一化后再回填：旧预设里可能存着 center-left / center-right，
+            # 它们不在 _POSITIONS 的键里，不翻译会让九个按钮一个都不高亮
+            pos = normalize_position(getattr(cfg, 'position', None))
             self._select_position(pos)
         else:
             cx = getattr(cfg, 'custom_x', 50)

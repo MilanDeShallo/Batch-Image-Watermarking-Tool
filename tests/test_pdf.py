@@ -8,7 +8,6 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import WatermarkConfig
 from src.pdf_engine import apply_pdf_watermark, render_pdf_page, get_pdf_page_count
