@@ -31,7 +31,11 @@ DIST = ROOT / "dist" / "WatermarkTool"
 ARCHIVE = ROOT / "dist" / "_archive"
 EXE_NAME = "批量图片水印工具.exe"
 
-REQUIRED = ["customtkinter", "tkinterdnd2", "PIL", "reportlab", "pypdf", "pypdfium2"]
+# psutil 也在检查列表里：它缺失不影响启动（available_memory_bytes 会回落到
+# 2GB 保守预算），但会让并行度决策永远按兜底值算，而界面上完全看不出来 ——
+# 属于"不装也能跑、装了才有正确行为"，必须在打包前拦住。
+REQUIRED = ["customtkinter", "tkinterdnd2", "PIL", "reportlab", "pypdf",
+            "pypdfium2", "psutil"]
 MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 

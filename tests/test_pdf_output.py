@@ -349,6 +349,44 @@ class TestMergedPdf:
                 pass
             assert not os.path.exists(out), "取消后不该留下半成品文件"
 
+    def test_cancel_between_pages_also_aborts(self):
+        """
+        合并到一半才取消：必须以 MergeCancelled 抛出，且不留半成品。
+
+        与上一条的区别：那次一进函数 should_cancel 就返回 True，命中的是
+        **循环前**的检查（旧版本也有）。本条让回调先放行、到第 3 次调用才返回
+        True，命中的只能是 watermark_pdf_bytes 里的**逐页**检查 ——
+        旧版 build_merged_pdf 调它时漏传 should_cancel，这条路径永远不触发：
+        一本几百页的 PDF 点了取消仍会跑完整本，界面却已经显示"已取消"。
+
+        调用次数是这条用例的判据：循环前 1 次 + 每页 1 次。只调到 1 次
+        就说明参数又丢了。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, "doc.pdf")
+            _make_pdf(doc, pages=3, fill=(1, 1, 1))
+            out = os.path.join(tmp, "merged.pdf")
+
+            calls = {"n": 0}
+
+            def cancel_after_two():
+                calls["n"] += 1
+                return calls["n"] > 2
+
+            try:
+                build_merged_pdf(
+                    [{"path": doc, "config": WatermarkConfig()}], out,
+                    should_cancel=cancel_after_two,
+                )
+                assert False, "处理到第 2 页前取消，应抛出 MergeCancelled"
+            except MergeCancelled:
+                pass
+
+            assert calls["n"] > 2, (
+                f"should_cancel 没传到底层逐页检查（只被调用 {calls['n']} 次）"
+            )
+            assert not os.path.exists(out), "取消后不该留下半成品文件"
+
     def test_progress_callback_reports_each_item(self):
         with tempfile.TemporaryDirectory() as tmp:
             img = os.path.join(tmp, "a.png")

@@ -486,6 +486,70 @@ class TestOpenImageModes:
         assert "nope.png" in str(exc.value)
 
 
+# ==================== 界面偏好容错 ====================
+
+class TestSavedAppearanceFallback:
+    """
+    read_saved_appearance 的负路径。
+
+    它在构建 UI **之前**被调用（AppWindow.__init__ 里 set_appearance_mode
+    那一行），此时还没有任何窗口能承接异常 —— 一旦抛出去就是"启动即崩溃"。
+    三类坏输入都必须静默回退：文件不存在、JSON 语法坏了、JSON 合法但取值
+    不认识（含"合法 JSON 但不是对象"这种 json.load 成功、后面 .get 才炸的）。
+
+    为什么单独测这个：ui_layout.json 是用户目录下的普通文件，断电/磁盘满/
+    手工编辑都会留下残缺内容，而它的失败代价是"整个程序打不开"。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_layout(self, tmp_path, monkeypatch):
+        import src.ui.app_window as aw
+        monkeypatch.setattr(aw, "LAYOUT_FILE", str(tmp_path / "ui_layout.json"))
+        return tmp_path
+
+    def test_missing_file_returns_default(self):
+        from src.ui.app_window import read_saved_appearance
+
+        assert read_saved_appearance() == "Dark"
+        assert read_saved_appearance("Light") == "Light"
+
+    def test_truncated_json_returns_default(self, _isolated_layout):
+        """写一半断电留下的残缺文件"""
+        from src.ui.app_window import read_saved_appearance
+
+        (_isolated_layout / "ui_layout.json").write_text(
+            '{"appearance": "Light", "left_ra', encoding="utf-8"
+        )
+        assert read_saved_appearance() == "Dark"
+
+    def test_unknown_value_returns_default(self, _isolated_layout):
+        """JSON 合法，但值不在 Dark/Light 白名单里"""
+        from src.ui.app_window import read_saved_appearance
+
+        (_isolated_layout / "ui_layout.json").write_text(
+            json.dumps({"appearance": "Rainbow"}), encoding="utf-8"
+        )
+        assert read_saved_appearance() == "Dark"
+
+    def test_non_dict_json_returns_default(self, _isolated_layout):
+        """json.load 成功但不是对象：'.get' 会 AttributeError"""
+        from src.ui.app_window import read_saved_appearance
+
+        (_isolated_layout / "ui_layout.json").write_text(
+            "[1, 2, 3]", encoding="utf-8"
+        )
+        assert read_saved_appearance() == "Dark"
+
+    def test_valid_value_is_honored(self, _isolated_layout):
+        """成功路径对照：白名单内的值必须原样读回"""
+        from src.ui.app_window import read_saved_appearance
+
+        (_isolated_layout / "ui_layout.json").write_text(
+            json.dumps({"appearance": "Light"}), encoding="utf-8"
+        )
+        assert read_saved_appearance() == "Light"
+
+
 # ==================== 运行入口 ====================
 
 if __name__ == "__main__":

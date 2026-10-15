@@ -663,6 +663,10 @@ def build_merged_pdf(
     :return: 输出总页数
     :raises MergeCancelled: 用户取消（不写出文件）
     """
+    # 延迟导入：batch_planner 依赖本模块（函数内导入 apply_pdf_watermark），
+    # 这里若写成模块级互相 import 会把依赖绕成环。
+    from src.batch_planner import TaskCancelled
+
     writer = PdfWriter()
     total = len(items)
 
@@ -678,10 +682,19 @@ def build_merged_pdf(
             progress(index, total, os.path.basename(path))
 
         if path.lower().endswith(".pdf"):
-            data, _ = watermark_pdf_bytes(
-                path, item.get("config"), item.get("page_configs"),
-                overlay_scale=eff_scale,
-            )
+            # should_cancel 必须一起透传：watermark_pdf_bytes 会在**每一页之间**
+            # 检查取消，漏掉这个参数后，一本几百页的 PDF 点了取消仍要跑完整本。
+            try:
+                data, _ = watermark_pdf_bytes(
+                    path, item.get("config"), item.get("page_configs"),
+                    should_cancel=should_cancel,
+                    overlay_scale=eff_scale,
+                )
+            except TaskCancelled:
+                # 统一对外异常类型：本函数只承诺 MergeCancelled（README「批处理 API」）。
+                # 不归一的话，透传进来的取消会落进调用方的 except Exception，
+                # 被计成"合并失败"——用户分不清"我取消了"和"程序出错了"。
+                raise MergeCancelled("用户取消合并")
         else:
             data = image_file_to_pdf_bytes(
                 path, item.get("config"), jpeg_quality

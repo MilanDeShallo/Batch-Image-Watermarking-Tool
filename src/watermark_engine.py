@@ -24,7 +24,7 @@ from typing import Optional
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 
-from src.config import MAX_IMAGE_PIXELS, normalize_position
+from src.config import DEFAULT_POSITION, MAX_IMAGE_PIXELS, normalize_position
 from src.logger import log_warning
 
 # 合成管线是 8 位/通道，这些模式携带的位深无法保留 —— 转换时记一条日志，
@@ -252,9 +252,11 @@ def anchor_position(
 
     # 解析位置字符串
     # 先归一化别名：调用方可能来自旧预设、旧脚本或第三方代码，仍带着历史写法。
-    # 不翻译就会落进下面 y 字典的 .get() 默认值 —— 表现为「选了左中、
-    # 水印却渲染在正中」，而且不报错、界面按钮高亮也正常，很难被发现。
-    position = normalize_position(position, "middle-center")
+    # 不翻译、或写法不在白名单里，都会落进下面 y/x 字典的 .get() 默认值 ——
+    # 表现为「选了左中、水印却渲染在正中」，而且不报错、界面按钮高亮也正常。
+    # 兜底默认值统一取 config.DEFAULT_POSITION（全项目唯一来源）：
+    # 以前这里硬写 middle-center，与 config 里的 bottom-right 是两套口径。
+    position = normalize_position(position, DEFAULT_POSITION)
     if position == "center":
         position = "middle-center"
 

@@ -198,9 +198,22 @@ def main():
     # 弹窗一律记录，不显示
     dialogs = []
     app._show_message = lambda m: dialogs.append(("msg", m))
-    app._show_completion_dialog = lambda o, s, f, note=None: dialogs.append(
-        ("done", o, s, f, note)
+    # 桩的参数名与真实方法保持一致（含 report）。
+    # 少了 report 时，_on_done 里的 report=self._last_failure_report 会抛
+    # TypeError —— 而它发生在 tkinter 回调里，只进 stderr，冒烟照样全绿，
+    # "失败清单入口"这条链路等于从来没被验证过。
+    app._show_completion_dialog = lambda output_dir, success, fail, note=None, report=None: dialogs.append(
+        ("done", output_dir, success, fail, note, report)
     )
+
+    # 上面这条注释不可靠，用签名本身兜底：真实方法日后新增关键字参数时，
+    # 这行会立刻失败，而不是等到某个回调偷偷 TypeError。
+    import inspect as _inspect
+    _real_params = set(_inspect.signature(AppWindow._show_completion_dialog).parameters) - {"self"}
+    _stub_params = set(_inspect.signature(app._show_completion_dialog).parameters)
+    check("完成对话框桩覆盖真实方法的全部参数",
+          _real_params <= _stub_params,
+          f"真实={sorted(_real_params)} 桩={sorted(_stub_params)}")
 
     # 关掉预览的后台渲染线程：它在工作线程里调 self.after()，
     # 而本次冒烟在批处理之外是同步驱动（不在 mainloop 里），
@@ -792,9 +805,69 @@ def main():
         app._quality_value_label.cget("text") == "72",
     )
 
+    head("负路径：只测成功路径才会漏掉的那些")
+    # 本节四条都对应一次真实事故。共同点：异常发生在 tkinter 回调或工作线程里，
+    # 只进 stderr —— 冒烟即使全绿也发现不了，必须主动构造失败场景来验。
     # 关窗保护靠这个标志；处理中为 True 时才会弹确认
     check("空闲时不处于处理中", app._processing is False)
     check("关窗回调已注册", callable(app._on_window_close))
+
+    # 处理中真的走一遍关窗回调。
+    # 只断言"回调可调用"是恒真的，等于什么都没验 —— 正因如此，
+    # _on_window_close 里漏导入 messagebox 造成的 NameError 长期没被发现
+    # （表现：处理中点关闭既不弹确认、窗口也关不掉，只能结束进程）。
+    # 弹窗在前面已被替换成记录器，askyesno 恒返回 False，所以走"用户点了否"分支。
+    app._processing = True
+    try:
+        app._on_window_close()
+        check("处理中点关闭不抛异常", True)
+    except Exception as exc:                      # noqa: BLE001 - 冒烟要抓到全部异常
+        check("处理中点关闭不抛异常", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        app._processing = False
+    check("确认被拒后窗口仍然存在", bool(app.winfo_exists()))
+
+    # 提前返回路径必须复位按钮三态。
+    # 用空文件列表走到「没有可处理的任务」那条 early return（旧实现只复位了
+    # 开始按钮，取消按钮会留在"可点"状态 —— 点了显示"正在取消…"，其实没任务）。
+    app._format_var.set("PNG")
+    app._merge_pdf_var.set(False)
+    app._set_processing_ui(True)      # 先摆成"处理中"，看 early return 能否自己收拾干净
+    app._run_batch([], {})
+    check("提前返回后开始按钮恢复可用",
+          str(app._start_btn.cget("state")) == "normal",
+          str(app._start_btn.cget("state")))
+    check("提前返回后取消按钮已禁用",
+          str(app._cancel_btn.cget("state")) == "disabled",
+          str(app._cancel_btn.cget("state")))
+    check("提前返回后未标记为处理中", app._processing is False)
+
+    # 预检线程里抛异常也必须能回到可用状态。
+    # 旧实现把 oversized_files / large_images 裸在 try 外面，抛出后线程静默死掉、
+    # after(0) 不执行 → 界面永久停在"正在检查 N 个文件…"、开始按钮永久 disabled。
+    import src.resource_budget as _rb  # noqa: PLC0415 - 就地打补丁，便于 finally 还原
+    _orig_over, _orig_large = _rb.oversized_files, _rb.large_images
+
+    def _boom(*_a, **_k):
+        raise OSError("模拟预检失败（文件被占用）")
+
+    _rb.oversized_files = _boom
+    _rb.large_images = _boom
+    try:
+        app._file_list.add_files([A])   # 确保预检真的会被驱动起来
+        app._on_start_processing()
+        scan_ok = pump(app, dialogs, timeout=45.0)
+        check("预检抛异常后界面仍回到可用状态", scan_ok, "开始按钮未恢复")
+        # 这一批是有成功文件的，所以 _on_done 一定走了"成功>0"分支调完成对话框。
+        # 无失败时 _write_failure_report 返回 ""，因此这里的 report 必须是 ""，
+        # 而不是桩的默认值 None —— 用后者就说明 _on_done 根本没把 report 传下去。
+        _done = [d for d in dialogs if d[0] == "done"]
+        _rep = _done[-1][5] if _done else "（没有完成对话框）"
+        check("完成对话框收到了失败清单参数（未传即 None）",
+              bool(_done) and _rep is not None,
+              f"done 对话框 {len(_done)} 个，report={_rep!r}")
+    finally:
+        _rb.oversized_files, _rb.large_images = _orig_over, _orig_large
 
     # ---------- 收尾 ----------
     head("收尾")

@@ -41,8 +41,34 @@ TASK_SLACK = 5.0
 # 超过此像素数给出显式预警（仍允许处理）
 LARGE_IMAGE_PIXELS = 50_000_000
 
-# 读不到尺寸（PDF、损坏文件）时的单任务内存估算
+# 读不到尺寸（PDF 打不开、损坏文件）时的单任务内存估算
 UNKNOWN_FILE_BYTES = 64 * 1024 * 1024
+
+# PDF 单页的峰值系数（等效 28 B/px）。
+#
+# 为什么不能沿用图片的 TASK_SLACK：实测 PDF 页的 B/px 比图片高。
+# 覆盖层渲染的 RSS 峰值增量（overlay_scale=2.0，psutil 采样，缓存未命中，
+# text 与 both 两种水印类型结果一致 —— 说明峰值由"页面位图同时存活的份数"
+# 决定，与合成内容无关，与图片侧同理）：
+#     A4  2.00 Mpx   40.1 MB   21.0 B/px
+#     A3  4.01 Mpx   83.0 MB   21.7 B/px
+#     A2  8.02 Mpx  169.6 MB   22.2 B/px
+#     A1 16.06 Mpx  345.8 MB   22.6 B/px
+# 取 7.0（=28 B/px）比实测上限高约 25%，与 TASK_SLACK 的余量口径一致。
+# **不要**为了"复用图片系数"把它降到 5.0：实测 22.6 > 20，那样是负余量，
+# 大页 PDF 并发时会真的 OOM。
+PDF_PAGE_SLACK = 7.0
+
+# 预检时最多读多少页的 MediaBox。
+#
+# 成本几乎全在"打开 PDF"（解析 xref），与页数关系很小 —— 实测 5 页 1.5ms、
+# 60 页 5.8ms、400 页 33.3ms，扫 24 页与只读页树根耗时相同。
+# 但仍要设上限：整本遍历会在上千个文件时累积。代价是"页面尺寸不一致、
+# 且巨页排在第 24 页之后"的文档会被低估，这是刻意取舍
+# （绝大多数文档全篇同尺寸，且巨页靠后本身极罕见）。
+# 另注：不能只读页树根的 /MediaBox —— 它是可继承的，但很多生成器
+# （实测 reportlab 就是）并不写这一项，那样会直接探不到尺寸。
+PDF_SIZE_PROBE_PAGES = 24
 
 # 进程可用内存中允许用于图像缓冲的比例
 MEMORY_BUDGET_RATIO = 0.5
@@ -97,12 +123,88 @@ def probe_image_size(path: str) -> tuple[int, int] | None:
         return None
 
 
-def file_memory_estimate(path: str) -> int:
-    """单个文件的峰值内存估算（图片按像素，其余按固定权重）"""
-    size = probe_image_size(path)
-    if size is None:
+def estimate_pdf_page_bytes(width: int, height: int) -> int:
+    """PDF 单页的峰值内存估算（显示像素 × PDF_PAGE_SLACK）"""
+    try:
+        w = int(width)
+        h = int(height)
+    except (TypeError, ValueError):
         return UNKNOWN_FILE_BYTES
-    return estimate_decoded_bytes(*size)
+    if w <= 0 or h <= 0:
+        return UNKNOWN_FILE_BYTES
+    return int(w * h * BYTES_PER_PIXEL * PDF_PAGE_SLACK)
+
+
+def probe_pdf_page_pixels(path: str) -> tuple[int, int] | None:
+    """
+    最大一页的**显示像素**尺寸（media box × 覆盖层倍率）。
+
+    为什么是"显示像素"而不是 PDF 自身的分辨率：PDF 是矢量，没有分辨率；
+    真正吃内存的是按页面显示尺寸渲染出来的那张覆盖层位图，
+    所以像素基数 = 页面点数 × 覆盖层倍率（与 pdf_engine.overlay_reference_size 同源）。
+
+    只扫前 PDF_SIZE_PROBE_PAGES 页（取舍见常量处的说明）。
+    读不到（不是 PDF / 没装 pypdf / 文件损坏）返回 None，
+    调用方按"未知尺寸"处理，**绝不阻断**预检。
+    """
+    if not str(path).lower().endswith(".pdf"):
+        return None
+    try:
+        from pypdf import PdfReader
+        with open(path, "rb") as f:
+            reader = PdfReader(f)
+            best = None
+            for index in range(min(len(reader.pages), PDF_SIZE_PROBE_PAGES)):
+                box = reader.pages[index].mediabox
+                w = float(box.width)
+                h = float(box.height)
+                if w <= 0 or h <= 0:
+                    continue
+                if best is None or w * h > best[0] * best[1]:
+                    best = (w, h)
+    except Exception:
+        return None
+    if best is None:
+        return None
+    # 倍率取当前全局值：预检就发生在批处理开始之前
+    try:
+        from src.pdf_engine import get_overlay_scale
+        scale = float(get_overlay_scale())
+    except Exception:
+        scale = 1.0
+    if scale <= 0:
+        scale = 1.0
+    return int(best[0] * scale), int(best[1] * scale)
+
+
+def probe_page_pixels(path: str) -> tuple[int, int] | None:
+    """
+    预检统一入口：图片取原图像素，PDF 取最大页的显示像素。
+
+    这里只解决"尺寸"；换算成字节时两者 Slack 不同，
+    由 file_memory_estimate 按来源分别调用。
+    """
+    size = probe_image_size(path)
+    if size is not None:
+        return size
+    return probe_pdf_page_pixels(path)
+
+
+def file_memory_estimate(path: str) -> int:
+    """
+    单个文件的峰值内存估算。
+
+    图片按解码后的原图像素算；PDF 按**最大页的显示像素**算。
+    旧实现把 PDF 一律当 UNKNOWN_FILE_BYTES=64MB：A4 页反而高估，
+    但 A3 起开始低估，A0 级取页面低估约 11 倍（实测 702.7MB vs 64MB）。
+    """
+    size = probe_image_size(path)
+    if size is not None:
+        return estimate_decoded_bytes(*size)
+    pdf_size = probe_pdf_page_pixels(path)
+    if pdf_size is not None:
+        return estimate_pdf_page_bytes(*pdf_size)
+    return UNKNOWN_FILE_BYTES
 
 
 def available_memory_bytes() -> int:
@@ -156,11 +258,15 @@ def plan_workers(
 def oversized_files(files, limit: int = MAX_IMAGE_PIXELS) -> list[tuple[str, int]]:
     """
     像素数超过硬上限的文件 —— 调用方应直接跳过并报错，
-    而不是交给 Pillow 去分配不可能成功的内存。
+    而不是交给 Pillow / 覆盖层去分配不可能成功的内存。
+
+    走 probe_page_pixels：**PDF 也要进来**。旧实现走 probe_image_size，
+    而它对 .pdf 直接返回 None，于是超大页的 PDF 既不进预算也不进预警，
+    连一句提示都没有。
     """
     out = []
     for path in files or []:
-        size = probe_image_size(path)
+        size = probe_page_pixels(path)
         if size is None:
             continue
         pixels = size[0] * size[1]
@@ -171,13 +277,13 @@ def oversized_files(files, limit: int = MAX_IMAGE_PIXELS) -> list[tuple[str, int
 
 def large_images(files, threshold: int = LARGE_IMAGE_PIXELS) -> list[tuple[str, int, int, int]]:
     """
-    像素数超过预警阈值的文件。
+    像素数超过预警阈值的文件（含 PDF —— 见 oversized_files 的说明）。
 
     :return: [(路径, 宽, 高, 像素数)]，按像素数从大到小
     """
     out = []
     for path in files or []:
-        size = probe_image_size(path)
+        size = probe_page_pixels(path)
         if size is None:
             continue
         w, h = size

@@ -65,17 +65,35 @@ POSITION_ALIASES = {
 }
 
 
+# 规范位置取值白名单 —— 与两个面板的九宫格按钮、引擎 anchor_position 的
+# 字典键完全一致。
+#
+# 为什么光有别名映射不够：`left-middle`、`middle-centre` 这类**分量写反或拼错**
+# 的输入不在别名表里，会被原样透传，然后落进 anchor_position 里 y/x 字典的
+# `.get()` 兜底值 —— 表现是"界面高亮在左中、水印却渲染在正中"，既不报错，
+# 界面也看不出异常。上一轮只堵住了 center-left / center-right 两种写法。
+# 现在非法值一律回落到 default，宁可落到默认角也不静默跑到正中。
+VALID_POSITIONS = frozenset({
+    "top-left", "top-center", "top-right",
+    "middle-left", "middle-center", "middle-right",
+    "bottom-left", "bottom-center", "bottom-right",
+    "center",   # 历史特殊值，等价于 middle-center（引擎内部会翻译）
+})
+
+
 def normalize_position(value, default: str = DEFAULT_POSITION) -> str:
     """
     把位置字符串归一化成引擎认识的形式（"{垂直}-{水平}"）。
 
     三个入口都会用到：面板读写配置、预设反序列化、引擎兜底。
-    只要这里口径唯一，旧预设里的 center-left 也能落到正确位置。
+    只要这里口径唯一，旧预设里的 center-left 也能落到正确位置；
+    表外写法（含分量写反、拼错）一律回落到 default，不再原样透传。
     """
     text = str(value or "").strip().lower()
     if not text:
         return default
-    return POSITION_ALIASES.get(text, text)
+    text = POSITION_ALIASES.get(text, text)
+    return text if text in VALID_POSITIONS else default
 
 
 # 输出同名冲突策略

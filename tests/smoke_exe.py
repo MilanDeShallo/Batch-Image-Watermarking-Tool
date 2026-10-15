@@ -95,6 +95,22 @@ REQUIRED_SYMBOLS = [
      "调度器异常兜底（按钮不会卡在禁用态）"),
     ("src.ui.app_window", "_run_batch",
      "预检异步化后的批处理主体"),
+
+    # ---- v1.5：第三轮审计修复 ----
+    ("src.config", "VALID_POSITIONS",
+     "位置白名单（'left-middle'/'weird'/空串不再静默落到正中）"),
+    ("src.watermark_engine", "DEFAULT_POSITION",
+     "兜底默认值与 config 单一来源对齐（不再硬写 middle-center）"),
+    ("src.ui.app_window", "_set_processing_ui",
+     "「处理中」三态收敛：提前返回 / 预检失败也能复位按钮"),
+
+    # ---- v1.5：第四轮审计修复 ----
+    ("src.resource_budget", "probe_pdf_page_pixels",
+     "PDF 按页面显示像素进预算（旧实现一律按 64MB 估，A0 低估 11 倍）"),
+    ("src.resource_budget", "probe_page_pixels",
+     "超限/预警清单不再跳过 PDF"),
+    ("src.resource_budget", "PDF_PAGE_SLACK",
+     "PDF 单页峰值系数 7.0（等效 28 B/px，实测 21~23）"),
 ]
 
 RESULTS: list[tuple[str, bool, str]] = []

@@ -62,6 +62,117 @@ class TestEstimate:
         assert rb.probe_image_size(str(p)) is None
 
 
+# ==================== PDF 页面预算 ====================
+
+def _write_pdf(path, width, height, pages=1):
+    """
+    写一个指定页面尺寸的空白 PDF。
+
+    只用 pypdf（不引 reportlab）：pypdf 本来就是探测 PDF 页尺寸的依赖，
+    这样测试不会因为"少装一个可选依赖"而失败。
+    单位是 PDF 点（1/72 英寸）。
+    """
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=width, height=height)
+    with open(str(path), "wb") as f:
+        writer.write(f)
+
+
+class TestPdfPageBudget:
+    """
+    PDF 也要按「页面的显示像素」进预算。
+
+    旧实现：`probe_image_size` 对 .pdf 直接返回 None → `file_memory_estimate`
+    一律给 `UNKNOWN_FILE_BYTES=64MB`。实测单页覆盖层峰值：
+    A4 40.1MB（反而高估 1.6×）、A3 83.0MB、A2 169.6MB、A1 345.8MB、A0 702.7MB
+    —— A0 被低估 11 倍，8 本并发直接冲破预算。
+    """
+
+    def test_page_pixels_use_display_size(self, tmp_path):
+        """
+        像素基数 = 页面点数 × 覆盖层倍率。
+
+        PDF 是矢量、没有"分辨率"，真正吃内存的是按显示尺寸渲染出来的
+        那张覆盖层位图，所以这里必须带上 overlay_scale。
+        """
+        from src.pdf_engine import get_overlay_scale
+
+        scale = get_overlay_scale()
+        p = tmp_path / "a4.pdf"
+        _write_pdf(p, 595, 842)
+
+        assert rb.probe_pdf_page_pixels(str(p)) == (int(595 * scale), int(842 * scale))
+
+    def test_max_page_wins_across_pages(self, tmp_path):
+        """取的是前 N 页里最大的一页，不是第一页"""
+        p = tmp_path / "mixed.pdf"
+        from pypdf import PdfWriter
+        writer = PdfWriter()
+        writer.add_blank_page(width=595, height=842)
+        writer.add_blank_page(width=1191, height=1684)      # A2
+        with open(str(p), "wb") as f:
+            writer.write(f)
+
+        w, h = rb.probe_pdf_page_pixels(str(p))
+        assert w > 595 and h > 842, (w, h)
+
+    def test_large_page_estimate_far_exceeds_unknown(self, tmp_path):
+        """A0 级页面的估算必须远高于旧的 64MB 兜底"""
+        p = tmp_path / "a0.pdf"
+        _write_pdf(p, 2384, 3370)
+
+        assert rb.file_memory_estimate(str(p)) > rb.UNKNOWN_FILE_BYTES * 5
+
+    def test_estimate_grows_with_page_area(self, tmp_path):
+        small = tmp_path / "a4.pdf"
+        big = tmp_path / "a1.pdf"
+        _write_pdf(small, 595, 842)
+        _write_pdf(big, 1684, 2384)
+
+        assert rb.file_memory_estimate(str(big)) > rb.file_memory_estimate(str(small))
+
+    def test_many_large_pdfs_reduce_workers(self, tmp_path):
+        """
+        这条是本次修复的实际收益：并行度真的被压下来了。
+
+        旧实现：每本都按 64MB 估 → 预算 1.2GB 能开 18 线程 → CPU 封顶 8。
+        现在：按 858MB/本估 → 只能开 1 线程。
+        """
+        p = tmp_path / "a0.pdf"
+        _write_pdf(p, 2384, 3370)
+        est = rb.file_memory_estimate(str(p))
+
+        assert est > rb.UNKNOWN_FILE_BYTES * 5, "估算没接上 PDF 页尺寸"
+
+        workers, reason = rb.plan_workers(
+            [est] * 8, cpu_count=16, available=int(2.4 * GB)
+        )
+        assert workers == 1, reason
+
+    def test_broken_pdf_falls_back_to_unknown(self, tmp_path):
+        """损坏文件回退到 64MB，且不抛异常（预检绝不能阻断批处理）"""
+        p = tmp_path / "broken.pdf"
+        p.write_bytes(b"%PDF-1.4 truncated, no xref")
+
+        assert rb.probe_pdf_page_pixels(str(p)) is None
+        assert rb.file_memory_estimate(str(p)) == rb.UNKNOWN_FILE_BYTES
+
+    def test_non_pdf_is_not_probed_as_pdf(self, tmp_path):
+        p = tmp_path / "a.png"
+        Image.new("RGB", (64, 64), (0, 0, 0)).save(str(p))
+
+        assert rb.probe_pdf_page_pixels(str(p)) is None
+
+    def test_page_pixels_keeps_image_branch(self, tmp_path):
+        """图片仍走原图像素这条路，不能被 PDF 分支抢走"""
+        p = tmp_path / "a.png"
+        Image.new("RGB", (321, 123), (0, 0, 0)).save(str(p))
+
+        assert rb.probe_page_pixels(str(p)) == (321, 123)
+
+
 # ==================== 并行度决策 ====================
 
 class TestPlanWorkers:
@@ -149,6 +260,32 @@ class TestThresholds:
             [item[3] for item in found], reverse=True
         )
         assert len(found) == 3
+
+    def test_oversized_includes_pdf(self, tmp_path):
+        """
+        超大页 PDF 也要进硬上限清单。
+
+        旧实现走 probe_image_size，对 .pdf 返回 None 就 continue ——
+        超大页 PDF 既不计入预算、也不进预警，连一句提示都没有。
+        """
+        p = tmp_path / "huge.pdf"
+        # 10000×14000 点 → 显示像素 20000×28000 = 5.6 亿 px，超过 3 亿硬上限
+        _write_pdf(p, 10000, 14000)
+
+        found = rb.oversized_files([str(p)])
+
+        assert [os.path.basename(item[0]) for item in found] == ["huge.pdf"]
+        assert found[0][1] > rb.MAX_IMAGE_PIXELS
+
+    def test_large_images_includes_pdf(self, tmp_path):
+        """预警清单同样不能漏掉 PDF"""
+        p = tmp_path / "a0.pdf"
+        _write_pdf(p, 2384, 3370)          # 显示像素约 4768×6740 ≈ 3214 万 px
+
+        found = rb.large_images([str(p)], threshold=10_000_000)
+
+        assert [os.path.basename(item[0]) for item in found] == ["a0.pdf"]
+        assert found[0][3] > 30_000_000
 
     def test_format_bytes(self):
         assert rb.format_bytes(0) == "0 B"

@@ -21,6 +21,11 @@ import os
 import json
 import customtkinter as ctk
 import tkinter as tk
+# 模块级导入 messagebox：_on_window_close 直接引用它，而那个函数是
+# WM_DELETE_WINDOW 回调 —— 文件里其余函数都在函数内局部导入 messagebox，
+# 唯独它漏了，于是抛 NameError。打包后没有控制台，表现就是"处理中点关闭
+# 既不弹确认、窗口也关不掉"。模块级导入一次，任何回调都能取到。
+from tkinter import messagebox
 from tkinterdnd2 import TkinterDnD
 from tkinterdnd2.TkinterDnD import DnDWrapper
 
@@ -610,7 +615,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         try:
             if not os.path.exists(LAYOUT_FILE):
                 return False
-            with open(LAYOUT_FILE, 'r') as f:
+            with open(LAYOUT_FILE, 'r', encoding='utf-8') as f:
                 layout = json.load(f)
 
             w = max(950, layout.get("win_width", self.WINDOW_WIDTH))
@@ -641,7 +646,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         """从 ui_layout.json 恢复分隔线比例"""
         try:
             if os.path.exists(LAYOUT_FILE):
-                with open(LAYOUT_FILE, 'r') as f:
+                with open(LAYOUT_FILE, 'r', encoding='utf-8') as f:
                     layout = json.load(f)
                 self.after(300, lambda: self._apply_layout(layout))
         except Exception:
@@ -722,7 +727,12 @@ class AppWindow(ctk.CTk, DnDWrapper):
             merged.update(layout)
 
             os.makedirs(os.path.dirname(LAYOUT_FILE), exist_ok=True)
-            with open(LAYOUT_FILE, 'w') as f:
+            # 读写两侧统一 utf-8。
+            # 这不是在修一个已发生的 bug：json.dump 默认 ensure_ascii=True，
+            # 非 ASCII 会转成 \uXXXX，实际落盘恒为纯 ASCII，任何 locale 都编得动。
+            # 显式写出来是为了口径一致 —— 否则日后有人打开 ensure_ascii=False，
+            # 写端就会按 cp936 编码，与读端的 utf-8 对不上。
+            with open(LAYOUT_FILE, 'w', encoding='utf-8') as f:
                 json.dump(merged, f)
         except Exception:
             pass
@@ -1488,9 +1498,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 预检期间先禁掉开始按钮，避免连点导致并发预检；
         # 同时打开取消按钮 —— 检查上千个文件也要几秒，中途应该能反悔
         self._cancel_requested = False
-        self._processing = True          # 预检也算"在处理"，关窗时要拦一下
-        self._start_btn.configure(state="disabled")
-        self._cancel_btn.configure(state="normal")
+        self._set_processing_ui(True)    # 预检也算"在处理"，关窗时要拦一下
         self._status_label.configure(text=f"正在检查 {len(files)} 个文件…")
         self.update_idletasks()
 
@@ -1503,32 +1511,76 @@ class AppWindow(ctk.CTk, DnDWrapper):
         def _scan_worker():
             import shutil
 
+            # 预检结果先给一份"什么都没查到"的完整默认值 ——
+            # 旧实现把超大图/大图两个调用裸在 try 外面，而它们正是逐文件开图
+            # 读头、最易抛 IO 异常的操作（文件被占用、句柄耗尽、损坏文件头）。
+            # 一旦抛出就没人接，线程静默死掉，下面的 after(0) 不执行：
+            # 界面永久停在"正在检查 N 个文件…"、开始按钮永久 disabled，
+            # 只能重启程序 —— 与 v1.5 声称修掉的"UI 卡在处理中"是同一个洞。
             report = {
-                "oversized": resource_budget.oversized_files(files),
-                "large": resource_budget.large_images(files),
+                "oversized": [],
+                "large": [],
                 "signed": [],
                 "total_input_size": 0,
                 "free_space": None,
             }
             try:
-                from src.pdf_engine import signed_pdf_files
-                report["signed"] = signed_pdf_files(files)
-            except Exception as exc:
-                log_exception("PDF 签名预检失败", exc)
-            try:
-                space_root = scan_dir or os.path.expanduser("~")
-                report["total_input_size"] = sum(
-                    os.path.getsize(f) for f in files if os.path.exists(f)
-                )
-                report["free_space"] = shutil.disk_usage(space_root).free
-            except Exception:
-                pass        # 预检失败不阻止处理，后面的分支会各自兜底
-
-            self.after(0, lambda r=report: self._run_batch(files, r))
+                try:
+                    report["oversized"] = resource_budget.oversized_files(files)
+                    report["large"] = resource_budget.large_images(files)
+                except Exception as exc:
+                    log_exception("像素预检失败", exc)
+                try:
+                    from src.pdf_engine import signed_pdf_files
+                    report["signed"] = signed_pdf_files(files)
+                except Exception as exc:
+                    log_exception("PDF 签名预检失败", exc)
+                try:
+                    space_root = scan_dir or os.path.expanduser("~")
+                    report["total_input_size"] = sum(
+                        os.path.getsize(f) for f in files if os.path.exists(f)
+                    )
+                    report["free_space"] = shutil.disk_usage(space_root).free
+                except Exception:
+                    pass        # 预检失败不阻止处理，后面的分支会各自兜底
+            finally:
+                # 关键：无论上面哪一步抛了异常，都必须回主线程收尾 ——
+                # 这是"按钮一定能恢复可用"的唯一保证
+                self.after(0, lambda r=report: self._run_batch(files, r))
 
         threading.Thread(target=_scan_worker, daemon=True).start()
 
-    def _run_batch(self, files, preflight):
+    def _set_processing_ui(self, processing: bool) -> None:
+        """
+        收敛「处理中」三态：开始按钮、取消按钮、_processing 标志。
+
+        三者必须同时改。只改其中一个就会出现自相矛盾的界面状态 ——
+        典型是"空闲态但取消按钮可点"，点下去界面显示"正在取消…"，
+        实际没有任何任务在跑。
+        """
+        self._processing = bool(processing)
+        self._start_btn.configure(state="disabled" if processing else "normal")
+        self._cancel_btn.configure(state="normal" if processing else "disabled")
+
+    def _run_batch(self, files, preflight) -> None:
+        """
+        薄壳：保证任何"还没真正开始处理"的返回都会复位按钮三态。
+
+        为什么要有这一层：_run_batch_inner 有 10 处提前返回（无法建输出目录、
+        配置取不到、全部超限、大图预警选否、磁盘不足、签名确认选否、
+        同名全跳过…），逐个补复位语句既啰嗦又容易漏 —— 漏掉的那一条就是
+        "界面空闲却可以点取消"。
+
+        判定用 _processing：它只在第 6 步（即将提交任务）置真，之后由
+        _on_done 负责复位；因此这里只在它仍为假时兜底，不干扰正常流程。
+        """
+        try:
+            self._run_batch_inner(files, preflight)
+        finally:
+            if not self._processing:
+                self._set_processing_ui(False)
+
+    def _run_batch_inner(self, files, preflight) -> None:
         """批处理主流程（此时预检结果已就绪）"""
         import gc
         import threading
@@ -1544,18 +1596,14 @@ class AppWindow(ctk.CTk, DnDWrapper):
             plan_output_paths,
         )
 
-        # 预检期间临时禁用了开始按钮，这里先恢复 ——
-        # 下面的 early return 分支依赖"按钮处于可用状态"这个前提，
-        # 不恢复的话任何一次提前返回都会让按钮永久卡在 disabled
-        self._start_btn.configure(state="normal")
-        # 预检阶段到此结束：真正的"处理中"由第 7 步重新标记，
-        # 这样下面任何一次 early return 都不会把状态卡在"处理中"
-        self._processing = False
+        # 预检阶段到此结束：回到"空闲态"三态，真正的"处理中"由第 6 步重新标记。
+        # 这样下面任何一次 early return 都不会把状态卡在"处理中"，
+        # 也不会留下一个可点的取消按钮。
+        self._set_processing_ui(False)
 
         # 预检期间用户可能已经点了取消，那就别再往下走
         if self._cancel_requested:
             self._cancel_requested = False
-            self._cancel_btn.configure(state="disabled")
             self._status_label.configure(text="已取消（尚未开始处理）")
             return
 
@@ -1729,8 +1777,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
         log_info(f"并行度决策：{worker_reason}")
 
         # ---------- 6. 更新 UI 状态 ----------
-        self._start_btn.configure(state="disabled")
-        self._cancel_btn.configure(state="normal")
+        # 真正开始处理：三态一起置为"处理中"。关窗确认也靠 _processing 判定，
+        # 置在这里意味着"已提交任务"与"界面显示处理中"始终同步。
+        self._set_processing_ui(True)
         self._progress_bar.pack()
         self._progress_bar.set(0)
         hint = "合并中..." if merge_pdf else "处理中..."
@@ -1740,7 +1789,6 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # ---------- 7. 会话与进度状态 ----------
         self._cancel_requested = False
-        self._processing = True          # 关窗时要据此确认，别把工作线程无声截断
         self._last_failure_report = ""
         self._save_session()
         self._batch_start_time = time.time()

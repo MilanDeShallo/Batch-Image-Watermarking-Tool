@@ -20,13 +20,24 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
 
+    # 双版本矩阵 —— 只跑单一版本会落进缝里：
+    #   3.10 = README 承诺的**最低支持**版本（真正的绑定约束是
+    #          pillow==12.3.0 的 Requires-Python >=3.10，其余依赖更低）
+    #   3.14 = 发布产物实际使用的版本（见 README「已验证版本组合」）
+    # 之前只跑 3.13：既没验文档承诺的下限，也没验发布所用的版本。
+    # fail-fast: false —— 一个版本挂了也要看到另一个版本的结果。
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements.txt
 
@@ -53,10 +64,14 @@ jobs:
       # 这一步真跑一次 PyInstaller（约 1 分钟），再从 exe 的字节码里
       # 抽符号做探测（只看产物时间戳是不够的）。
       # CI 里不带 --launch：无头环境下启动 GUI 会引入不必要的不确定性。
+      # 只在 3.14 上打包（发布产物就是它构建的），否则同一份产物
+      # 会在矩阵里被构建两次，每个版本白等一分钟。
       - name: Build executable
+        if: matrix.python-version == '3.14'
         run: python -m PyInstaller build.spec --noconfirm
 
       - name: Packaged artifact smoke test
+        if: matrix.python-version == '3.14'
         run: python -u tests/smoke_exe.py
 
       # 失败时最有价值的是日志：崩溃钩子会把主线程与工作线程的异常都写进去
