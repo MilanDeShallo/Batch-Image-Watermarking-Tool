@@ -778,25 +778,37 @@ def main():
         f"实际 {_pos!r}",
     )
 
-    # 主题持久化：切主题要立刻落盘，下次启动才能读回。
+    # 皮肤：固定浅色、界面上无处可切（用户要求去掉深色版）。
     # 冒烟会真的写盘，所以先把 LAYOUT_FILE 指到临时文件，别污染用户的界面偏好。
     _orig_layout = aw.LAYOUT_FILE
     aw.LAYOUT_FILE = os.path.join(
         _tempfile.gettempdir(), "smoke_ui_layout.json"
     )
     try:
-        app._apply_theme("Light")
-        _saved = aw.read_saved_appearance()
-        check("切换浅色后写入布局文件", _saved == "Light", f"实际 {_saved!r}")
+        check(
+            "外观模式固定为浅色",
+            ctk.get_appearance_mode() == "Light",
+            f"实际 {ctk.get_appearance_mode()!r}",
+        )
+        check("顶栏没有主题切换按钮（深色版已移除）", not hasattr(app, "_theme_btn"))
+        check(
+            "皮肤来自自定义主题文件",
+            str(getattr(app, "_theme_source", "")).endswith("ctk_theme.json"),
+            f"实际 {getattr(app, '_theme_source', None)!r}",
+        )
 
-        app._apply_theme("Dark")
-        check("切回深色同样落盘", aw.read_saved_appearance() == "Dark")
-
+        # 预置一个旧版布局文件：带已废弃的 appearance 字段。
+        # 保存后该字段要被清掉，同一文件里的布局比例必须原样保留（读-改-写）
+        with open(aw.LAYOUT_FILE, "w", encoding="utf-8") as _f:
+            _json.dump({"appearance": "Dark", "left_ratio": 0.31}, _f)
+        app._save_layout()
         with open(aw.LAYOUT_FILE, encoding="utf-8") as _f:
             _raw = _json.load(_f)
+        check("旧的外观字段已清除", "appearance" not in _raw, f"实际 {_raw!r}")
         check(
-            "布局文件里同时保留布局与主题",
-            _raw.get("appearance") == "Dark",
+            "旧布局比例被保留（读-改-写没被破坏）",
+            _raw.get("left_ratio") == 0.31,
+            f"实际 {_raw!r}",
         )
     finally:
         try:
@@ -804,6 +816,75 @@ def main():
         except Exception:
             pass
         aw.LAYOUT_FILE = _orig_layout
+
+    # 文件名截断：列表里 .png/.jpg/.pdf 是用户第一眼要确认的信息，
+    # 截断必须优先保住扩展名，而不是从尾巴上切（"人像竖版.…"）
+    _elided = app._file_list._elide_name(
+        "一个特别长的测试文件名用来验证截断行为.png", 120
+    )
+    check(
+        "超长文件名被截断且保留扩展名",
+        "…" in _elided and _elided.endswith(".png"),
+        f"实际 {_elided!r}",
+    )
+    check(
+        "放得下的文件名原样返回",
+        app._file_list._elide_name("a.png", 400) == "a.png",
+    )
+
+    # 原生窗口外观（图标 + 标题栏配色）：都只是"画"，失败也不能拦住启动，
+    # 但"悄悄全失效"同样要能发现 —— 所以逐项确认真的执行了
+    check(
+        "应用图标文件存在",
+        os.path.isfile(aw._asset_path("app.ico")),
+        aw._asset_path("app.ico"),
+    )
+    check(
+        "窗口图标已设置",
+        aw._apply_window_icon(app) is True,
+        aw._asset_path("app.ico"),
+    )
+    _tb = aw.style_titlebar(app)
+    check(
+        "标题栏配色已应用（非 Windows 环境返回 False 属正常）",
+        _tb is True or not sys.platform.startswith("win"),
+        f"实际 {_tb!r}",
+    )
+
+    # 品牌名接线：窗口标题必须是「APP_NAME — 批量图片水印工具」
+    from src import APP_NAME
+
+    check(
+        "窗口标题带品牌名",
+        APP_NAME in app.title(),
+        app.title(),
+    )
+
+    # 顶栏状态与底栏状态必须是两个不同控件：曾撞名（都叫 _status_label），
+    # 结果底栏的"处理进度/就绪"文案被顶栏状态覆盖，两处显示同一句话
+    check(
+        "顶栏状态与底栏状态是两个标签",
+        app._top_status_label is not app._status_label,
+        f"top={app._top_status_label} bottom={app._status_label}",
+    )
+    app._file_list.select_by_index(0)
+    _top_text = app._top_status_label.cget("text")
+    check(
+        "选中文件后顶栏显示文件名",
+        "1/1" in _top_text or "第 1" in _top_text,
+        f"实际 {_top_text!r}",
+    )
+
+    # 输入框焦点态：隐藏窗口下 Tk 不派发 <FocusIn>（event_generate 也无效），
+    # 所以只能确认"绑定还在"。CTkEntry 自己也会绑 FocusIn/FocusOut，
+    # 因此判据要落到我们那个 lambda 上（真变色由截图与人工验证）
+    _inner = getattr(app._output_dir_entry, "_entry", None)
+    _script = (_inner.bind("<FocusIn>") if _inner is not None else "") or ""
+    check(
+        "输入框已绑定焦点态（FocusIn 上挂着我们的回调）",
+        "<lambda>" in _script,
+        f"实际绑定脚本 {_script!r}",
+    )
 
     # 质量标签：IntVar.set 不触发 CTkSlider 的 command，必须手动同步
     app._quality_var.set(72)

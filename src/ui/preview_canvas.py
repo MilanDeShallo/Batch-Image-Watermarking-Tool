@@ -29,6 +29,8 @@ import threading
 import time
 import os
 
+from src.ui import theme
+
 
 class PreviewCanvas(ctk.CTkFrame):
 
@@ -98,15 +100,19 @@ class PreviewCanvas(ctk.CTkFrame):
         self.grid_rowconfigure(0, weight=1)
 
         # 预览 Canvas
-        canvas_frame = ctk.CTkFrame(self, fg_color=("#f0f0f0", "#1e1e1e"), corner_radius=8)
+        canvas_frame = ctk.CTkFrame(
+            self, fg_color=theme.SURFACE_ALT, corner_radius=theme.RADIUS_CARD
+        )
         canvas_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 2))
         canvas_frame.grid_columnconfigure(0, weight=1)
         canvas_frame.grid_rowconfigure(0, weight=1)
 
         import tkinter as tk
+        # 原生 tk.Canvas 不认 CustomTkinter 的主题值，底色直接从 theme 取；
+        # 皮肤固定浅色，不存在"跟随切换"的场景（见 src/ui/theme.py）
         self._canvas = tk.Canvas(
             canvas_frame,
-            bg=self._get_canvas_bg(),
+            bg=theme.SURFACE_ALT,
             highlightthickness=0,
             cursor="hand2",
         )
@@ -114,7 +120,7 @@ class PreviewCanvas(ctk.CTkFrame):
 
         self._placeholder_id = self._canvas.create_text(
             0, 0, text="拖入图片后在此预览水印效果",
-            fill="gray", font=("Microsoft YaHei", 13)
+            fill=theme.TEXT_MUTED, font=("Microsoft YaHei", 13)
         )
         self._canvas.bind("<Configure>", self._on_canvas_resize)
         self._image_item = None
@@ -129,28 +135,33 @@ class PreviewCanvas(ctk.CTkFrame):
         zoom_bar = ctk.CTkFrame(self, fg_color="transparent")
         zoom_bar.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
+        # 缩放按钮：默认字号下 "−" 只有一条细缝，几乎看不见；
+        # 提到 15pt 加粗后与「适应窗口」按钮的视觉重量才匹配
+        zoom_btn_font = ("Microsoft YaHei", 15, "bold")
         self._zoom_out_btn = ctk.CTkButton(
-            zoom_bar, text="−", width=28, height=28,
+            zoom_bar, text="−", width=30, height=28, font=zoom_btn_font,
             command=lambda: self._adjust_zoom(-0.1)
         )
         self._zoom_out_btn.pack(side="left", padx=2)
 
+        # 滑块宽度 110：这一条栏里还有"显示/原图分辨率"两个右侧标签，
+        # 实测滑块 150 时整栏会超宽，两个标签被挤成 1px（信息直接消失）
         self._zoom_slider = ctk.CTkSlider(
             zoom_bar, from_=0.25, to=2.0,
-            variable=self._zoom_var, width=150,
+            variable=self._zoom_var, width=110,
             command=self._on_zoom_slider
         )
         self._zoom_slider.pack(side="left", padx=4)
         self._zoom_slider.set(1.0)
 
         self._zoom_in_btn = ctk.CTkButton(
-            zoom_bar, text="+", width=28, height=28,
+            zoom_bar, text="+", width=30, height=28, font=zoom_btn_font,
             command=lambda: self._adjust_zoom(0.1)
         )
         self._zoom_in_btn.pack(side="left", padx=2)
 
         self._fit_btn = ctk.CTkButton(
-            zoom_bar, text="适应窗口", width=70, height=28,
+            zoom_bar, text="适应窗口", width=78, height=28,
             command=self._fit_to_window
         )
         self._fit_btn.pack(side="left", padx=(8, 2))
@@ -162,12 +173,12 @@ class PreviewCanvas(ctk.CTkFrame):
         self._zoom_display.pack(side="left", padx=4)
 
         self.info_label = ctk.CTkLabel(
-            zoom_bar, text="", text_color="gray", font=("Microsoft YaHei", 10)
+            zoom_bar, text="", text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 10)
         )
         self.info_label.pack(side="right", padx=4)
 
         self.size_label = ctk.CTkLabel(
-            zoom_bar, text="", text_color="gray", font=("Microsoft YaHei", 10)
+            zoom_bar, text="", text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 10)
         )
         self.size_label.pack(side="right", padx=4)
 
@@ -198,34 +209,26 @@ class PreviewCanvas(ctk.CTkFrame):
         self._pdf_next_btn.pack(side="left", padx=(4, 0))
 
         ctk.CTkLabel(
-            self._pdf_bar, text="跳到第", text_color="gray",
+            self._pdf_bar, text="跳到第", text_color=theme.TEXT_MUTED,
             font=("Microsoft YaHei", 10),
         ).pack(side="left", padx=(14, 2))
 
         self._pdf_jump_entry = ctk.CTkEntry(self._pdf_bar, width=54, height=26)
         self._pdf_jump_entry.pack(side="left")
         self._pdf_jump_entry.bind("<Return>", lambda e: self._jump_pdf_page())
+        theme.bind_focus_ring(self._pdf_jump_entry)
 
         ctk.CTkLabel(
-            self._pdf_bar, text="页（回车）", text_color="gray",
+            self._pdf_bar, text="页（回车）", text_color=theme.TEXT_MUTED,
             font=("Microsoft YaHei", 10),
         ).pack(side="left", padx=(2, 4))
 
         # 哪些页被单独设过参数（由主窗口回填，翻页时一眼可见）
         self._pdf_marked_label = ctk.CTkLabel(
-            self._pdf_bar, text="", text_color="#f59e0b",
+            self._pdf_bar, text="", text_color=theme.WARN,
             font=("Microsoft YaHei", 10),
         )
         self._pdf_marked_label.pack(side="left", padx=(12, 2))
-
-    def _get_canvas_bg(self):
-        """根据主题获取画布背景色"""
-        return "#1e1e1e" if ctk.get_appearance_mode() == "Dark" else "#f0f0f0"
-
-    def update_theme(self):
-        """主题切换时更新画布颜色"""
-        self._canvas.configure(bg=self._get_canvas_bg())
-        self._apply_zoom()
 
     # ==================== 缩放 ====================
 

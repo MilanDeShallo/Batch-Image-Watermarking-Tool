@@ -24,6 +24,7 @@ import customtkinter as ctk
 from typing import Callable, Optional
 
 from src.config import WatermarkConfig, normalize_position, opacity_to_alpha
+from src.ui import theme
 
 # 九宫格位置定义
 _POSITIONS = [
@@ -111,6 +112,8 @@ class TextWatermarkPanel(ctk.CTkFrame):
 
         ctk.CTkLabel(color_frame, text="颜色:").pack(side="left")
 
+        # 色块按钮显示的是"水印颜色"本身（数据），不取主题色 ——
+        # 只有 hover 用一个中性灰，避免与任何主题色撞车
         self._color_btn = ctk.CTkButton(
             color_frame,
             text="      ",
@@ -143,7 +146,7 @@ class TextWatermarkPanel(ctk.CTkFrame):
         ctk.CTkLabel(
             self,
             text="0 = 完全透明（看不见），100 = 完全不透明；浅色底图请选深色水印",
-            text_color="gray",
+            text_color=theme.TEXT_MUTED,
             font=("Microsoft YaHei", 9),
             justify="left",
             wraplength=260,
@@ -186,12 +189,15 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._grid_frame = ctk.CTkFrame(pos_frame)
         self._grid_frame.pack(pady=2)
 
-        for i, (pos_key, _) in enumerate(_POSITIONS):
+        for i, (pos_key, pos_label) in enumerate(_POSITIONS):
             row, col = divmod(i, 3)
             btn = ctk.CTkButton(
                 self._grid_frame,
-                text="",  # 用小圆点或缩写表示
-                width=28, height=28,
+                # 带文字标签而不是空方块：空方块要用户自己数格子猜方位，
+                # 与图片面板的九宫格（一直有文字）也对不上
+                text=pos_label,
+                width=48, height=28,
+                font=("Microsoft YaHei", 10),
                 command=lambda p=pos_key: self._select_position(p),
             )
             btn.grid(row=row, column=col, padx=2, pady=2)
@@ -210,7 +216,8 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._custom_x_entry = ctk.CTkEntry(x_row, width=60, textvariable=self._custom_x_var)
         self._custom_x_entry.pack(side="left", padx=5)
         self._custom_x_entry.bind("<KeyRelease>", lambda e: self._notify_change())
-        ctk.CTkLabel(x_row, text="(0=左 100=右)", text_color="gray", font=("Microsoft YaHei", 9)).pack(side="left")
+        theme.bind_focus_ring(self._custom_x_entry)
+        ctk.CTkLabel(x_row, text="(0=左 100=右)", text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 9)).pack(side="left")
 
         y_row = ctk.CTkFrame(self._custom_pos_frame, fg_color="transparent")
         y_row.pack(fill="x", pady=1)
@@ -219,7 +226,8 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._custom_y_entry = ctk.CTkEntry(y_row, width=60, textvariable=self._custom_y_var)
         self._custom_y_entry.pack(side="left", padx=5)
         self._custom_y_entry.bind("<KeyRelease>", lambda e: self._notify_change())
-        ctk.CTkLabel(y_row, text="(0=上 100=下)", text_color="gray", font=("Microsoft YaHei", 9)).pack(side="left")
+        theme.bind_focus_ring(self._custom_y_entry)
+        ctk.CTkLabel(y_row, text="(0=上 100=下)", text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 9)).pack(side="left")
 
         # ---- 边距 ----
         margin_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -264,12 +272,14 @@ class TextWatermarkPanel(ctk.CTkFrame):
         self._spacing_x_entry = ctk.CTkEntry(tile_params_frame, width=50, textvariable=self._spacing_x_var)
         self._spacing_x_entry.pack(side="left", padx=5)
         self._spacing_x_entry.bind("<KeyRelease>", lambda e: self._notify_change())
+        theme.bind_focus_ring(self._spacing_x_entry)
 
         ctk.CTkLabel(tile_params_frame, text="垂直间距:").pack(side="left", padx=(15, 0))
         self._spacing_y_var = ctk.IntVar(value=100)
         self._spacing_y_entry = ctk.CTkEntry(tile_params_frame, width=50, textvariable=self._spacing_y_var)
         self._spacing_y_entry.pack(side="left", padx=5)
         self._spacing_y_entry.bind("<KeyRelease>", lambda e: self._notify_change())
+        theme.bind_focus_ring(self._spacing_y_entry)
 
         self._stagger_var = ctk.BooleanVar(value=True)
         self._stagger_cb = ctk.CTkCheckBox(
@@ -372,12 +382,18 @@ class TextWatermarkPanel(ctk.CTkFrame):
     def _select_position(self, position: str):
         """选中九宫格位置"""
         self._selected_position = position
-        # 更新按钮视觉反馈
+        # 更新按钮视觉反馈：选中 = 主色实底，未选中 = 暖中性底
         for pos, btn in self._position_buttons.items():
             if pos == position:
-                btn.configure(fg_color="#3b82f6", hover_color="#2563eb")
+                btn.configure(
+                    fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+                    text_color=theme.ON_ACCENT,
+                )
             else:
-                btn.configure(fg_color=("gray70", "gray40"), hover_color=("gray80", "gray50"))
+                btn.configure(
+                    fg_color=theme.NEUTRAL_BTN, hover_color=theme.NEUTRAL_BTN_HOVER,
+                    text_color=theme.TEXT,
+                )
         self._notify_change()
 
     def _on_pos_mode_changed(self):

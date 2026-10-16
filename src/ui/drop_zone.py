@@ -10,11 +10,36 @@
 
 from __future__ import annotations
 
+import tkinter as tk
+
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES
 from tkinterdnd2.TkinterDnD import DnDWrapper
 
 from src.file_manager import collect_files, is_image_file, sanitize_path
+from src.ui import theme
+
+
+def _draw_photo_icon(canvas: tk.Canvas):
+    """
+    在画布上画一个"图片"图标，返回 (描边项, 填充项) 两组 id。
+
+    为什么要画而不是用 emoji/字体符号：Windows 上 emoji 由 Tk 当普通字符渲染，
+    字号一变就错位甚至变方块；这里用 Canvas 画，颜色和尺寸都可控。
+    """
+    outline = [canvas.create_rectangle(
+        3, 5, 45, 35, outline=theme.TEXT_DISABLED, width=2
+    )]
+    fill = [
+        canvas.create_oval(11, 11, 18, 18, fill=theme.TEXT_DISABLED, outline=""),
+        canvas.create_polygon(
+            7, 33, 18, 19, 27, 33, fill=theme.TEXT_DISABLED, outline=""
+        ),
+        canvas.create_polygon(
+            23, 33, 32, 22, 41, 33, fill=theme.TEXT_DISABLED, outline=""
+        ),
+    ]
+    return outline, fill
 
 
 class DropZone(ctk.CTkFrame, DnDWrapper):
@@ -30,13 +55,13 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
     - DragLeave / Drop 后：恢复默认样式
     """
 
-    # 样式常量
-    _DEFAULT_BORDER_COLOR = ("gray40", "gray60")
-    _HOVER_BORDER_COLOR = ("#3b82f6", "#60a5fa")
+    # 样式常量（取色统一来自 src/ui/theme.py）
+    _DEFAULT_BORDER_COLOR = theme.BORDER
+    _HOVER_BORDER_COLOR = theme.ACCENT
     _DEFAULT_BORDER_WIDTH = 1
     _HOVER_BORDER_WIDTH = 2
-    _DEFAULT_TEXT_COLOR = ("gray50", "gray50")
-    _HOVER_TEXT_COLOR = ("#3b82f6", "#60a5fa")
+    _DEFAULT_TEXT_COLOR = theme.TEXT_MUTED
+    _HOVER_TEXT_COLOR = theme.ACCENT
     _DEFAULT_HINT = "将图片或 PDF 拖拽到这里\n或点击下方按钮添加"
     _HOVER_HINT = "松开以添加文件"
 
@@ -54,18 +79,30 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
         self.configure(
             border_width=self._DEFAULT_BORDER_WIDTH,
             border_color=self._DEFAULT_BORDER_COLOR,
-            corner_radius=8,
-            fg_color=("gray95", "gray15"),
+            corner_radius=theme.RADIUS_CARD,
+            fg_color=theme.SURFACE_ALT,
         )
 
-        # 提示文字标签
+        # 图标 + 提示文字（整体在框内居中）
+        # 空状态只有两行字的话，"这里能放什么"得读完才明白；给一个图片图标，
+        # 一眼就知道是"放图的地方"。图标与文字同色，拖入时一起变主色。
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._icon_canvas = tk.Canvas(
+            content, width=48, height=40,
+            bg=theme.SURFACE_ALT, highlightthickness=0,
+        )
+        self._icon_canvas.pack(pady=(0, 8))
+        self._icon_outline_ids, self._icon_fill_ids = _draw_photo_icon(self._icon_canvas)
+
         self._hint_label = ctk.CTkLabel(
-            self,
+            content,
             text=self._DEFAULT_HINT,
             text_color=self._DEFAULT_TEXT_COLOR,
             font=ctk.CTkFont(size=14),
         )
-        self._hint_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._hint_label.pack()
 
         # 注册拖放（直接在 CTkFrame 上注册，DnDWrapper 提供 drop_target_register 方法）
         self.drop_target_register(DND_FILES)
@@ -87,6 +124,7 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
             text=self._HOVER_HINT,
             text_color=self._HOVER_TEXT_COLOR,
         )
+        self._set_icon_color(self._HOVER_TEXT_COLOR)
 
     def _on_leave(self, event):
         """鼠标离开 → 恢复默认样式"""
@@ -108,6 +146,24 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
         if image_files:
             self.on_files_added(image_files)
 
+    def _set_icon_color(self, color: str):
+        """
+        重画图标颜色。
+
+        描边项只有 outline、填充项只有 fill —— 两者都试着设一遍，
+        对不适用的那个 canvas 会抛 TclError，直接忽略（这是 tk 的既定行为）。
+        """
+        for item in self._icon_outline_ids:
+            try:
+                self._icon_canvas.itemconfig(item, outline=color)
+            except Exception:
+                pass
+        for item in self._icon_fill_ids:
+            try:
+                self._icon_canvas.itemconfig(item, fill=color)
+            except Exception:
+                pass
+
     def _reset_style(self):
         """恢复到默认视觉样式"""
         self.configure(
@@ -118,3 +174,4 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
             text=self._DEFAULT_HINT,
             text_color=self._DEFAULT_TEXT_COLOR,
         )
+        self._set_icon_color(theme.TEXT_DISABLED)

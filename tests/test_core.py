@@ -486,68 +486,92 @@ class TestOpenImageModes:
         assert "nope.png" in str(exc.value)
 
 
-# ==================== 界面偏好容错 ====================
+# ==================== 皮肤（只有一套浅色） ====================
 
-class TestSavedAppearanceFallback:
+
+class TestThemePalette:
     """
-    read_saved_appearance 的负路径。
+    皮肤只有一套浅色值 —— 把一条**设计约束**钉住。
 
-    它在构建 UI **之前**被调用（AppWindow.__init__ 里 set_appearance_mode
-    那一行），此时还没有任何窗口能承接异常 —— 一旦抛出去就是"启动即崩溃"。
-    三类坏输入都必须静默回退：文件不存在、JSON 语法坏了、JSON 合法但取值
-    不认识（含"合法 JSON 但不是对象"这种 json.load 成功、后面 .get 才炸的）。
-
-    为什么单独测这个：ui_layout.json 是用户目录下的普通文件，断电/磁盘满/
-    手工编辑都会留下残缺内容，而它的失败代价是"整个程序打不开"。
+    用户明确要求去掉深色版，而 CustomTkinter 只在收到 (浅, 深) 二元组时
+    才做外观模式切换：只要有人往调色板里塞回二元组，界面就会出现
+    "部分控件随系统深色变化、部分不变"的半深半浅状态，且不报任何错。
+    所以这里直接对调色板与主题字典做结构断言，而不是等肉眼看出来。
     """
 
-    @pytest.fixture(autouse=True)
-    def _isolated_layout(self, tmp_path, monkeypatch):
-        import src.ui.app_window as aw
-        monkeypatch.setattr(aw, "LAYOUT_FILE", str(tmp_path / "ui_layout.json"))
-        return tmp_path
+    def test_all_colors_are_single_values(self):
+        """调色板里不允许出现二元组（深色版残留）"""
+        from src.ui import theme
 
-    def test_missing_file_returns_default(self):
-        from src.ui.app_window import read_saved_appearance
+        assert theme.ALL_COLORS, "调色板是空的"
+        for name, value in theme.ALL_COLORS.items():
+            assert isinstance(value, str), f"{name} 不是单一色值：{value!r}"
+            assert value.startswith("#") and len(value) == 7, f"{name}={value!r}"
 
-        assert read_saved_appearance() == "Dark"
-        assert read_saved_appearance("Light") == "Light"
+    def test_ctk_theme_has_no_dual_mode_entries(self):
+        """主题字典里同样不允许出现列表/元组值"""
+        from src.ui import theme
 
-    def test_truncated_json_returns_default(self, _isolated_layout):
-        """写一半断电留下的残缺文件"""
-        from src.ui.app_window import read_saved_appearance
+        def walk(node, path=""):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    walk(value, f"{path}.{key}" if path else str(key))
+            else:
+                assert not isinstance(node, (list, tuple)), \
+                    f"主题项 {path} 是二元组：{node!r}"
 
-        (_isolated_layout / "ui_layout.json").write_text(
-            '{"appearance": "Light", "left_ra', encoding="utf-8"
-        )
-        assert read_saved_appearance() == "Dark"
+        walk(theme.build_ctk_theme())
 
-    def test_unknown_value_returns_default(self, _isolated_layout):
-        """JSON 合法，但值不在 Dark/Light 白名单里"""
-        from src.ui.app_window import read_saved_appearance
+    def test_theme_dict_covers_all_widget_keys(self):
+        """键集合不能少 —— 少一个键，对应控件创建时就取不到默认色"""
+        from src.ui import theme
 
-        (_isolated_layout / "ui_layout.json").write_text(
-            json.dumps({"appearance": "Rainbow"}), encoding="utf-8"
-        )
-        assert read_saved_appearance() == "Dark"
+        expected = {
+            "CTk", "CTkToplevel", "CTkFrame", "CTkButton", "CTkLabel",
+            "CTkEntry", "CTkCheckBox", "CTkSwitch", "CTkRadioButton",
+            "CTkProgressBar", "CTkSlider", "CTkOptionMenu", "CTkComboBox",
+            "CTkScrollbar", "CTkSegmentedButton", "CTkTextbox",
+            "CTkScrollableFrame", "DropdownMenu", "CTkFont",
+        }
+        assert set(theme.build_ctk_theme()) == expected
 
-    def test_non_dict_json_returns_default(self, _isolated_layout):
-        """json.load 成功但不是对象：'.get' 会 AttributeError"""
-        from src.ui.app_window import read_saved_appearance
+    def test_install_theme_writes_file(self, tmp_path, monkeypatch):
+        """install_theme 落盘并返回路径（AppWindow 启动时靠它装载皮肤）"""
+        import json as _json
 
-        (_isolated_layout / "ui_layout.json").write_text(
-            "[1, 2, 3]", encoding="utf-8"
-        )
-        assert read_saved_appearance() == "Dark"
+        from src.ui import theme
 
-    def test_valid_value_is_honored(self, _isolated_layout):
-        """成功路径对照：白名单内的值必须原样读回"""
-        from src.ui.app_window import read_saved_appearance
+        target = tmp_path / "sub" / "ctk_theme.json"
+        monkeypatch.setattr(theme, "theme_file_path", lambda: target)
 
-        (_isolated_layout / "ui_layout.json").write_text(
-            json.dumps({"appearance": "Light"}), encoding="utf-8"
-        )
-        assert read_saved_appearance() == "Light"
+        result = theme.install_theme()
+        assert result == str(target)
+        data = _json.loads(target.read_text(encoding="utf-8"))
+        # 抽查一项：默认按钮底色必须来自调色板，而不是内置主题
+        assert data["CTkButton"]["fg_color"] == theme.NEUTRAL_BTN
+
+    def test_install_theme_falls_back_on_failure(self, monkeypatch):
+        """皮肤坏不能拦启动：任何异常都回落到内置主题"""
+        from src.ui import theme
+
+        def _boom():
+            raise OSError("用户目录不可写")
+
+        monkeypatch.setattr(theme, "theme_file_path", _boom)
+        assert theme.install_theme() == "blue"
+
+    def test_titlebar_colorref_byte_order(self):
+        """
+        Windows COLORREF 是 0x00BBGGRR，与网页的 #RRGGBB 字节序相反。
+
+        写反了不会报错，只会让标题栏颜色偏蓝 —— 属于"看起来只是不好看"、
+        极难在代码里发现的那类错误，所以钉一个非对称色值做判据。
+        """
+        from src.ui.app_window import _colorref
+
+        assert _colorref("#4F8A66") == 0x668A4F
+        assert _colorref("#000000") == 0x000000
+        assert _colorref("#FFFFFF") == 0xFFFFFF
 
 
 # ==================== 运行入口 ====================

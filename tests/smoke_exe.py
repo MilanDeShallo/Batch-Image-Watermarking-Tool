@@ -97,8 +97,8 @@ REQUIRED_SYMBOLS = [
      "预设目录迁到用户目录 + 旧目录迁移"),
     ("src.batch_planner", "overlay_scale",
      "倍率快照透传到 PDF 引擎"),
-    ("src.ui.app_window", "read_saved_appearance",
-     "主题持久化"),
+    ("src.ui.theme", "install_theme",
+     "皮肤装载：单一浅色主题 + 失败回落内置主题"),
     ("src.ui.app_window", "_dispatch_impl",
      "调度器异常兜底（按钮不会卡在禁用态）"),
     ("src.ui.app_window", "_run_batch",
@@ -119,6 +119,16 @@ REQUIRED_SYMBOLS = [
      "超限/预警清单不再跳过 PDF"),
     ("src.resource_budget", "PDF_PAGE_SLACK",
      "PDF 单页峰值系数 7.0（等效 28 B/px，实测 21~23）"),
+
+    # ---- 界面美化（v1.5 之后）----
+    ("src.ui.app_window", "style_titlebar",
+     "系统标题栏按皮肤上色（DWM 属性 34/35/36，Win11 22H2+）"),
+    ("src.ui.app_window", "_asset_path",
+     "图标等资源路径在打包后能定位到 _internal"),
+
+    # ---- 品牌化（2026-10-16）----
+    ("src", "APP_NAME",
+     "品牌名单一来源（窗口标题 / 失败清单 / PDF Producer 共用）"),
 ]
 
 RESULTS: list[tuple[str, bool, str]] = []

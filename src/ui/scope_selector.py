@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_LABELS, SCOPE_PAGE
+from src.ui import theme
 
 
 class ScopeSelector(ctk.CTkFrame):
@@ -54,13 +55,14 @@ class ScopeSelector(ctk.CTkFrame):
         head.pack(fill="x")
 
         ctk.CTkLabel(
-            head, text="参数作用范围", font=("Microsoft YaHei", 11, "bold")
+            head, text="参数作用范围",
+            font=("Microsoft YaHei", 11, "bold"), text_color=theme.TEXT,
         ).pack(side="left")
 
         self._clear_btn = ctk.CTkButton(
             head, text="清除专属", width=66, height=22,
             font=("Microsoft YaHei", 10),
-            fg_color=("gray75", "gray35"), hover_color=("gray65", "gray45"),
+            fg_color=theme.NEUTRAL_BTN, hover_color=theme.NEUTRAL_BTN_HOVER,
             command=self._handle_clear,
         )
         self._clear_btn.pack(side="right")
@@ -81,7 +83,7 @@ class ScopeSelector(ctk.CTkFrame):
             self._radios[scope] = rb
 
         self._hint = ctk.CTkLabel(
-            self, text="", text_color="gray", anchor="w", justify="left",
+            self, text="", text_color=theme.TEXT_MUTED, anchor="w", justify="left",
             font=("Microsoft YaHei", 10), wraplength=290,
         )
         self._hint.pack(fill="x", pady=(2, 0))
@@ -132,7 +134,7 @@ class ScopeSelector(ctk.CTkFrame):
         """
         self._hint.configure(
             text=text,
-            text_color=("#b45309", "#fbbf24") if warn else "gray",
+            text_color=theme.WARN if warn else theme.TEXT_MUTED,
         )
 
     def describe(self, scope: str) -> str:

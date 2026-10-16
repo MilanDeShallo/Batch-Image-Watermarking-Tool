@@ -16,8 +16,15 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 from typing import Optional, Callable, List
 
+from src.ui import theme
+
 # 缩略图缓存上限（防止大量文件时内存溢出）
 MAX_THUMB_CACHE = 200
+
+# 文件名标签沿用的字号（与主题 CTkFont 的 Windows size 一致），
+# 量文字宽度时必须用"同样大小"的字体，否则算出来的可用字数是错的
+_NAME_FONT_SIZE = 13
+_name_font_cache: dict = {}
 
 
 class FileList(ctk.CTkScrollableFrame):
@@ -46,6 +53,10 @@ class FileList(ctk.CTkScrollableFrame):
         self._row_widgets: dict[int, ctk.CTkFrame] = {}
         # 行内的「专属参数」标记，按索引保存，便于只改文案不重建整行
         self._marker_labels: dict[int, ctk.CTkLabel] = {}
+        # 行内的文件名标签，用于布局完成后按实际列宽重算省略位置
+        self._name_labels: dict[int, ctk.CTkLabel] = {}
+        # 每行上次量到的名字列宽度，避免 <Configure> 高频触发时重复测量
+        self._name_fit: dict[int, int] = {}
 
         # 缩略图缓存
         self._thumb_cache: dict[str, ImageTk.PhotoImage] = {}
@@ -134,6 +145,9 @@ class FileList(ctk.CTkScrollableFrame):
         for widget in self._row_widgets.values():
             widget.destroy()
         self._row_widgets.clear()
+        self._marker_labels.clear()
+        self._name_labels.clear()
+        self._name_fit.clear()
 
         self._update_scroll_size()
         self.on_selection_changed(None)
@@ -201,6 +215,69 @@ class FileList(ctk.CTkScrollableFrame):
                 return  # 滚动失败不应影响选中
             widget = getattr(widget, "master", None)
 
+    def _name_font(self):
+        """按当前 DPI 缩放取一个与 CTkLabel 实际字号一致的字体对象（用于量文字宽度）"""
+        try:
+            scaling = float(ctk.ScalingTracker.get_widget_scaling(self))
+        except Exception:
+            scaling = 1.0
+        px = max(8, int(round(_NAME_FONT_SIZE * scaling)))
+        font = _name_font_cache.get(px)
+        if font is None:
+            try:
+                from tkinter import font as tkfont
+                font = tkfont.Font(family="Microsoft YaHei", size=-px)  # 负值 = 像素
+            except Exception:
+                font = False
+            _name_font_cache[px] = font
+        return font or None
+
+    def _head_fit(self, text: str, avail_px: int) -> str:
+        """取 text 的最长前缀，使「前缀 + …」不超过 avail_px（二分，含省略号宽度）"""
+        font = self._name_font()
+        if font is None or avail_px <= 0:
+            return ""
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid] + "…") <= avail_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
+
+    def _elide_name(self, name: str, avail_px: int) -> str:
+        """
+        按像素宽度截断文件名，超出补省略号，**优先保住扩展名**。
+
+        为什么必须做：行里右侧的「大小 / 专属标记」是固定列，文件名一旦超长，
+        pack 只能二选一 —— 要么文件名把右侧两列挤没，要么反过来文件名被挤成
+        0 宽（两种都实测出现过）。先把文件名截到可用宽度，两侧才都能显示。
+
+        为什么先保扩展名：.png / .jpg / .pdf 往往是用户第一眼要确认的信息，
+        从尾巴截断（"人像竖版.…"）刚好把它切掉。所以先留出「…扩展名」的位置，
+        再截主名 → "人像竖….png"。
+        """
+        font = self._name_font()
+        if font is None or avail_px <= 0:
+            return name
+        try:
+            if font.measure(name) <= avail_px:
+                return name
+
+            stem, ext = os.path.splitext(name)
+            # 扩展名较短且确实存在时才值得保（.tar.gz 这类长尾走整体截断）。
+            # 注意这里只减去扩展名本身的宽度：省略号宽度已经算在
+            # _head_fit 的判据里，再减一次会把主名截得过短（实测出过"人….png"）
+            if ext and len(ext) <= 6:
+                head = self._head_fit(stem, avail_px - font.measure(ext))
+                if head:
+                    return head + "…" + ext
+            head = self._head_fit(name, avail_px)
+            return (head + "…") if head else "…"
+        except Exception:
+            return name
+
     def _create_row_widget(self, index: int):
         """为指定索引创建一行 UI 组件"""
         path = self._files[index]
@@ -221,27 +298,52 @@ class FileList(ctk.CTkScrollableFrame):
         row.pack(fill="x", padx=2, pady=1)
         row.grid_propagate(False)
 
-        # 布局：序号 | 缩略图 | 文件名 | 大小
-        num_label = ctk.CTkLabel(row, text=f"{index + 1:>3}", width=30, anchor="e")
+        # 布局：序号 | 缩略图 | 文件名 | 大小 | 专属标记
+        #
+        # 打包顺序 = 空间分配的优先级，这里刻意把右侧固定列排在文件名之前：
+        # pack 按顺序分配空间，排在后面的控件在空间不够时会被压成 1px
+        # （实测：文件名先打包时「大小」整列消失；改顺序后又轮到「标记」只剩 1px）。
+        # 让固定列先落位，文件名用剩余宽度（_refit_name 再按实际宽度补省略号）最稳。
+        num_label = ctk.CTkLabel(
+            row, text=f"{index + 1:>3}", width=26, anchor="e",
+            text_color=theme.TEXT_MUTED,
+        )
         num_label.pack(side="left", padx=(4, 4))
 
         # 缩略图占位
-        thumb_label = ctk.CTkLabel(row, text="", width=36, height=36)
+        thumb_label = ctk.CTkLabel(row, text="", width=32, height=32)
         thumb_label.pack(side="left", padx=(0, 4))
 
-        name_label = ctk.CTkLabel(row, text=filename, anchor="w")
-        name_label.pack(side="left", fill="x", expand=True, padx=4)
+        size_label = ctk.CTkLabel(
+            row, text=size_str, width=54, anchor="e", text_color=theme.TEXT_MUTED,
+        )
+        size_label.pack(side="right", padx=(0, 8))
 
-        size_label = ctk.CTkLabel(row, text=size_str, width=70, anchor="e")
-        size_label.pack(side="right", padx=8)
-
-        # 专属参数标记：该文件（或它的某几页）被单独设过参数时亮起
+        # 专属参数标记：该文件（或它的某几页）被单独设过参数时亮起。
+        # 刻意不给 width —— 实测 CTkLabel 不指定宽度时会按文字自适应：
+        # 空文本只占 1px，有字时自动撑开。给固定宽度（哪怕 60）会让
+        # 绝大多数没有专属参数的行白占一列，把文件名挤到只剩三四个字。
         marker_label = ctk.CTkLabel(
-            row, text="", width=66, anchor="e",
-            text_color="#f59e0b", font=("Microsoft YaHei", 10),
+            row, text="", anchor="e",
+            text_color=theme.WARN, font=("Microsoft YaHei", 10),
         )
         marker_label.pack(side="right", padx=(0, 2))
         self._marker_labels[index] = marker_label
+
+        name_label = ctk.CTkLabel(
+            # 宽度先给一个很小的值：名字若要求整串宽度，会先把右侧固定列挤没。
+            # 给 10 之后固定列各自拿到位置，剩余空间由 expand 交给名字列。
+            # 真正的省略号位置在布局完成后由 _refit_name 按实际宽度补上。
+            row, text=filename, anchor="w", width=10, text_color=theme.TEXT
+        )
+        name_label.pack(side="left", fill="x", expand=True, padx=4)
+        self._name_labels[index] = name_label
+
+        # 列宽受 DPI 缩放与字体影响，事先算不准（要先维护一张尺寸表）；
+        # 绑 <Configure>：列宽真的变化时（首次布局、拖分隔线、改窗口大小）
+        # 都会回调过来，按实际宽度重算省略号位置。宽度没变时直接返回，
+        # 不会因为拖动窗口而反复量字。
+        name_label.bind("<Configure>", lambda _e, i=index: self._refit_name(i))
 
         # 异步加载缩略图
         self._load_thumbnail_async(path, thumb_label)
@@ -279,12 +381,38 @@ class FileList(ctk.CTkScrollableFrame):
 
         self._row_widgets[index] = row
 
+    def _refit_name(self, index: int):
+        """
+        按名字列**实际拿到的宽度**重新截断文件名（补省略号）。
+
+        为什么不能只算一次：行内各列的宽度受 DPI 缩放、字体、面板宽度影响，
+        事先算准要维护一张尺寸表；而 <Configure> 事件在"列宽真的变了"时
+        自己会来 —— 拖动分隔线、改窗口大小都能跟着重算。
+        宽度没变就直接返回：拖动窗口时该回调会高频触发，不能每次都去量字。
+        """
+        label = self._name_labels.get(index)
+        if label is None or not (0 <= index < len(self._files)):
+            return
+        try:
+            width = label.winfo_width()
+            if width <= 1 or self._name_fit.get(index) == width:
+                return
+            self._name_fit[index] = width
+            name = os.path.basename(self._files[index])
+            elided = self._elide_name(name, width - 6)   # 6px 内边距余量
+            if elided and elided != label.cget("text"):
+                label.configure(text=elided)
+        except Exception:
+            pass
+
     def _rebuild_all_rows(self):
         """销毁所有行并按当前 _files 列表重建"""
         for widget in self._row_widgets.values():
             widget.destroy()
         self._row_widgets.clear()
         self._marker_labels.clear()
+        self._name_labels.clear()
+        self._name_fit.clear()
 
         for i in range(len(self._files)):
             self._create_row_widget(i)
@@ -297,7 +425,7 @@ class FileList(ctk.CTkScrollableFrame):
         """高亮指定行，取消其他行的高亮"""
         for idx, widget in self._row_widgets.items():
             if idx == index:
-                widget.configure(fg_color=("#3b82f6", "#4a90d9"))
+                widget.configure(fg_color=theme.ACCENT_SOFT)
             else:
                 widget.configure(fg_color="transparent")
 
@@ -403,9 +531,9 @@ class FileList(ctk.CTkScrollableFrame):
         target = self._get_row_index_at_y(y_root)
         for idx, widget in self._row_widgets.items():
             if idx == target and idx != self._drag_source_idx:
-                widget.configure(fg_color=("#fbbf24", "#f59e0b"))  # 黄色高亮
+                widget.configure(fg_color=theme.WARN_SOFT)  # 落点提示
             elif idx == self._selected_index:
-                widget.configure(fg_color=("#3b82f6", "#4a90d9"))  # 保持选中蓝色
+                widget.configure(fg_color=theme.ACCENT_SOFT)  # 保持选中色
             else:
                 widget.configure(fg_color="transparent")
 
@@ -423,12 +551,18 @@ class FileList(ctk.CTkScrollableFrame):
 
     def update_marker(self, path: str, text: str):
         """更新单个文件的专属标记（只改文案，不重建行，便于编辑时高频调用）"""
+        text = text or ""
         for idx, p in enumerate(self._files):
             if p == path:
                 label = self._marker_labels.get(idx)
                 if label is not None:
                     try:
-                        label.configure(text=text or "")
+                        # 只在文案真的变了才动：该函数在拖滑块时每帧都会被调用，
+                        # 无条件 configure 会让上千文件时明显掉帧。
+                        # 标记列是自适应的，它的宽度一变，名字列的 <Configure>
+                        # 会把省略号位置一并重算，这里不用额外触发。
+                        if label.cget("text") != text:
+                            label.configure(text=text)
                     except Exception:
                         pass  # 行已被销毁重建
                 return
@@ -440,7 +574,9 @@ class FileList(ctk.CTkScrollableFrame):
             label = self._marker_labels.get(idx)
             if label is None:
                 continue
+            want = texts.get(p, "") or ""
             try:
-                label.configure(text=texts.get(p, "") or "")
+                if label.cget("text") != want:
+                    label.configure(text=want)
             except Exception:
                 pass

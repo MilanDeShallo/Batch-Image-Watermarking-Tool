@@ -29,6 +29,8 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from pypdf import PdfReader, PdfWriter
 
+from src import APP_NAME
+
 # 覆盖层渲染倍率（相对 PDF 页面点数）。
 # 2.0 ≈ 144 DPI，保证文字在 200% 缩放下依然清晰。
 # 注意：覆盖层是整页位图，输出体积与倍率的平方成正比，
@@ -303,7 +305,7 @@ class MergeCancelled(Exception):
 # ============================================================
 
 # 产出工具标识（写进输出 PDF 的 /Producer）
-APP_PRODUCER = "批量图片水印工具"
+APP_PRODUCER = f"{APP_NAME} — 批量图片水印工具"
 
 # 原文档元数据里应当原样带走的键
 _PRESERVED_META_KEYS = ("/Title", "/Author", "/Subject", "/Keywords", "/Creator")

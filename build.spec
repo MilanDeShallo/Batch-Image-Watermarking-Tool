@@ -19,9 +19,10 @@ block_cipher = None
 # 产物目录名（WatermarkTool）与 exe 名（中文名）保持不变 ——
 # 桌面快捷方式、打开水印工具.bat 与分发脚本都指着它们，改名会连带失效。
 sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
-from src import __version__ as APP_VERSION          # noqa: E402
+from src import APP_NAME                          # noqa: E402
+from src import __version__ as APP_VERSION        # noqa: E402
 
-print(f"[build] 批量图片水印工具 v{APP_VERSION}")
+print(f"[build] {APP_NAME} v{APP_VERSION} — 批量图片水印工具")
 
 # 收集 CustomTkinter 数据文件
 ctk_datas = collect_data_files('customtkinter')
@@ -32,8 +33,11 @@ dnd_datas = collect_data_files('tkinterdnd2')
 # 收集 pypdfium2 的 PDFium 动态库（DLL）
 pdfium_binaries = collect_dynamic_libs('pypdfium2')
 
-# 合并所有数据文件
-all_datas = ctk_datas + dnd_datas
+# 合并所有数据文件，并带上应用图标：
+# 图标既要嵌进 exe（EXE 的 icon=，决定资源管理器/任务栏显示的图标），
+# 也要留在 _internal 里（运行时 iconbitmap 会去读它 —— 只嵌不进包的话，
+# 开发运行有图标、打包后反而没有）
+all_datas = ctk_datas + dnd_datas + [('assets/app.ico', 'assets')]
 
 # 不再打包 presets/ 目录：预设现在存到 %APPDATA%/WatermarkTool/presets，
 # 安装目录是只读的。把空目录打进包里只会让用户以为预设存在那里。
@@ -84,7 +88,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # 可后续添加 icon.ico
+    icon='assets/app.ico',
 )
 
 coll = COLLECT(

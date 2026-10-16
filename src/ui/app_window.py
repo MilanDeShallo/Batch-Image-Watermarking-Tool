@@ -3,7 +3,7 @@
 
 布局：
 +------------------------------------------------------------------+
-| 标题栏 [深色/浅色切换] [预设下拉]                              |
+| 标题栏 [预设下拉] [保存预设] [删除]                             |
 +--------+------------------------+-------------------------------+
 | 文件区 | 预览区                  | 水印设置区                   |
 | 拖拽区  | 实时预览画布            | Tab: 文字 / 图片             |
@@ -12,12 +12,15 @@
 | 输出目录| 格式/质量 | 进度条     | [开始] [取消]               |
 +------------------------------------------------------------------+
 
+皮肤固定浅色（暖奶白 + 鼠尾草绿），没有深色版 —— 见 src/ui/theme.py。
+
 Phase 4a 完成：整合文字水印面板、图片水印面板、逆向合成预览画布
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import json
 import customtkinter as ctk
 import tkinter as tk
@@ -29,12 +32,14 @@ from tkinter import messagebox
 from tkinterdnd2 import TkinterDnD
 from tkinterdnd2.TkinterDnD import DnDWrapper
 
+from src import APP_NAME
 from src.ui.drop_zone import DropZone
 from src.ui.file_list import FileList
 from src.ui.text_watermark_panel import TextWatermarkPanel
 from src.ui.image_watermark_panel import ImageWatermarkPanel
 from src.ui.preview_canvas import PreviewCanvas
 from src.ui.scope_selector import ScopeSelector
+from src.ui import theme
 from src.file_manager import (
     collect_files,
     is_image_file,
@@ -49,30 +54,10 @@ from src.config import (
     WatermarkConfig,
 )
 from src.logger import log_error, log_exception, log_info, log_path
-from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_PAGE, ScopeStore
+from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_LABELS, SCOPE_PAGE, ScopeStore
 
 # 布局配置文件：存到用户 AppData 目录，与水印预设完全分离
 LAYOUT_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WatermarkTool", "ui_layout.json")
-
-# 主题与布局同存一份：都是"界面偏好"，没必要再开一个文件
-APPEARANCE_KEY = "appearance"
-
-
-def read_saved_appearance(default: str = "Dark") -> str:
-    """
-    读取上次保存的主题（"Dark" / "Light"）。
-
-    必须在构建 UI **之前**调用，所以对"文件不存在 / 内容损坏 / 值不认识"
-    一律返回默认值 —— 主题若等到 UI 建好之后再设置，用户会先看到一帧深色
-    再跳变；而且两道 PanedWindow 分隔线是我们自己画的，不随
-    set_appearance_mode 变化，浅色模式下会留下一道深色条纹。
-    """
-    try:
-        with open(LAYOUT_FILE, 'r', encoding='utf-8') as f:
-            value = json.load(f).get(APPEARANCE_KEY)
-    except Exception:
-        return default
-    return value if value in ("Dark", "Light") else default
 
 # 崩溃恢复会话文件
 SESSION_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WatermarkTool", "session.json")
@@ -82,6 +67,102 @@ MIN_LEFT = 180
 MIN_CENTER = 300
 MIN_RIGHT = 260
 MIN_BOTTOM = 40
+
+# 底部栏的设计高度（逻辑像素）—— 两行控件：输出目录那行 + 同名策略/质量/开始处理那行。
+# 它只是"设计值"：真正的最小高度取控件算出的请求高度（随 DPI 缩放变化），
+# 见 _build_ui 末尾的 paneconfigure 与 _apply_layout 里的 bar_floor。
+# 直接拿逻辑值当物理下限用，会在 125%/150% 缩放下偏小，
+# 把第二行（含「开始处理」）裁掉且不报任何错。
+MIN_BOTTOM_BAR = 92
+
+
+# ============================================================
+# 原生窗口外观（图标 + 标题栏配色）
+#
+# 这两件事都属于"画"，不碰任何功能：窗口仍是系统窗口，
+# 拖动、贴边（Aero Snap）、双击最大化、系统菜单、最小化/关闭全部原样。
+# 自绘标题栏要用 overrideredirect 去掉系统边框，那些能力都得自己重写 ——
+# 拿功能换外观，不做。
+# ============================================================
+
+def _asset_path(name: str) -> str:
+    """
+    资源文件路径：开发运行时在项目 assets/，打包后在 PyInstaller 的解包目录。
+
+    __file__ 是 src/ui/app_window.py，往上三层才是项目根。
+    """
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    return os.path.join(base, "assets", name)
+
+
+def _apply_window_icon(window) -> bool:
+    """
+    设置窗口图标（缺文件也不影响启动 —— 图标不是功能）。
+
+    打包后的 .ico 由 build.spec 的 datas 一起带上，路径同样走 _asset_path。
+    """
+    try:
+        window.iconbitmap(_asset_path("app.ico"))
+        return True
+    except Exception:
+        return False
+
+
+def _colorref(hex_color: str) -> int:
+    """'#RRGGBB' → Windows COLORREF（0x00BBGGRR，红蓝字节序与网页写法相反）"""
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def style_titlebar(window) -> bool:
+    """
+    把系统标题栏涂成与皮肤同色，返回是否成功。
+
+    靠 DWM 的窗口属性实现，需要 Windows 11 22H2+（build 22621+）：
+    - 34 边框色 / 35 标题栏底色 / 36 标题文字色
+    - 20 先置为 0（浅色），否则系统仍是深色标题栏
+    不满足条件时 DWM 直接忽略这些属性，函数返回 True 但外观不变；
+    真正出错（非 Windows、取不到 HWND）返回 False —— 都只是"没生效"，
+    绝不影响功能，所以调用方不需要处理。
+
+    为什么不用 Tk 的 config(bg=...)：那只能改**客户区**，改不到系统绘制的
+    标题栏；标题栏颜色在 Windows 上只有 DWM 一条路。
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
+        ]
+
+        # DWM 要的是"被系统装饰的那个顶层窗口"，它是 Tk 窗口的父窗口；
+        # 直接对 winfo_id() 设置不会报错、但也不会有任何效果
+        hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+
+        def _set(attr: int, value: int) -> None:
+            data = ctypes.c_uint32(value)
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, attr, ctypes.byref(data), ctypes.sizeof(data)
+            )
+
+        _set(20, 0)                        # 浅色标题栏
+        _set(35, _colorref(theme.BG))      # 标题栏底色 = 窗口底色
+        _set(36, _colorref(theme.TEXT))    # 标题文字 = 主文字色
+        _set(34, _colorref(theme.BORDER))  # 窗口描边
+        return True
+    except Exception:
+        return False
 
 
 class AppWindow(ctk.CTk, DnDWrapper):
@@ -97,18 +178,30 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
 
         # 窗口基本配置
-        self.title("批量图片水印工具")
+        self.title(f"{APP_NAME} — 批量图片水印工具")
         self.geometry(f"{self.WINDOW_WIDTH}x{self.WINDOW_HEIGHT}")
         self.minsize(950, 620)
 
-        # CustomTkinter 内置 DPI 机制
-        ctk.set_default_color_theme("blue")
-        # 主题沿用上次的选择（与布局同存一份），构建 UI 之前就要定下来
-        ctk.set_appearance_mode(read_saved_appearance())
+        # 皮肤（调色板 + 圆角）统一来自 src/ui/theme.py。
+        # 必须在创建任何控件之前装载 —— 控件构造时就把主题值读走了，
+        # 之后再换主题只对"之后新建的控件"生效，界面会一半新一半旧。
+        self._theme_source = theme.install_theme()
+        if self._theme_source == "blue":
+            log_error("自定义主题装载失败，已回退内置主题 blue")
+        # 外观模式固定浅色：本工具只有一套皮肤，没有深色版（见 theme.py 顶部说明）。
+        # 也要在建控件之前设置，否则会先闪一帧系统深色再跳变。
+        ctk.set_appearance_mode("Light")
 
         # 恢复窗口大小和位置（优先于居中）
         if not self._restore_window_geometry():
             self._center_window()  # 无保存数据时居中
+
+        # 窗口图标与标题栏配色（纯外观；任何一步失败都不影响功能）
+        _apply_window_icon(self)
+        # 标题栏要等窗口真的显示出来才有 HWND 可上色，且部分系统在
+        # 显示/从最小化恢复时会重置标题栏颜色，所以 <Map> 时再补一次
+        self.after(0, lambda: style_titlebar(self))
+        self.bind("<Map>", lambda _e: style_titlebar(self), add="+")
 
         # 内部状态
         self._cancel_requested = False
@@ -145,26 +238,34 @@ class AppWindow(ctk.CTk, DnDWrapper):
     def _build_ui(self):
         """构建可拖动分隔线布局"""
 
-        # ====== 顶部栏：标题 + 主题切换 + 预设 ======
-        self._top_bar = ctk.CTkFrame(self, height=40)
-        self._top_bar.pack(fill="x", side="top", padx=10, pady=(10, 5))
+        # ====== 顶部栏：当前文件状态 + 预设 ======
+        # 顶栏原先重复写了一遍应用名（窗口标题栏已经有了），现在换成
+        # "正在编辑哪一个文件、在哪一层" —— 这是顶栏唯一值得占位的信息
+        self._top_bar = ctk.CTkFrame(self, height=44)
+        self._top_bar.pack(fill="x", side="top", padx=12, pady=(12, 8))
         self._top_bar.pack_propagate(False)
 
-        title_label = ctk.CTkLabel(
-            self._top_bar,
-            text="批量图片水印工具",
-            font=ctk.CTkFont(size=16, weight="bold")
-        )
-        title_label.pack(side="left", padx=10)
+        status_frame = ctk.CTkFrame(self._top_bar, fg_color="transparent")
+        status_frame.pack(side="left", padx=12)
 
-        self._theme_btn = ctk.CTkButton(
-            self._top_bar, text="深色/浅色", width=100,
-            command=self._toggle_theme,
+        # 状态点：有选中文件时亮起主色，否则是禁用灰。
+        # 注意命名：底栏另有一个 _status_label（处理进度/就绪状态），
+        # 两者不能同名 —— 撞名后底栏的进度文案会被顶栏状态覆盖掉
+        self._top_status_dot = ctk.CTkLabel(
+            status_frame, text="●", font=("Microsoft YaHei", 10),
+            text_color=theme.TEXT_DISABLED,
         )
-        self._theme_btn.pack(side="right", padx=5)
+        self._top_status_dot.pack(side="left", padx=(0, 8))
+
+        self._top_status_label = ctk.CTkLabel(
+            status_frame, text="尚未选择文件",
+            font=("Microsoft YaHei", 14), text_color=theme.TEXT_MUTED,
+            anchor="w",
+        )
+        self._top_status_label.pack(side="left")
 
         preset_frame = ctk.CTkFrame(self._top_bar, fg_color="transparent")
-        preset_frame.pack(side="right", padx=5)
+        preset_frame.pack(side="right", padx=12)
 
         self._preset_var = ctk.StringVar(value="-- 选择预设 --")
         self._preset_menu = ctk.CTkOptionMenu(
@@ -172,43 +273,49 @@ class AppWindow(ctk.CTk, DnDWrapper):
             values=self._get_preset_list(), width=140,
             command=self._on_preset_selected,
         )
-        self._preset_menu.pack(side="left", padx=(0, 3))
+        self._preset_menu.pack(side="left", padx=(0, 4))
 
         self._save_preset_btn = ctk.CTkButton(
             preset_frame, text="保存预设", width=70,
             command=self._on_save_preset,
         )
-        self._save_preset_btn.pack(side="left", padx=2)
+        self._save_preset_btn.pack(side="left", padx=4)
 
+        # 危险操作按钮：浅底深字（不是正红实心块）——正红在这套暖色界面里
+        # 太扎眼，会把视线从主操作上抢走。字色/底色成对定义在 theme.py 里。
         self._delete_preset_btn = ctk.CTkButton(
             preset_frame, text="删除", width=50,
-            fg_color="#ef4444", hover_color="#dc2626",
+            fg_color=theme.DANGER_SOFT, hover_color=theme.DANGER_SOFT_HOVER,
+            text_color=theme.DANGER,
             command=self._on_delete_preset,
         )
-        self._delete_preset_btn.pack(side="left", padx=2)
+        self._delete_preset_btn.pack(side="left", padx=4)
 
         # 预设已修改提示
         self._preset_loaded_name: str | None = None
         self._preset_just_loaded = False
         self._preset_modified_label = ctk.CTkLabel(
-            preset_frame, text="●已修改", text_color="#f59e0b",
+            preset_frame, text="●已修改", text_color=theme.WARN,
             font=("Microsoft YaHei", 10)
         )
         # 初始隐藏（pack 后再 pack_forget）
 
         # ====== 垂直 PanedWindow：主内容区 | 底部栏 ======
+        # 分隔条颜色用窗口底色：三栏卡片靠它"透出缝隙"，
+        # 圆角卡片之间看起来才是一条细缝而不是一道突兀的隔板
+        paned_bg = theme.BG
         self._vpaned = tk.PanedWindow(
             self, orient="vertical",
-            sashwidth=4, sashrelief="flat",
-            bg="#2b2b2b", bd=0,
+            sashwidth=8, sashrelief="flat",
+            bg=paned_bg, bd=0,
         )
-        self._vpaned.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+        self._vpaned.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
         # ====== 水平 PanedWindow：左 | 中 | 右 ======
         self._hpaned = tk.PanedWindow(
             self._vpaned, orient="horizontal",
-            sashwidth=4, sashrelief="flat",
-            bg="#2b2b2b", bd=0,
+            sashwidth=8, sashrelief="flat",
+            bg=paned_bg, bd=0,
         )
         self._vpaned.add(self._hpaned, minsize=200, stretch="always")
 
@@ -219,32 +326,48 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._drop_zone = DropZone(
             left_frame, on_files_added=self._on_files_dropped, height=120,
         )
-        self._drop_zone.pack(fill="x", padx=5, pady=5)
+        self._drop_zone.pack(fill="x", padx=12, pady=(12, 8))
 
+        # 添加文件是这一栏的主路径：整个界面只有它和「开始处理」用主色，
+        # 其余按钮一律走中性色，视线才会先落在这两处
         self._browse_btn = ctk.CTkButton(
             left_frame, text="+ 浏览添加图片", command=self._browse_files,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            text_color=theme.ON_ACCENT,
         )
-        self._browse_btn.pack(fill="x", padx=5, pady=2)
+        self._browse_btn.pack(fill="x", padx=12, pady=(0, 8))
 
         btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=5, pady=2)
+        btn_frame.pack(fill="x", padx=12, pady=(0, 8))
 
-        self._clear_btn = ctk.CTkButton(btn_frame, text="清空", width=60, command=self._on_clear_files)
+        # 四个小按钮等宽（58×28）：宽度不一致时整排看着是"没对齐"而不是"有主次"。
+        # 都是中性色 —— 「删除选中」只是把文件移出列表、不删磁盘文件，不该用危险色
+        self._clear_btn = ctk.CTkButton(
+            btn_frame, text="清空", width=58, height=28, command=self._on_clear_files
+        )
         self._clear_btn.pack(side="left", padx=2)
-        self._remove_btn = ctk.CTkButton(btn_frame, text="删除选中", width=70, command=self._on_remove_selected)
+        self._remove_btn = ctk.CTkButton(
+            btn_frame, text="删除选中", width=58, height=28, command=self._on_remove_selected
+        )
         self._remove_btn.pack(side="left", padx=2)
-        self._up_btn = ctk.CTkButton(btn_frame, text="上移", width=50, command=self._on_move_up)
+        self._up_btn = ctk.CTkButton(
+            btn_frame, text="上移", width=58, height=28, command=self._on_move_up
+        )
         self._up_btn.pack(side="left", padx=2)
-        self._down_btn = ctk.CTkButton(btn_frame, text="下移", width=50, command=self._on_move_down)
+        self._down_btn = ctk.CTkButton(
+            btn_frame, text="下移", width=58, height=28, command=self._on_move_down
+        )
         self._down_btn.pack(side="left", padx=2)
 
         self._file_list = FileList(
             left_frame, on_selection_changed=self._on_file_selected,
         )
-        self._file_list.pack(fill="both", expand=True, padx=5, pady=5)
+        self._file_list.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        self._count_label = ctk.CTkLabel(left_frame, text="共 0 个文件")
-        self._count_label.pack(pady=2)
+        self._count_label = ctk.CTkLabel(
+            left_frame, text="共 0 个文件", text_color=theme.TEXT_MUTED,
+        )
+        self._count_label.pack(pady=(0, 12))
 
         # ---- 中栏：预览区 ----
         center_frame = ctk.CTkFrame(self._hpaned)
@@ -254,7 +377,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             center_frame, on_config_changed=self._get_current_config,
             on_page_changed=self._on_preview_page_changed,
         )
-        self._preview_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        self._preview_canvas.pack(fill="both", expand=True, padx=8, pady=8)
 
         # ---- 右栏：水印设置区 ----
         right_frame = ctk.CTkFrame(self._hpaned)
@@ -266,14 +389,14 @@ class AppWindow(ctk.CTk, DnDWrapper):
             on_scope_changed=self._on_scope_changed,
             on_clear=self._on_clear_scope_override,
         )
-        self._scope_selector.pack(fill="x", padx=8, pady=(8, 0))
+        self._scope_selector.pack(fill="x", padx=12, pady=(12, 0))
 
-        ctk.CTkFrame(right_frame, height=1, fg_color=("gray70", "gray30")).pack(
-            fill="x", padx=10, pady=(8, 2)
-        )
+        ctk.CTkFrame(
+            right_frame, width=1, height=1, corner_radius=0, fg_color=theme.BORDER
+        ).pack(fill="x", padx=12, pady=(8, 0))
 
         self._settings_tabview = ctk.CTkTabview(right_frame)
-        self._settings_tabview.pack(fill="both", expand=True, padx=4, pady=4)
+        self._settings_tabview.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         tab_text = self._settings_tabview.add("文字水印")
         self._text_panel = TextWatermarkPanel(tab_text)
@@ -290,12 +413,12 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # ---- 底部操作栏（两行：输出设置 / 执行控制）----
         # 输出设置项变多之后单行放不下：文件名模板、同名冲突策略、覆盖原图
         # 都是"导出结果长什么样"的一部分，藏进二级对话框反而更难发现
-        bottom_bar = ctk.CTkFrame(self._vpaned, height=88)
-        self._vpaned.add(bottom_bar, minsize=88, height=88)
+        bottom_bar = ctk.CTkFrame(self._vpaned, height=MIN_BOTTOM_BAR)
+        self._vpaned.add(bottom_bar, minsize=MIN_BOTTOM_BAR, height=MIN_BOTTOM_BAR)
 
         # ===== 第一行：输出位置 / 文件名 / 格式 =====
         self._row1 = ctk.CTkFrame(bottom_bar, fg_color="transparent")
-        self._row1.pack(fill="x", padx=6, pady=(5, 0))
+        self._row1.pack(fill="x", padx=12, pady=(8, 0))
 
         ctk.CTkLabel(self._row1, text="输出目录:").pack(side="left", padx=(2, 2))
         self._output_dir_var = ctk.StringVar(value="")
@@ -303,6 +426,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             self._row1, textvariable=self._output_dir_var, width=170
         )
         self._output_dir_entry.pack(side="left", padx=2)
+        theme.bind_focus_ring(self._output_dir_entry)
         self._output_dir_btn = ctk.CTkButton(
             self._row1, text="浏览...", width=58, command=self._browse_output_dir
         )
@@ -310,7 +434,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         self._output_hint_label = ctk.CTkLabel(
             self._row1, text="留空 → 源目录\\watermarked_output",
-            text_color="gray", font=("Microsoft YaHei", 9)
+            text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 9)
         )
         self._output_hint_label.pack(side="left", padx=(4, 8))
 
@@ -320,12 +444,20 @@ class AppWindow(ctk.CTk, DnDWrapper):
             self._row1, textvariable=self._template_var, width=168
         )
         self._template_entry.pack(side="left", padx=2)
+        theme.bind_focus_ring(self._template_entry)
         # 失焦时归一化：空模板会生成没有主名的文件，必须回落到默认
         self._template_entry.bind("<FocusOut>", lambda e: self._on_template_changed())
 
-        ctk.CTkFrame(self._row1, width=1, fg_color=("gray70", "gray30")).pack(
-            side="left", fill="y", padx=8
-        )
+        # 竖向分隔条：width/height 必须都给。
+        # CustomTkinter 的 CTkFrame 默认尺寸是 200×200（逻辑像素），
+        # 只写 width=1 时它的请求高度仍是 200 逻辑像素（1.5 倍缩放下 = 300 物理像素），
+        # 而它又 fill="y" —— 于是把整条底部栏吃光，第二行的
+        # 「同名策略 / 质量 / 开始处理」被挤成 1px，用户完全看不到。
+        # height=1 + fill="y" 才是"想要一条竖线"的正确写法：
+        # 请求高度 1，实际高度由父容器撑满。
+        ctk.CTkFrame(
+            self._row1, width=1, height=1, corner_radius=0, fg_color=theme.BORDER
+        ).pack(side="left", fill="y", padx=8)
 
         ctk.CTkLabel(self._row1, text="格式:").pack(side="left", padx=(0, 2))
         self._format_var = ctk.StringVar(value="自动")
@@ -347,7 +479,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
 
         # ===== 第二行：同名策略 / 覆盖原图 / 质量 / 进度 / 执行 =====
         row2 = ctk.CTkFrame(bottom_bar, fg_color="transparent")
-        row2.pack(fill="x", padx=6, pady=(3, 5))
+        row2.pack(fill="x", padx=12, pady=(8, 8))
 
         ctk.CTkLabel(row2, text="同名文件:").pack(side="left", padx=(2, 2))
         self._conflict_var = ctk.StringVar(value=CONFLICT_LABELS[CONFLICT_RENAME])
@@ -362,13 +494,13 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._overwrite_original_cb = ctk.CTkCheckBox(
             row2, text="覆盖原图", variable=self._overwrite_original_var,
             width=92, font=("Microsoft YaHei", 11),
-            fg_color="#ef4444", hover_color="#dc2626",
+            fg_color=theme.DANGER, hover_color=theme.DANGER_HOVER,
         )
         self._overwrite_original_cb.pack(side="left", padx=(8, 2))
 
         self._template_hint_label = ctk.CTkLabel(
             row2, text="模板变量: {original} {date} {time} {seq}",
-            text_color="gray", font=("Microsoft YaHei", 9)
+            text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 9)
         )
         self._template_hint_label.pack(side="left", padx=(8, 2))
 
@@ -396,17 +528,30 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._start_btn = ctk.CTkButton(
             row2, text="开始处理", width=100,
             command=self._on_start_processing,
-            fg_color="#22c55e", hover_color="#16a34a",
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            text_color=theme.ON_ACCENT,
         )
         self._start_btn.pack(side="right", padx=5)
 
         self._cancel_btn = ctk.CTkButton(
             row2, text="取消", width=70,
             command=self._on_cancel_processing,
-            fg_color="#ef4444", hover_color="#dc2626",
+            fg_color=theme.DANGER_SOFT, hover_color=theme.DANGER_SOFT_HOVER,
+            text_color=theme.DANGER,
         )
         self._cancel_btn.pack(side="right", padx=2)
         self._cancel_btn.configure(state="disabled")
+
+        # 底部栏的最小高度按"两行控件的实际需求"定（请求高度已含 DPI 缩放）。
+        # _vpaned.add() 时子控件还没建出来、量不到，只能等这里再补一次：
+        # 拖分隔线时 Tk 靠 minsize 兜底，_apply_layout 用同一个口径，
+        # 两条路径才不会出现"拖不动到那么小、一恢复布局又变小"的矛盾。
+        try:
+            self._vpaned.paneconfigure(
+                bottom_bar, minsize=bottom_bar.winfo_reqheight()
+            )
+        except Exception:
+            pass
 
         # 恢复布局
         self._restore_layout()
@@ -663,8 +808,11 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 total_h = self.WINDOW_HEIGHT
 
             # 水平：左栏比例 + 中栏比例（右栏自动占余）
-            left_ratio = layout.get("left_ratio", 0.20)
-            center_ratio = layout.get("center_ratio", 0.45)
+            # 水平：左栏比例 + 中栏比例（右栏自动占余）
+            # 左栏默认 0.24：文件列表一行要放"序号/缩略图/文件名/大小/专属标记"，
+            # 0.20 时固定列就把行占满，文件名只剩两三个字（实测 324px 行宽下）
+            left_ratio = layout.get("left_ratio", 0.24)
+            center_ratio = layout.get("center_ratio", 0.43)
 
             left_w = max(MIN_LEFT, int(total_w * left_ratio))
             center_w = max(MIN_CENTER, int(total_w * center_ratio))
@@ -674,9 +822,20 @@ class AppWindow(ctk.CTk, DnDWrapper):
             if len(self._hpaned.panes()) >= 3:
                 self._hpaned.sash_place(1, left_w + center_w, 0)
 
-            # 垂直：底部栏比例
-            bottom_ratio = layout.get("bottom_ratio", 0.08)
-            bottom_h = max(MIN_BOTTOM, int(total_h * bottom_ratio))
+            # 垂直：底部栏比例。
+            # 下限取「底部栏的请求高度 + 分隔条宽度」——请求高度由控件自己算出，
+            # DPI 缩放已经在里面了；写死一个常数在 125%/150% 缩放下必然偏小，
+            # 结果是第二行（含「开始处理」）被裁掉，界面上却不报任何错。
+            sash_w = int(self._vpaned.cget("sashwidth"))
+            bar_floor = MIN_BOTTOM
+            if len(self._vpaned.panes()) >= 2:
+                try:
+                    bar = self._vpaned.nametowidget(self._vpaned.panes()[1])
+                    bar_floor = max(bar_floor, bar.winfo_reqheight() + sash_w)
+                except Exception:
+                    pass
+            bottom_ratio = layout.get("bottom_ratio", 0.10)
+            bottom_h = max(bar_floor, int(total_h * bottom_ratio))
             content_h = max(100, total_h - bottom_h)
 
             if len(self._vpaned.panes()) >= 2:
@@ -710,10 +869,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
                     layout["center_ratio"] = round(max(MIN_CENTER, sash2 - sash1) / total_w, 4)
                 if len(self._vpaned.panes()) >= 2:
                     v_sash = self._vpaned.sash_coord(0)[1]
-                    layout["bottom_ratio"] = round(max(MIN_BOTTOM, total_h - v_sash) / total_h, 4)
-
-            # 主题与布局同存一份，都是"下次启动该恢复的界面偏好"
-            layout[APPEARANCE_KEY] = ctk.get_appearance_mode()
+                    layout["bottom_ratio"] = round(
+                        max(MIN_BOTTOM, total_h - v_sash) / total_h, 4
+                    )
 
             # 读-改-写：几何被跳过时不能把上一次存下来的窗口大小/位置抹掉
             merged = {}
@@ -724,6 +882,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
                     merged = loaded
             except Exception:
                 merged = {}
+            # 旧版本把外观模式（Dark/Light）也存进了这个文件；皮肤已固定为浅色，
+            # 顺手清掉这个失效字段，别让它一直躺在用户目录里误导排查
+            merged.pop("appearance", None)
             merged.update(layout)
 
             os.makedirs(os.path.dirname(LAYOUT_FILE), exist_ok=True)
@@ -905,6 +1066,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         """用户切换作用范围 → 面板回填该层的参数"""
         self._scope = scope
         self._sync_panels_to_target()
+        self._refresh_top_status()
 
     def _on_clear_scope_override(self):
         """清除当前层的专属参数"""
@@ -1061,36 +1223,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
     # 事件处理
     # ============================================================
 
-    def _apply_theme(self, mode: str, save: bool = True):
-        """
-        应用主题并同步所有依赖颜色的自绘部件。
-
-        customtkinter 只负责自己的控件：PanedWindow 的分隔线和预览画布底色
-        都是我们自己的，必须手动跟随 —— 否则浅色模式下会留下一道深色分隔线。
-        """
-        mode = "Light" if str(mode).lower().startswith("light") else "Dark"
-        ctk.set_appearance_mode(mode)
-
-        # 同步 PanedWindow 分隔线颜色
-        paned_bg = "#f0f0f0" if mode == "Light" else "#2b2b2b"
-        try:
-            self._vpaned.configure(bg=paned_bg)
-            self._hpaned.configure(bg=paned_bg)
-        except Exception:
-            pass
-
-        # 同步预览画布颜色
-        if hasattr(self, '_preview_canvas'):
-            self._preview_canvas.update_theme()
-
-        if save:
-            # 立即落盘：否则"切了主题但没正常关窗"（崩溃 / 强杀）就白切了
-            self._save_layout()
-
-    def _toggle_theme(self):
-        """切换深色/浅色主题 + 同步原生控件颜色"""
-        target = "Light" if ctk.get_appearance_mode() == "Dark" else "Dark"
-        self._apply_theme(target)
+    # 皮肤切换已移除（只有一套浅色皮肤，见 src/ui/theme.py）。
+    # 原生 tk 控件的颜色（PanedWindow 分隔条、预览画布底色）在创建时
+    # 直接取自 theme，不存在"切换后需要重新同步"的场景。
 
     # ============================================================
     # 预设管理
@@ -1333,6 +1468,8 @@ class AppWindow(ctk.CTk, DnDWrapper):
             self._preview_canvas.clear_preview()
             self._refresh_scope_ui()
 
+        self._refresh_top_status()
+
     def _browse_output_dir(self):
         """浏览选择输出目录"""
         from tkinter.filedialog import askdirectory
@@ -1442,6 +1579,35 @@ class AppWindow(ctk.CTk, DnDWrapper):
         count = self._file_list.count
         self._count_label.configure(text=f"共 {count} 个文件")
         self._refresh_output_hint()
+        self._refresh_top_status()
+
+    def _refresh_top_status(self):
+        """
+        顶栏状态：当前预览的文件 + 序号 + 正在编辑的作用层。
+
+        窗口标题栏已经写了应用名，顶栏不重复，只回答"现在在改哪个文件、
+        改的是哪一层"这两个问题。作用层取自 self._scope，与右侧面板同源。
+        """
+        try:
+            total = self._file_list.count
+            path = self._file_list.selected_file
+            index = self._file_list.selected_index
+        except Exception:
+            return
+
+        if path:
+            scope = SCOPE_LABELS.get(self._scope, "")
+            parts = [os.path.basename(path), f"第 {index + 1}/{total} 个"]
+            if scope:
+                parts.append(scope)
+            self._top_status_label.configure(
+                text="  ·  ".join(parts), text_color=theme.TEXT
+            )
+            self._top_status_dot.configure(text_color=theme.ACCENT)
+        else:
+            text = "尚未选择文件" if total == 0 else f"共 {total} 个文件 · 未选择"
+            self._top_status_label.configure(text=text, text_color=theme.TEXT_MUTED)
+            self._top_status_dot.configure(text_color=theme.TEXT_DISABLED)
 
     def _write_failure_report(self, output_dir: str, failures: list) -> str:
         """
@@ -1462,7 +1628,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             path = os.path.join(target_dir, name)
 
             lines = [
-                "批量图片水印工具 — 失败清单",
+                f"{APP_NAME} — 失败清单",
                 f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 f"失败数量: {len(failures)}",
                 f"日志文件: {log_path()}",
@@ -2151,6 +2317,12 @@ class AppWindow(ctk.CTk, DnDWrapper):
         dialog.resizable(False, False)
         dialog.transient(self)
 
+        # 标题栏与主窗一致（纯外观，失败不影响对话框任何行为）。
+        # 等它真正显示出来再上色：CTkToplevel 构造时会 withdraw 自己再 deiconify，
+        # 抢在显示之前设置有时会被随后的显示流程覆盖
+        _apply_window_icon(dialog)
+        dialog.after(120, lambda: style_titlebar(dialog))
+
         # 居中显示
         dialog.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() // 2) - 200
@@ -2180,7 +2352,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             dialog,
             text="\n".join(lines),
             font=ctk.CTkFont(size=12),
-            text_color=("gray20", "gray80"),
+            text_color=theme.TEXT,
             justify="left",
             wraplength=360,
         ).pack(pady=5)
@@ -2203,7 +2375,8 @@ class AppWindow(ctk.CTk, DnDWrapper):
         if report and os.path.exists(report):
             ctk.CTkButton(
                 btn_frame, text="查看失败清单", width=120,
-                fg_color="#8B3A3A", hover_color="#A04545",
+                fg_color=theme.WARN_SOFT, hover_color=theme.WARN_SOFT_HOVER,
+                text_color=theme.WARN,
                 command=lambda p=report: (
                     os.startfile(os.path.abspath(p)) if os.name == 'nt'
                     else subprocess.run(["xdg-open", p])

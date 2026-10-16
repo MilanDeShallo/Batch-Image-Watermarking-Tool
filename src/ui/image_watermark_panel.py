@@ -12,6 +12,7 @@ import os
 from PIL import Image, ImageTk
 
 from src.config import WatermarkConfig, normalize_position
+from src.ui import theme
 
 
 class ImageWatermarkPanel(ctk.CTkFrame):
@@ -42,7 +43,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         )
 
         self.logo_path_label = ctk.CTkLabel(
-            logo_frame, text="未选择", text_color="gray",
+            logo_frame, text="未选择", text_color=theme.TEXT_MUTED,
             anchor="w"
         )
         self.logo_path_label.grid(row=0, column=1, sticky="ew", padx=(4, 0))
@@ -63,12 +64,16 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         # Logo 预览
         self.logo_preview_label = ctk.CTkLabel(
             self, text="", width=120, height=80,
-            fg_color="#2a2d32", corner_radius=6
+            fg_color=theme.SURFACE_ALT, corner_radius=theme.RADIUS_INPUT
         )
         self.logo_preview_label.grid(row=1, column=0, **grid_opts)
 
         # --- 分隔线 ---
-        sep = ctk.CTkFrame(self, height=1, fg_color=("gray70", "gray30"))
+        # width 与 height 都要给：CTkFrame 默认 200×200（逻辑像素），
+        # 只写 height=1 时请求宽度仍是 200 逻辑像素，会把面板的请求宽度撑起来
+        sep = ctk.CTkFrame(
+            self, width=1, height=1, corner_radius=0, fg_color=theme.BORDER
+        )
         sep.grid(row=2, column=0, sticky="ew", padx=12, pady=8)
 
         # --- 缩放比例 ---
@@ -153,7 +158,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
 
         # 默认选中右下
         self.selected_position = 8
-        self.pos_buttons[8].configure(fg_color="#3b82f6")
+        self._restyle_position_buttons()
 
         # --- 自定义坐标（默认隐藏） ---
         self.custom_pos_frame = ctk.CTkFrame(pos_frame, fg_color="transparent")
@@ -165,7 +170,8 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         self.custom_x_entry = ctk.CTkEntry(x_row, width=60, textvariable=self.custom_x_var)
         self.custom_x_entry.pack(side="left", padx=5)
         self.custom_x_entry.bind("<KeyRelease>", lambda e: self._notify_change())
-        ctk.CTkLabel(x_row, text="(0=左 100=右)", text_color="gray", font=("Microsoft YaHei", 9)).pack(side="left")
+        theme.bind_focus_ring(self.custom_x_entry)
+        ctk.CTkLabel(x_row, text="(0=左 100=右)", text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 9)).pack(side="left")
 
         y_row = ctk.CTkFrame(self.custom_pos_frame, fg_color="transparent")
         y_row.pack(fill="x", pady=1)
@@ -174,7 +180,8 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         self.custom_y_entry = ctk.CTkEntry(y_row, width=60, textvariable=self.custom_y_var)
         self.custom_y_entry.pack(side="left", padx=5)
         self.custom_y_entry.bind("<KeyRelease>", lambda e: self._notify_change())
-        ctk.CTkLabel(y_row, text="(0=上 100=下)", text_color="gray", font=("Microsoft YaHei", 9)).pack(side="left")
+        theme.bind_focus_ring(self.custom_y_entry)
+        ctk.CTkLabel(y_row, text="(0=上 100=下)", text_color=theme.TEXT_MUTED, font=("Microsoft YaHei", 9)).pack(side="left")
         row += 1
 
         # --- 边距 ---
@@ -193,7 +200,9 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         row += 1
 
         # --- 分隔线 ---
-        sep2 = ctk.CTkFrame(self, height=1, fg_color=("gray70", "gray30"))
+        sep2 = ctk.CTkFrame(
+            self, width=1, height=1, corner_radius=0, fg_color=theme.BORDER
+        )
         sep2.grid(row=row, column=0, sticky="ew", padx=12, pady=8)
         row += 1
 
@@ -211,6 +220,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         self.spacing_x_entry.insert(0, "100")
         self.spacing_x_entry.grid(row=0, column=1, sticky="w", padx=(0, 8))
         self.spacing_x_entry.bind("<KeyRelease>", lambda e: self._notify_change())
+        theme.bind_focus_ring(self.spacing_x_entry)
 
         ctk.CTkLabel(
             self.tile_params_frame, text="垂直间距:"
@@ -221,6 +231,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         self.spacing_y_entry.insert(0, "100")
         self.spacing_y_entry.bind("<KeyRelease>", lambda e: self._notify_change())
         self.spacing_y_entry.grid(row=0, column=3, sticky="w")
+        theme.bind_focus_ring(self.spacing_y_entry)
 
         self._stagger_var = ctk.BooleanVar(value=False)
         stagger_check = ctk.CTkCheckBox(
@@ -280,7 +291,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
                        由调用方统一刷新一次，避免重复渲染。
         """
         self.logo_path = None
-        self.logo_path_label.configure(text="未选择", text_color="gray")
+        self.logo_path_label.configure(text="未选择", text_color=theme.TEXT_MUTED)
         # 无条件清掉预览图：曾经写成 `if self.logo_preview_tk:` 才清理，
         # 而该字段为 None 时就会跳过 —— 界面上残留上一张 Logo 的缩略图，
         # 用户以为已经清掉了
@@ -312,7 +323,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             # 显示文件名
             self.logo_path_label.configure(
                 text=os.path.basename(path),
-                text_color=("gray10", "#e0e0e0")
+                text_color=theme.TEXT
             )
             self._notify_change()
             return True
@@ -331,7 +342,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
         if is_tile:
             # 禁用位置和边距
             for btn in self.pos_buttons:
-                btn.configure(state="disabled", fg_color="#44474e")
+                btn.configure(state="disabled", fg_color=theme.TRACK)
             # 注意：要禁用真正可交互的滑块，而不是外层容器。
             # CTkFrame 不支持 state 参数，对它 configure(state=...) 会抛
             # ValueError；异常一旦抛出会中断整个 set_from_config，
@@ -347,7 +358,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             for btn in self.pos_buttons:
                 btn.configure(state="normal")
             # 恢复当前选中的高亮
-            self.pos_buttons[self.selected_position].configure(fg_color="#3b82f6")
+            self._restyle_position_buttons()
             self.margin_slider.configure(state="normal")
             # 启用自定义坐标（根据当前模式）
             if hasattr(self, 'custom_x_entry'):
@@ -370,14 +381,30 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             self.custom_pos_frame.pack(pady=2)
         self._notify_change()
 
+    def _restyle_position_buttons(self):
+        """
+        按当前选中项刷新九宫格配色：选中 = 主色实底，未选中 = 暖中性底。
+
+        单独收一个函数，是因为"选中态样式"原先在创建、点击、解除禁用、
+        回填预设四处各写一遍，改主色时要改四个地方，漏一个就会出现
+        "点过的按钮和回填后的按钮颜色不一样"。
+        """
+        for i, btn in enumerate(self.pos_buttons):
+            if i == self.selected_position:
+                btn.configure(
+                    fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+                    text_color=theme.ON_ACCENT,
+                )
+            else:
+                btn.configure(
+                    fg_color=theme.NEUTRAL_BTN, hover_color=theme.NEUTRAL_BTN_HOVER,
+                    text_color=theme.TEXT,
+                )
+
     def _select_position(self, index):
         """9 宫格按钮点击"""
         self.selected_position = index
-        for i, btn in enumerate(self.pos_buttons):
-            if i == index:
-                btn.configure(fg_color="#3b82f6")
-            else:
-                btn.configure(fg_color=("#c0c0c0", "#3b3b3b"))
+        self._restyle_position_buttons()
         self._notify_change()
 
     def _update_label(self, label, text):
@@ -495,7 +522,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
 
         # 旋转角度
         self.angle_slider.set(data.get("logo_angle", 0))
-        self._update_label(self.angle_value_label, f"{int(self.angle_slider.get())}")
+        self._update_label(self.angle_value_label, f"{int(self.angle_slider.get())}°")
 
         # 位置模式
         pos_mode = data.get("logo_position_mode", "grid")
@@ -511,11 +538,7 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             pos_map = {name: i for i, name in enumerate(self._POS_NAMES)}
             pos_idx = pos_map.get(pos_str, 8)
             self.selected_position = pos_idx
-            for i, btn in enumerate(self.pos_buttons):
-                if i == pos_idx:
-                    btn.configure(fg_color="#3b82f6")
-                else:
-                    btn.configure(fg_color=("#c0c0c0", "#3b3b3b"))
+            self._restyle_position_buttons()
         else:
             if hasattr(self, 'custom_x_var'):
                 self.custom_x_var.set(str(data.get("logo_custom_x", 50)))
