@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox
 import os
 from PIL import Image, ImageTk
 
-from src.config import WatermarkConfig, normalize_position
+from src.config import WatermarkConfig, format_percent, normalize_position
 from src.ui import theme
 
 
@@ -370,6 +370,21 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             self.tile_params_frame.grid_remove()
         self._notify_change()
 
+    def set_custom_position(self, x_pct: float, y_pct: float):
+        """
+        由预览图上拖动 Logo 水印写入坐标（公开入口，主窗口调用）。
+
+        与文字面板同名同义：顺带切到"自定义"定位，写入走面板自己的提交通道，
+        所以作用范围（全部 / 本文件 / 本页）与手输坐标一致。
+        """
+        self.custom_x_var.set(format_percent(x_pct))
+        self.custom_y_var.set(format_percent(y_pct))
+        if self.pos_mode_var.get() != "custom":
+            self.pos_mode_var.set("custom")
+            self._on_pos_mode_changed()    # 内部会 notify，别重复触发
+        else:
+            self._notify_change()
+
     def _on_pos_mode_changed(self):
         """位置模式切换：九宫格 / 自定义坐标"""
         mode = self.pos_mode_var.get()
@@ -541,8 +556,12 @@ class ImageWatermarkPanel(ctk.CTkFrame):
             self._restyle_position_buttons()
         else:
             if hasattr(self, 'custom_x_var'):
-                self.custom_x_var.set(str(data.get("logo_custom_x", 50)))
-                self.custom_y_var.set(str(data.get("logo_custom_y", 50)))
+                # format_percent 而非 str()：拖出来的坐标是浮点，
+                # str() 会出现 33.470000000000006 这种噪声值
+                self.custom_x_var.set(
+                    format_percent(data.get("logo_custom_x", 50)))
+                self.custom_y_var.set(
+                    format_percent(data.get("logo_custom_y", 50)))
 
         # 平铺模式
         tile = data.get("logo_tile", False)

@@ -44,12 +44,15 @@ class PreviewCanvas(ctk.CTkFrame):
     DEBOUNCE_MS = 150
     ZOOM_THROTTLE_MS = 50
 
-    def __init__(self, parent, on_config_changed=None, on_page_changed=None, **kwargs):
+    def __init__(self, parent, on_config_changed=None, on_page_changed=None,
+                 on_watermark_moved=None, **kwargs):
         super().__init__(parent, **kwargs)
 
         self.on_config_changed = on_config_changed
         # 翻页回调：主窗口据此把面板切换到该页的专属参数
         self.on_page_changed = on_page_changed
+        # 拖动水印结束时的回调：(kind, x_pct, y_pct) —— 由主窗口写回面板
+        self.on_watermark_moved = on_watermark_moved
         self.current_image_path = None
         self._display_image_tk = None
         self._debounce_timer = None
@@ -93,6 +96,23 @@ class PreviewCanvas(ctk.CTkFrame):
         self._pan_offset = (0, 0)
         self._pan_start = None
 
+        # ==== 拖动水印：预览图上直接定位 ====
+        # 拖动期间只移动 canvas item（零重绘），所以是丝滑的；
+        # 松手后才走正常渲染链路提交一次，导出与预览仍然同源
+        self._wm_boxes = []            # 可拖动水印的矩形（渲染图坐标，上层在前）
+        self._wm_base_render = None    # 不含水印的渲染底图（拖动时当背景，避免残影）
+        self._wm_cfg = None            # 上次渲染用的配置（现算精灵/命中框要用）
+        self._wm_scale = 1.0           # 上次渲染的 scale
+        self._wm_drag = None           # 拖动状态；None = 未在拖
+        self._wm_sprite_tk = None      # 拖动期间显示的精灵（Tk 图像）
+        self._wm_sprite_item = None    # 精灵的 canvas item
+        self._wm_base_tk = None        # 无水印底图的 Tk 图像（显示尺寸，按需生成）
+        self._wm_base_key = None       # 底图 Tk 图像对应的（渲染版本, 显示尺寸）
+        self._wm_guides = []           # 吸附对齐线
+        self._wm_readout = None        # 拖动中的坐标读数 canvas item
+        self._wm_cursor = ""           # 当前光标（悬停在水印上是手型）
+        self._wm_live = None           # 拖动中的实时坐标 (x_pct, y_pct)
+
         self._build_ui()
 
     def _build_ui(self):
@@ -130,6 +150,9 @@ class PreviewCanvas(ctk.CTkFrame):
         self._canvas.bind("<B1-Motion>", self._on_pan_motion)
         self._canvas.bind("<ButtonRelease-1>", self._on_pan_end)
         self._canvas.bind("<Control-MouseWheel>", self._on_ctrl_scroll)
+        # 悬停时光标变手型：不这样没人知道水印是可以拖的
+        self._canvas.bind("<Motion>", self._on_canvas_motion)
+        self._canvas.bind("<Leave>", self._on_canvas_leave)
 
         # 底部缩放控制栏
         zoom_bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -362,9 +385,8 @@ class PreviewCanvas(ctk.CTkFrame):
             max(-max_dy, min(max_dy, self._pan_offset[1])),
         )
 
-        # 居中 + 偏移
-        x = (cw - w) // 2 + self._pan_offset[0]
-        y = (ch - h) // 2 + self._pan_offset[1]
+        # 居中 + 偏移（与 _image_origin 同源：命中判定要按同一处坐标换算）
+        x, y = self._image_origin()
 
         self._image_item = self._canvas.create_image(
             x, y, anchor="nw", image=self._display_image_tk
@@ -373,6 +395,10 @@ class PreviewCanvas(ctk.CTkFrame):
     # ==================== 拖动 ====================
 
     def _on_pan_start(self, event):
+        # 按在水印墨迹上 = 拖水印；按在别处 = 平移画面
+        hit = self._wm_hit_test(event.x, event.y)
+        if hit is not None and self._wm_drag_begin(hit, event):
+            return
         self._pan_start = (event.x, event.y)
 
     def _on_pan_motion(self, event):
@@ -383,6 +409,8 @@ class PreviewCanvas(ctk.CTkFrame):
         每次都要复制 1800px 缓存图 + LANCZOS 重采样（实测 25ms/帧），
         于是拖动既迟滞又掉帧。显示图已按缩放缓存，移动是零成本的。
         """
+        if self._wm_drag is not None and self._wm_drag_motion(event):
+            return
         if self._pan_start is None or self._cached_render is None:
             return
         dx = event.x - self._pan_start[0]
@@ -392,7 +420,309 @@ class PreviewCanvas(ctk.CTkFrame):
         self._draw_canvas_image()
 
     def _on_pan_end(self, event):
+        if self._wm_drag is not None:
+            self._wm_drag_end(event)
+            return
         self._pan_start = None
+
+    # ==================== 拖动水印（预览图上直接定位）====================
+    #
+    # 交互：按在**水印墨迹上**拖动 = 移动水印（自动切到"自定义"定位）；
+    #       按在其它地方拖动 = 平移画面（原有行为不变）。
+    #
+    # 为什么拖动期间不重新渲染：一次完整渲染要过后台线程 + 重采样 + 生成 Tk 图像，
+    # 每帧几十毫秒，拖起来就是"黏"的。这里的做法是——按下时准备好两张显示图
+    # （无水印底图 + 精灵），拖动期间只 canvas.coords() 移动精灵项；
+    # 松手后再走正常渲染链路提交一次。手感丝滑，最终结果仍由引擎产出。
+
+    _SNAP_PX = 8                     # 吸附阈值（显示像素）
+    _SNAP_LINES = (0.0, 50.0, 100.0)  # 吸附线：左/上、居中、右/下
+    _ALT_MASK = 0x0008 | 0x20000     # Windows 上 Alt 的 state 位（两个都认）
+
+    def _refresh_watermark_boxes(self):
+        """按当前配置算出可拖动水印的矩形（渲染图坐标，上层在前）"""
+        self._wm_boxes = []
+        try:
+            from src.watermark_engine import watermark_boxes
+
+            cfg = self._wm_cfg
+            base = self._wm_base_render
+            if cfg is None or base is None:
+                return
+            self._wm_boxes = watermark_boxes(cfg, base.size, self._wm_scale)
+        except Exception:
+            # 命中判定失败只意味着"这次拖不了水印"，平移画面照常
+            self._wm_boxes = []
+
+    def _image_origin(self) -> tuple:
+        """当前显示图在画布上的左上角（居中 + 平移量），与 _draw_canvas_image 同源"""
+        w, h = self._display_size
+        cw = max(self._canvas.winfo_width(), 100)
+        ch = max(self._canvas.winfo_height(), 100)
+        return (cw - w) // 2 + self._pan_offset[0], (ch - h) // 2 + self._pan_offset[1]
+
+    def _display_scale(self) -> float:
+        """显示图 / 渲染图 的缩放比（渲染图坐标 × 它 = 显示图坐标）"""
+        if self._cached_render is None or self._cached_render.width <= 0:
+            return 0.0
+        if self._display_size[0] <= 0:
+            return 0.0
+        return self._display_size[0] / self._cached_render.width
+
+    def _wm_hit_test(self, cx: float, cy: float):
+        """画布坐标是否落在某个可拖动水印上；是则返回那一条描述"""
+        k = self._display_scale()
+        if k <= 0 or not self._wm_boxes:
+            return None
+        ox, oy = self._image_origin()
+        rx = (cx - ox) / k
+        ry = (cy - oy) / k
+        for item in self._wm_boxes:      # 已按"上层在前"排好序
+            x, y, w, h = item["box"]
+            if x <= rx <= x + w and y <= ry <= y + h:
+                return item
+        return None
+
+    def _wm_tile_hint(self) -> bool:
+        """
+        有水印可画、却因为没有位置可拖（平铺）而不能拖 → 值得给一句提示。
+
+        只看"存在哪些水印、它们是不是平铺"，不看内容细节；
+        _wm_boxes 非空说明本来就有可拖的水印，那就没什么要解释的。
+        """
+        cfg = self._wm_cfg
+        if cfg is None or self._wm_boxes:
+            return False
+        wtype = getattr(cfg, "watermark_type", "text")
+        has_text = wtype in ("text", "both") and bool(getattr(cfg, "text", "").strip())
+        has_logo = wtype in ("image", "both") and bool(getattr(cfg, "logo_path", None))
+        if not (has_text or has_logo):
+            return False
+        return ((has_text and getattr(cfg, "tile", False))
+                or (has_logo and getattr(cfg, "logo_tile", False)))
+
+    def _on_canvas_motion(self, event):
+        """悬停反馈：水印上给手型光标（"这里可以拖"的唯一提示）"""
+        if self._wm_drag is not None:
+            return
+        want = "hand2" if self._wm_hit_test(event.x, event.y) else ""
+        if want != self._wm_cursor:
+            self._wm_cursor = want
+            try:
+                self._canvas.configure(cursor=want)
+            except Exception:
+                pass
+
+    def _on_canvas_leave(self, _event=None):
+        if self._wm_cursor and self._wm_drag is None:
+            self._wm_cursor = ""
+            try:
+                self._canvas.configure(cursor="")
+            except Exception:
+                pass
+
+    def _wm_drag_begin(self, item, event) -> bool:
+        """进入拖动状态：备好"无水印底图 + 精灵"两张显示图"""
+        from src.watermark_engine import build_watermark_sprite
+
+        base = self._wm_base_render
+        cfg = self._wm_cfg
+        k = self._display_scale()
+        if base is None or cfg is None or k <= 0:
+            return False
+
+        try:
+            # kind 要显式传：两种水印可以同时存在（watermark_type="both"），
+            # 拖的是哪个就得建哪个
+            sprite_render = build_watermark_sprite(
+                cfg, base.size, self._wm_scale, item["kind"]
+            )
+        except Exception:
+            return False
+        if sprite_render is None:
+            return False
+
+        dw, dh = self._display_size
+        sw = max(1, int(round(sprite_render.width * k)))
+        sh = max(1, int(round(sprite_render.height * k)))
+
+        # 无水印底图：拖动期间把画面换成它，否则原位置会留下一份水印残影。
+        # 按（渲染版本, 显示尺寸）缓存 —— 缩放变化会自然失效重算。
+        key = (self._render_token, dw, dh)
+        if self._wm_base_tk is None or self._wm_base_key != key:
+            resample = Image.LANCZOS if k < 1 else Image.BICUBIC
+            base_display = base.convert("RGB").resize((dw, dh), resample)
+            self._wm_base_tk = ImageTk.PhotoImage(base_display)
+            self._wm_base_key = key
+
+        # 精灵直接做成 Tk 图像：Tk 8.6 的 photo 支持逐像素 alpha，
+        # 半透明文字叠在底图上是对的（A/B 实测过，见 .workbuddy/tmp/ab_sprite.py）。
+        # 这样拖动期间每帧只剩一次 canvas.coords()，零重绘 —— 手感最顺。
+        self._wm_sprite_tk = ImageTk.PhotoImage(
+            sprite_render.resize((sw, sh), Image.LANCZOS)
+        )
+
+        x, y, _w, _h = item["box"]
+        ox, oy = self._image_origin()
+        if self._image_item is not None:
+            self._canvas.itemconfig(self._image_item, image=self._wm_base_tk)
+        self._wm_sprite_item = self._canvas.create_image(
+            ox + x * k, oy + y * k, anchor="nw", image=self._wm_sprite_tk
+        )
+        self._wm_drag = {
+            "kind": item["kind"],
+            "render_size": base.size,
+            "sprite_size": sprite_render.size,
+            "start": (event.x, event.y),
+            "anchor": (float(x), float(y)),
+            "origin": (ox, oy),
+            "k": k,
+            "live": None,
+        }
+        try:
+            self._canvas.configure(cursor="fleur")
+        except Exception:
+            pass
+        return True
+
+    def _wm_drag_motion(self, event) -> bool:
+        """拖动中：只移动精灵项 + 更新对齐线/读数，不触发任何渲染"""
+        st = self._wm_drag
+        if st is None:
+            return False
+
+        from src.watermark_engine import (
+            custom_anchor_position, custom_percent_for_anchor,
+        )
+
+        k = st["k"]
+        target_x = st["anchor"][0] + (event.x - st["start"][0]) / k
+        target_y = st["anchor"][1] + (event.y - st["start"][1]) / k
+
+        # 像素 → 百分比：夹取规则与导出共用同一个 clamp_anchor，
+        # 所以拖出边界时数值会自己收敛，不会越拖越偏
+        x_pct, y_pct = custom_percent_for_anchor(
+            st["render_size"], st["sprite_size"], target_x, target_y
+        )
+
+        guides = None
+        if not (event.state & self._ALT_MASK):
+            x_pct, y_pct, guides = self._wm_snap(x_pct, y_pct)
+
+        # 再由引擎的同一套换算回算像素位置：看到的 = 导出的
+        px, py = custom_anchor_position(
+            st["render_size"], st["sprite_size"], x_pct, y_pct
+        )
+        ox, oy = st["origin"]
+        sx, sy = ox + px * k, oy + py * k
+        self._canvas.coords(self._wm_sprite_item, sx, sy)
+
+        self._wm_show_guides(guides, ox, oy, k, st)
+        self._wm_show_readout(x_pct, y_pct, sx, sy, k, st)
+        st["live"] = (x_pct, y_pct)
+        return True
+
+    def _wm_snap(self, x_pct, y_pct):
+        """
+        靠近 0 / 50 / 100% 时吸附到整值，返回 (x, y, 参考线)。
+
+        阈值按**显示像素**折算成百分比：写死百分比的话，图越大越难吸住
+        （同样 6px 在 4000px 宽的图上只有 0.15%）。按住 Alt 可临时关闭。
+        """
+        dw = max(1, self._display_size[0])
+        dh = max(1, self._display_size[1])
+        thr_x = self._SNAP_PX / dw * 100
+        thr_y = self._SNAP_PX / dh * 100
+
+        guides = {"x": None, "y": None}
+        for line in self._SNAP_LINES:
+            if abs(x_pct - line) <= thr_x:
+                x_pct, guides["x"] = line, line
+                break
+        for line in self._SNAP_LINES:
+            if abs(y_pct - line) <= thr_y:
+                y_pct, guides["y"] = line, line
+                break
+        return x_pct, y_pct, (guides if (guides["x"] is not None or guides["y"] is not None) else None)
+
+    def _wm_show_guides(self, guides, ox, oy, k, st):
+        """画吸附参考线（虚线，主色）"""
+        for item in self._wm_guides:
+            self._canvas.delete(item)
+        self._wm_guides = []
+        if not guides:
+            return
+        rw, rh = st["render_size"]
+        if guides["x"] is not None:
+            gx = ox + rw * guides["x"] / 100 * k
+            self._wm_guides.append(self._canvas.create_line(
+                gx, oy, gx, oy + rh * k, fill=theme.ACCENT, dash=(4, 4)
+            ))
+        if guides["y"] is not None:
+            gy = oy + rh * guides["y"] / 100 * k
+            self._wm_guides.append(self._canvas.create_line(
+                ox, gy, ox + rw * k, gy, fill=theme.ACCENT, dash=(4, 4)
+            ))
+
+    def _wm_show_readout(self, x_pct, y_pct, sx, sy, k, st):
+        """水印旁边显示实时百分比（图片深浅不定，所以垫一块底色）"""
+        from src.config import format_percent
+
+        text = f"{format_percent(x_pct)}% , {format_percent(y_pct)}%"
+        cw = max(self._canvas.winfo_width(), 100)
+        ch = max(self._canvas.winfo_height(), 100)
+        sw = st["sprite_size"][0] * k
+        tx = min(max(sx + sw + 6, 4), max(4, cw - 96))
+        ty = min(max(sy, 4), max(4, ch - 22))
+
+        if self._wm_readout is None:
+            self._wm_readout = self._canvas.create_text(
+                tx, ty, anchor="nw", text=text, fill=theme.TEXT,
+                font=("Microsoft YaHei", 10),
+            )
+        else:
+            self._canvas.itemconfig(self._wm_readout, text=text)
+            self._canvas.coords(self._wm_readout, tx, ty)
+
+    def _wm_drag_end(self, _event=None) -> bool:
+        """松手：收尾并把最终坐标交回主窗口（由它写进面板 → 正常渲染）"""
+        st = self._wm_drag
+        if st is None:
+            return False
+        live = st.get("live")
+        kind = st["kind"]
+        self._wm_drag_cancel()
+        if live is not None and self.on_watermark_moved is not None:
+            self.on_watermark_moved(kind, live[0], live[1])
+        return True
+
+    def _wm_drag_cancel(self):
+        """清理拖动状态：删临时项、画面换回正常渲染图"""
+        st = self._wm_drag
+        self._wm_drag = None
+
+        for item in self._wm_guides:
+            self._canvas.delete(item)
+        self._wm_guides = []
+        if self._wm_readout is not None:
+            self._canvas.delete(self._wm_readout)
+            self._wm_readout = None
+        if self._wm_sprite_item is not None:
+            self._canvas.delete(self._wm_sprite_item)
+            self._wm_sprite_item = None
+        if self._image_item is not None and self._display_image_tk is not None:
+            try:
+                self._canvas.itemconfig(self._image_item, image=self._display_image_tk)
+            except Exception:
+                pass
+        self._wm_sprite_tk = None
+
+        if st is not None:
+            self._wm_cursor = ""
+            try:
+                self._canvas.configure(cursor="")
+            except Exception:
+                pass
 
     # ==================== 占位文字 ====================
 
@@ -682,7 +1012,11 @@ class PreviewCanvas(ctk.CTkFrame):
             page_count = self._base_page_count
             pdf_page = self._base_page_index
 
-            payload = (display, ref_size, gen, page_count, pdf_page)
+            # 连同"不含水印的底图 + 配置 + scale"一起带回主线程：
+            # 预览图上拖动水印时要用它们现算精灵与命中框，
+            # 用的还是引擎那套函数，所以拖到哪就导出到哪
+            payload = (display, ref_size, gen, page_count, pdf_page,
+                       work, config, scale)
         except Exception as e:
             error = str(e)
         finally:
@@ -696,8 +1030,10 @@ class PreviewCanvas(ctk.CTkFrame):
 
         if gen == self._generation:
             if payload is not None:
-                display, ref_size, _gen, page_count, pdf_page = payload
-                self._cache_and_display(display, ref_size, gen, page_count, pdf_page)
+                (display, ref_size, _gen, page_count, pdf_page,
+                 base_work, config, scale) = payload
+                self._cache_and_display(display, ref_size, gen, page_count, pdf_page,
+                                        base_work, config, scale)
             elif error is not None:
                 self._show_placeholder(f"预览出错: {error}")
 
@@ -706,7 +1042,8 @@ class PreviewCanvas(ctk.CTkFrame):
             self._schedule_refresh(immediate=True)
 
     def _cache_and_display(self, display_img: Image.Image, ref_size, gen: int,
-                           page_count=None, pdf_page: int = 0):
+                           page_count=None, pdf_page: int = 0,
+                           base_work=None, config=None, scale: float = 1.0):
         """主线程：缓存结果 + 应用缩放"""
         if gen != self._generation:
             return
@@ -715,6 +1052,17 @@ class PreviewCanvas(ctk.CTkFrame):
         self._cached_orig_size = ref_size
         self._render_token += 1      # 让显示图缓存失效
         self._display_key = None
+
+        # 拖动水印要用的三件套：无水印底图、配置、scale
+        self._wm_base_render = base_work
+        self._wm_cfg = config
+        self._wm_scale = scale
+        self._wm_base_tk = None      # 渲染换了，底图显示缓存也就失效了
+        self._wm_base_key = None
+        self._refresh_watermark_boxes()
+        if self._wm_drag is not None:
+            # 拖动过程中被别的刷新打断（例如切了文件）：直接收尾，别留下悬空状态
+            self._wm_drag_cancel()
 
         if page_count is not None:
             # 回填页数并同步翻页栏（首帧渲染完成后按钮才有正确的可用状态）
@@ -726,12 +1074,24 @@ class PreviewCanvas(ctk.CTkFrame):
             )
             self._update_pdf_bar()
         else:
-            self.info_label.configure(text=f"原图: {ref_size[0]}x{ref_size[1]}")
+            text = f"原图: {ref_size[0]}x{ref_size[1]}"
+            if self._wm_tile_hint():
+                # 平铺的水印没有"位置"可拖（从左上角按间距铺开）。
+                # 在用户会试着拖的地方说清楚，比让他试半天再放弃好。
+                text += "　·　平铺模式：位置由间距决定，不支持拖动"
+            self.info_label.configure(text=text)
         # 注意：这里不再重置 _pan_offset —— 微调参数时视图跳回中心很打断操作，
         # 换文件时由 set_image() 重置
         self._apply_zoom(force=True)
 
     def _show_placeholder(self, message: str):
+        # 占位状态下没有图，也就没有可拖动的水印 —— 一并收掉拖动状态，
+        # 否则残留的精灵/参考线会盖在占位文字上
+        self._wm_drag_cancel()
+        self._wm_boxes = []
+        self._wm_base_render = None
+        self._wm_base_tk = None
+        self._wm_base_key = None
         self._cached_render = None
         self._cached_orig_size = (0, 0)
         self._display_key = None

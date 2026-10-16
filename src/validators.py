@@ -27,8 +27,10 @@ from typing import Any
 
 # 文字水印面板
 TEXT_FIELD_SPECS: dict[str, tuple[float, float, float, bool]] = {
-    "custom_x":   (0.0,   100.0,   50.0,  True),   # 位置 X 百分比
-    "custom_y":   (0.0,   100.0,   50.0,  True),   # 位置 Y 百分比
+    # 位置百分比允许小数：预览图上直接拖动水印时，整数百分比在
+    # 3000px 宽的图上一步就是 30px，够不上"完全自定义"
+    "custom_x":   (0.0,   100.0,   50.0,  False),  # 位置 X 百分比（小数可用）
+    "custom_y":   (0.0,   100.0,   50.0,  False),  # 位置 Y 百分比（小数可用）
     "spacing_x":  (1.0, 10000.0,  100.0,  True),   # 水平间距（必须 > 0）
     "spacing_y":  (1.0, 10000.0,  100.0,  True),   # 垂直间距（必须 > 0）
     "margin":     (0.0,  1000.0,   20.0,  True),   # 边距
@@ -39,8 +41,8 @@ TEXT_FIELD_SPECS: dict[str, tuple[float, float, float, bool]] = {
 
 # 图片（Logo）水印面板
 IMAGE_FIELD_SPECS: dict[str, tuple[float, float, float, bool]] = {
-    "logo_custom_x":  (0.0,   100.0,   50.0,  True),
-    "logo_custom_y":  (0.0,   100.0,   50.0,  True),
+    "logo_custom_x":  (0.0,   100.0,   50.0,  False),
+    "logo_custom_y":  (0.0,   100.0,   50.0,  False),
     "logo_spacing_x": (1.0, 10000.0,  100.0,  True),
     "logo_spacing_y": (1.0, 10000.0,  100.0,  True),
     "logo_margin":    (0.0,  1000.0,    5.0,  True),
@@ -146,9 +148,16 @@ def clamp_number(
 
 
 def _format_value(value: int | float) -> str:
-    """修正提示里的数值格式化（整数不带小数点）"""
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
+    """
+    修正提示里的数值格式化（整数不带小数点）。
+
+    先 round 再格式化：拖动水印写回的是浮点百分比，直接 str() 会出现
+    33.470000000000006 这种噪声值，提示里很难看。
+    """
+    if isinstance(value, float):
+        value = round(value, 4)
+        if value.is_integer():
+            return str(int(value))
     return str(value)
 
 

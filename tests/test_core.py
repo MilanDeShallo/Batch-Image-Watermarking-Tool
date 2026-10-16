@@ -574,7 +574,109 @@ class TestThemePalette:
         assert _colorref("#FFFFFF") == 0xFFFFFF
 
 
-# ==================== 窗口几何夹取 ====================
+# ==================== 水印几何（预览拖动与导出共用）====================
+
+
+class TestWatermarkGeometry:
+    """
+    预览图上直接拖水印，靠的是引擎里这一套换算 —— 与真正渲染用的是同一组函数，
+    所以"拖到哪就导出到哪"是结构性保证，而不是靠两处代码各自保持同步。
+    """
+
+    def test_clamp_keeps_sprite_inside(self):
+        from src.watermark_engine import clamp_anchor
+
+        assert clamp_anchor((100, 100), (30, 20), 90, 90) == (70, 80)
+        assert clamp_anchor((100, 100), (30, 20), -5, -5) == (0, 0)
+
+    def test_percent_round_trip(self):
+        """
+        百分比 → 像素 → 百分比必须回到原值。
+
+        拖动就是把鼠标位移换算成百分比写进配置，再让引擎按百分比定位；
+        这个来回若对不上，就会出现"松手后水印跳一下"。
+        （边界处不适用：pct 代表中心点，中心贴边时精灵会被夹回来，见下一个用例。）
+        """
+        from src.watermark_engine import (
+            custom_anchor_position, custom_percent_for_anchor,
+        )
+
+        base, sprite = (1600, 1000), (200, 80)
+        for pct in ((20.0, 20.0), (50.0, 50.0), (80.0, 80.0), (33.47, 66.13)):
+            x, y = custom_anchor_position(base, sprite, *pct)
+            got = custom_percent_for_anchor(base, sprite, x, y)
+            assert got == pytest.approx(pct, abs=0.05), f"{pct} → {got}"
+
+    def test_percent_converges_at_edges(self):
+        """往图外拖：数值收敛到"精灵贴边"，与导出时的夹取同一套规则"""
+        from src.watermark_engine import custom_percent_for_anchor
+
+        assert custom_percent_for_anchor((1000, 800), (200, 100), -999, -999) == (
+            10.0, 6.25,
+        )
+
+    def test_boxes_empty_when_tiled(self):
+        """平铺没有位置概念（从左上角按间距铺开），不该出现在可拖列表里"""
+        from src.config import WatermarkConfig
+        from src.watermark_engine import watermark_boxes
+
+        assert watermark_boxes(WatermarkConfig(text="W", tile=True), (400, 300)) == []
+
+    def test_boxes_empty_without_content(self):
+        from src.config import WatermarkConfig
+        from src.watermark_engine import watermark_boxes
+
+        assert watermark_boxes(WatermarkConfig(text="   "), (400, 300)) == []
+
+    def test_boxes_for_single_text(self):
+        from src.config import WatermarkConfig
+        from src.watermark_engine import watermark_boxes
+
+        cfg = WatermarkConfig(text="W", tile=False, position="bottom-right", margin=20)
+        boxes = watermark_boxes(cfg, (400, 300))
+        assert len(boxes) == 1 and boxes[0]["kind"] == "text"
+        x, y, w, h = boxes[0]["box"]
+        assert x >= 0 and y >= 0 and x + w <= 400 and y + h <= 300
+
+    def test_boxes_use_custom_percent(self):
+        """自定义定位的水印，命中框中心应落在给定百分比上"""
+        from src.config import WatermarkConfig
+        from src.watermark_engine import watermark_boxes
+
+        cfg = WatermarkConfig(
+            text="W", tile=False, position_mode="custom",
+            custom_x=25.5, custom_y=70.25,
+        )
+        x, y, w, h = watermark_boxes(cfg, (1000, 800))[0]["box"]
+        assert (x + w / 2) / 1000 * 100 == pytest.approx(25.5, abs=0.2)
+        assert (y + h / 2) / 800 * 100 == pytest.approx(70.25, abs=0.2)
+
+
+class TestPercentFormatting:
+    def test_format_percent(self):
+        from src.config import format_percent
+
+        assert format_percent(50) == "50"
+        assert format_percent(50.0) == "50"
+        assert format_percent(33.470000000000006) == "33.47"
+        assert format_percent(0.5) == "0.5"
+        assert format_percent("12.345") == "12.35"
+
+    def test_custom_coords_accept_decimals(self):
+        """
+        拖动写回的是小数百分比，校验器不能把它取整。
+
+        曾经规格表里 custom_x 标的是"整数"，3000px 宽的图上一步就是 30px，
+        与"完全自定义位置"的目标不符。
+        """
+        from src.validators import TEXT_FIELD_SPECS, clamp_number
+
+        value, corrected = clamp_number("33.47", TEXT_FIELD_SPECS["custom_x"])
+        assert value == pytest.approx(33.47)
+        assert corrected is False
+
+        # 越界仍然要夹住
+        assert clamp_number("150", TEXT_FIELD_SPECS["custom_x"])[0] == 100.0
 
 
 class TestWindowGeometryClamp:

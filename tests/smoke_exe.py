@@ -120,6 +120,16 @@ REQUIRED_SYMBOLS = [
     ("src.resource_budget", "PDF_PAGE_SLACK",
      "PDF 单页峰值系数 7.0（等效 28 B/px，实测 21~23）"),
 
+    # ---- v1.6.0：预览图上直接拖水印 ----
+    ("src.watermark_engine", "watermark_boxes",
+     "水印几何的单一来源（渲染 / 命中判定 / 拖拽共用）"),
+    ("src.watermark_engine", "custom_percent_for_anchor",
+     "像素 → 百分比反算（拖动写回坐标用）"),
+    ("src.watermark_engine", "build_watermark_sprite",
+     "水印精灵构造（预览拖动与渲染共用）"),
+    ("src.config", "format_percent",
+     "百分比格式化（拖动写回保留小数、去掉浮点噪声）"),
+
     # ---- 界面美化（v1.5 之后）----
     ("src.ui.app_window", "style_titlebar",
      "系统标题栏按皮肤上色（DWM 属性 34/35/36，Win11 22H2+）"),

@@ -108,6 +108,22 @@ CONFLICT_LABELS = {
 }
 
 
+def format_percent(value) -> str:
+    """
+    百分比数值 → 界面显示文本（去掉多余的 0，整数不带小数点）。
+
+    预览图上拖动水印时写回的是浮点百分比，直接 str() 会得到
+    "33.470000000000006" 这种噪声值；统一走这里，输入框里就是 33.47。
+    """
+    try:
+        num = round(float(value), 2)
+    except (TypeError, ValueError):
+        return str(value)
+    if num.is_integer():
+        return str(int(num))
+    return f"{num:.2f}".rstrip("0").rstrip(".")
+
+
 def opacity_to_alpha(percent) -> int:
     """
     不透明度(0-100) → alpha(0-255)。

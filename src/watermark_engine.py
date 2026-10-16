@@ -281,11 +281,22 @@ def anchor_position(
     return (x, y)
 
 
+def clamp_anchor(base_size: tuple, sprite_size: tuple, x, y) -> tuple:
+    """
+    把水印左上角夹进基图范围，返回夹取后的 (x, y)。
+
+    水印比基图还大时贴左上角（bw - sw 为负，min 之后再由 max 拉回 0）。
+    """
+    bw, bh = base_size
+    sw, sh = sprite_size
+    return max(0, min(int(x), bw - sw)), max(0, min(int(y), bh - sh))
+
+
 def custom_anchor_position(
     base_size: tuple[int, int],
     sprite_size: tuple[int, int],
-    x_pct: int,
-    y_pct: int,
+    x_pct: float,
+    y_pct: float,
 ) -> tuple[int, int]:
     """
     根据自定义百分比坐标计算水印左上角坐标。
@@ -293,7 +304,7 @@ def custom_anchor_position(
     Args:
         base_size: 基图尺寸 (width, height)
         sprite_size: 水印尺寸 (width, height)
-        x_pct: 水平位置百分比 (0=左边缘, 100=右边缘)
+        x_pct: 水平位置百分比 (0=左边缘, 100=右边缘)；小数可用
         y_pct: 垂直位置百分比 (0=上边缘, 100=下边缘)
 
     Returns:
@@ -306,11 +317,168 @@ def custom_anchor_position(
     x = int(bw * x_pct / 100) - sw // 2
     y = int(bh * y_pct / 100) - sh // 2
 
-    # 边界约束：确保水印不超出图片范围
-    x = max(0, min(x, bw - sw))
-    y = max(0, min(y, bh - sh))
+    # 边界约束：确保水印不超出图片范围（与 custom_percent_for_anchor 共用）
+    return clamp_anchor(base_size, sprite_size, x, y)
 
-    return (x, y)
+
+def custom_percent_for_anchor(
+    base_size: tuple[int, int],
+    sprite_size: tuple[int, int],
+    x, y,
+) -> tuple[float, float]:
+    """
+    反向换算：想让水印左上角落在 (x, y) 时，自定义百分比该取多少。
+
+    预览里"拖到哪里"就是靠这个把像素位移转成百分比的。夹取规则与
+    custom_anchor_position 共用同一个 clamp_anchor，所以：
+    - 拖出图片边界时数值会自己收敛，不会越拖越偏；
+    - 收敛到的位置与导出时完全一致（两边同一套规则）。
+
+    返回 (x_pct, y_pct)，可能带小数 —— 精度到 0.01% 时为亚像素级。
+    """
+    bw, bh = base_size
+    sw, sh = sprite_size
+    x, y = clamp_anchor(base_size, sprite_size, x, y)
+    return (x + sw / 2) / bw * 100, (y + sh / 2) / bh * 100
+
+
+def single_watermark_anchor(
+    base_size: tuple[int, int],
+    sprite_size: tuple[int, int],
+    cfg,
+    scale: float = 1.0,
+    prefix: str = "",
+) -> tuple[int, int]:
+    """
+    单点定位：水印左上角像素坐标（九宫格位置 / 自定义百分比）。
+
+    prefix 用来区分两套平行字段：文字水印用 ""（position / margin /
+    custom_x…），Logo 水印用 "logo_"。
+    """
+    pos_mode = getattr(cfg, f"{prefix}position_mode", "grid")
+    if pos_mode == "custom":
+        return custom_anchor_position(
+            base_size, sprite_size,
+            getattr(cfg, f"{prefix}custom_x", 50),
+            getattr(cfg, f"{prefix}custom_y", 50),
+        )
+    return anchor_position(
+        base_size, sprite_size,
+        getattr(cfg, f"{prefix}position", DEFAULT_POSITION),
+        scaled_px(getattr(cfg, f"{prefix}margin", 20), scale),
+    )
+
+
+def build_text_sprite(cfg, base_size: tuple[int, int], scale: float = 1.0):
+    """按 cfg 渲染文字水印精灵；文字为空/纯空白时返回 None。"""
+    if not cfg.text or not cfg.text.strip():
+        return None
+
+    # 字号（相对短边的百分比）。
+    # 字号下限也按 scale 换算：否则预览缩小时字号会被 12px 下限顶住，
+    # 显示出的字号比导出大（ratio 很小时能差 3 倍以上）
+    font_floor = max(1, scaled_px(MIN_FONT_PX, scale))
+    font_size = max(font_floor, int(min(base_size) * cfg.font_ratio))
+    font, _is_warning = load_font_with_fallback(cfg.font_path or None, font_size)
+
+    # 不透明度只有一个来源：opacity。这里取派生出的 alpha，
+    # 而不是直接用 cfg.color_rgba —— 后者可能与滑块值不一致
+    rgba = cfg.color_rgba
+    resolver = getattr(cfg, "resolved_color_rgba", None)
+    if callable(resolver):
+        rgba = resolver()
+
+    return _render_text_sprite(cfg.text, font, rgba, cfg.angle)
+
+
+def build_watermark_sprite(cfg, base_size: tuple[int, int], scale: float = 1.0,
+                           kind: str | None = None):
+    """
+    按配置生成水印精灵；无水印/内容无效时返回 None。
+
+    :param kind: "text" 或 "image" 指定要哪一个。两种水印可以同时存在
+                 （watermark_type == "both"），预览里拖动时要知道拖的是哪一个，
+                 所以允许显式指定；不指定则按 watermark_type 推断。
+    """
+    if kind is None:
+        wtype = getattr(cfg, "watermark_type", "text")
+        kind = "text" if wtype == "text" else "image"
+
+    if kind == "image":
+        return build_logo_sprite(cfg, base_size, scale)
+    return build_text_sprite(cfg, base_size, scale)
+
+
+def build_logo_sprite(cfg, base_size: tuple[int, int], scale: float = 1.0):
+    """按 cfg 加载并缩放 Logo 精灵；路径无效时返回 None。"""
+    import os
+
+    if not getattr(cfg, "logo_path", None) or not os.path.exists(cfg.logo_path):
+        return None
+
+    # with 确保源文件句柄及时释放 —— Windows 下否则会导致 Logo 文件无法移动/删除
+    with Image.open(cfg.logo_path) as src_logo:
+        src_logo.load()
+        logo = src_logo.convert("RGBA")
+
+    # 先裁掉 Logo 自带的透明边框：这样 scale_ratio 对应"看得见的宽度"，
+    # 也能避免带留白的 Logo 把平铺间距撑大
+    logo = crop_to_ink(logo)
+    target_w = max(
+        max(1, scaled_px(MIN_LOGO_PX, scale)), int(base_size[0] * cfg.scale_ratio)
+    )
+    target_h = max(1, int(logo.height * target_w / logo.width))
+    logo = logo.resize((target_w, target_h), Image.LANCZOS)
+
+    # 不透明度调节（仅缩放 alpha 通道，保留原透明底）
+    opacity_factor = cfg.logo_opacity / 100.0
+    if opacity_factor < 1.0:
+        alpha = logo.getchannel("A").point(lambda a: int(a * opacity_factor))
+        logo.putalpha(alpha)
+
+    # 旋转角度
+    logo_angle = getattr(cfg, "logo_angle", 0)
+    if logo_angle:
+        logo = logo.rotate(-logo_angle, expand=True, resample=Image.BICUBIC)
+        logo = crop_to_ink(logo)  # 旋转扩充出来的透明角同样要裁掉
+
+    return logo
+
+
+def watermark_boxes(cfg, base_size: tuple[int, int], scale: float = 1.0) -> list:
+    """
+    所有**可拖动**水印的矩形，从上层到下层排列（后画的在上，命中判定先试它）。
+
+    返回 [{"kind": "text"|"image", "prefix": str, "box": (x, y, w, h)}]；
+    平铺的水印不在其中 —— 平铺完全不用位置参数（从左上角按间距铺开），
+    没有"位置"可拖。
+
+    预览的命中判定与拖拽换算都走这里，与导出共用 single_watermark_anchor：
+    所以"拖到哪就导出到哪"是结构性保证，不靠两处代码各自保持同步。
+    """
+    out = []
+    wtype = getattr(cfg, "watermark_type", "text")
+
+    # Logo 在渲染顺序上后画（压在上面），命中判定要先试它
+    if wtype in ("image", "both") and not getattr(cfg, "logo_tile", False):
+        sprite = build_logo_sprite(cfg, base_size, scale)
+        if sprite is not None:
+            x, y = single_watermark_anchor(base_size, sprite.size, cfg, scale, "logo_")
+            out.append({
+                "kind": "image", "prefix": "logo_",
+                "box": (x, y, sprite.width, sprite.height),
+            })
+
+    if wtype in ("text", "both") and not getattr(cfg, "tile", False):
+        sprite = build_text_sprite(cfg, base_size, scale)
+        if sprite is not None:
+            x, y = single_watermark_anchor(base_size, sprite.size, cfg, scale, "")
+            out.append({
+                "kind": "text", "prefix": "",
+                "box": (x, y, sprite.width, sprite.height),
+            })
+
+    return out
 
 
 # ============================================================
@@ -481,27 +649,12 @@ def add_text_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Imag
                   平铺间距、边距、字号下限都按它换算，使预览与导出几何一致；
                   scale=1.0 即导出，与历史行为完全一致。
     """
-    # v4: 空字符串/纯空格容错
-    if not cfg.text or not cfg.text.strip():
+    # v4: 空字符串/纯空格容错（判断在 build_text_sprite 里，返回 None 即无水印）
+    sprite = build_text_sprite(cfg, base.size, scale)
+    if sprite is None:
         return base
 
     base = base.convert("RGBA")
-
-    # 计算字号（相对短边的百分比）。
-    # 字号下限也按 scale 换算：否则预览缩小时字号会被 12px 下限顶住，
-    # 显示出的字号比导出大（ratio 很小时能差 3 倍以上）
-    font_floor = max(1, scaled_px(MIN_FONT_PX, scale))
-    font_size = max(font_floor, int(min(base.size) * cfg.font_ratio))
-    font, is_warning = load_font_with_fallback(cfg.font_path or None, font_size)
-
-    # 渲染文字 sprite
-    # 不透明度只有一个来源：opacity。这里取派生出的 alpha，
-    # 而不是直接用 cfg.color_rgba —— 后者可能与滑块值不一致
-    rgba = cfg.color_rgba
-    resolver = getattr(cfg, "resolved_color_rgba", None)
-    if callable(resolver):
-        rgba = resolver()
-    sprite = _render_text_sprite(cfg.text, font, rgba, cfg.angle)
 
     # 创建透明覆盖层
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -514,16 +667,8 @@ def add_text_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Imag
             cfg.stagger,
         )
     else:
-        # 单次定位（支持九宫格 / 自定义坐标）
-        pos_mode = getattr(cfg, 'position_mode', 'grid')
-        if pos_mode == "custom":
-            cx = getattr(cfg, 'custom_x', 50)
-            cy = getattr(cfg, 'custom_y', 50)
-            x, y = custom_anchor_position(base.size, sprite.size, cx, cy)
-        else:
-            x, y = anchor_position(
-                base.size, sprite.size, cfg.position, scaled_px(cfg.margin, scale)
-            )
+        # 单次定位（九宫格 / 自定义坐标）—— 与预览的命中判定共用同一个函数
+        x, y = single_watermark_anchor(base.size, sprite.size, cfg, scale, "")
         # alpha_composite 而非 paste(..., sprite)：见 tile_grid 中的说明
         overlay.alpha_composite(sprite, (x, y))
 
@@ -544,35 +689,15 @@ def add_image_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Ima
     """
     import os
 
-    # Logo 路径有效性检查
+    # Logo 路径有效性检查（加载/缩放细节在 build_logo_sprite 里，返回 None 即跳过）
     if not getattr(cfg, 'logo_path', None) or not os.path.exists(cfg.logo_path):
         return base
 
+    logo = build_logo_sprite(cfg, base.size, scale)
+    if logo is None:
+        return base
+
     base = base.convert("RGBA")
-
-    # 加载并缩放 Logo
-    # with 确保源文件句柄及时释放 —— Windows 下否则会导致 Logo 文件无法移动/删除
-    with Image.open(cfg.logo_path) as src_logo:
-        src_logo.load()
-        logo = src_logo.convert("RGBA")
-    # 先裁掉 Logo 自带的透明边框：这样 scale_ratio 对应"看得见的宽度"，
-    # 也能避免带留白的 Logo 把平铺间距撑大
-    logo = crop_to_ink(logo)
-    target_w = max(max(1, scaled_px(MIN_LOGO_PX, scale)), int(base.width * cfg.scale_ratio))
-    target_h = max(1, int(logo.height * target_w / logo.width))
-    logo = logo.resize((target_w, target_h), Image.LANCZOS)
-
-    # 不透明度调节（仅缩放 alpha 通道，保留原透明底）
-    opacity_factor = cfg.logo_opacity / 100.0
-    if opacity_factor < 1.0:
-        alpha = logo.getchannel("A").point(lambda a: int(a * opacity_factor))
-        logo.putalpha(alpha)
-
-    # 旋转角度
-    logo_angle = getattr(cfg, 'logo_angle', 0)
-    if logo_angle:
-        logo = logo.rotate(-logo_angle, expand=True, resample=Image.BICUBIC)
-        logo = crop_to_ink(logo)  # 旋转扩充出来的透明角同样要裁掉
 
     # 创建透明覆盖层
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -585,17 +710,8 @@ def add_image_watermark(base: Image.Image, cfg, scale: float = 1.0) -> Image.Ima
             getattr(cfg, 'logo_stagger', False),
         )
     else:
-        # 单次定位（支持九宫格 / 自定义坐标）
-        pos_mode = getattr(cfg, 'logo_position_mode', 'grid')
-        if pos_mode == "custom":
-            cx = getattr(cfg, 'logo_custom_x', 50)
-            cy = getattr(cfg, 'logo_custom_y', 50)
-            x, y = custom_anchor_position(base.size, logo.size, cx, cy)
-        else:
-            x, y = anchor_position(
-                base.size, logo.size, cfg.logo_position,
-                scaled_px(cfg.logo_margin, scale),
-            )
+        # 单次定位（九宫格 / 自定义坐标）—— 与预览的命中判定共用同一个函数
+        x, y = single_watermark_anchor(base.size, logo.size, cfg, scale, "logo_")
         # alpha_composite 而非 paste(..., logo)：见 tile_grid 中的说明
         overlay.alpha_composite(logo, (x, y))
 

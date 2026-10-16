@@ -904,6 +904,31 @@ def main():
         app._quality_value_label.cget("text") == "72",
     )
 
+    # 预览图上拖动水印：接口在不在、默认会不会误拦截平移。
+    # 真实拖动行为由 test_core 的几何单测 + 人工验证覆盖（这里没有真鼠标）
+    pc = app._preview_canvas
+    check("预览具备水印命中判定与拖动入口",
+          callable(getattr(pc, "_wm_hit_test", None))
+          and callable(getattr(pc, "_wm_drag_begin", None)))
+    check("空闲时没有可拖动水印残留、不拦截平移",
+          pc._wm_drag is None and pc._wm_hit_test(5, 5) is None)
+    check("两个面板都提供 set_custom_position 入口",
+          callable(getattr(app._text_panel, "set_custom_position", None))
+          and callable(getattr(app._image_panel, "set_custom_position", None)))
+
+    # 拖动写回：自动切"自定义"，且小数不被取整（精度要求）
+    app._text_panel.set_custom_position(33.47, 66.13)
+    app.update()
+    check(
+        "拖动写回坐标：切自定义且保留两位小数",
+        app._text_panel._pos_mode_var.get() == "custom"
+        and app._text_panel._custom_x_var.get() == "33.47"
+        and app._text_panel._custom_y_var.get() == "66.13",
+        f"mode={app._text_panel._pos_mode_var.get()} "
+        f"x={app._text_panel._custom_x_var.get()} "
+        f"y={app._text_panel._custom_y_var.get()}",
+    )
+
     head("负路径：只测成功路径才会漏掉的那些")
     # 本节四条都对应一次真实事故。共同点：异常发生在 tkinter 回调或工作线程里，
     # 只进 stderr —— 冒烟即使全绿也发现不了，必须主动构造失败场景来验。

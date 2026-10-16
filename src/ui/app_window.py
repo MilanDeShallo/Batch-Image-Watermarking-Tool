@@ -472,6 +472,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self._preview_canvas = PreviewCanvas(
             center_frame, on_config_changed=self._get_current_config,
             on_page_changed=self._on_preview_page_changed,
+            on_watermark_moved=self._on_watermark_moved,
         )
         self._preview_canvas.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -1212,6 +1213,19 @@ class AppWindow(ctk.CTk, DnDWrapper):
     def _on_preview_page_changed(self, page_index: int):
         """预览翻页 → 面板切换到该页的专属参数"""
         self._sync_panels_to_target()
+
+    def _on_watermark_moved(self, kind: str, x_pct: float, y_pct: float):
+        """
+        预览图上拖动水印 → 写回对应面板（面板会顺带切到"自定义"定位）。
+
+        只走面板自己的提交通道：作用范围（全部 / 本文件 / 本页）、
+        "预设已修改"标记、预览刷新全部沿用既有逻辑，不新增任何语义。
+        也就是说——拖出来的坐标与手输坐标在这个程序里没有任何区别。
+        """
+        panel = self._image_panel if kind == "image" else self._text_panel
+        setter = getattr(panel, "set_custom_position", None)
+        if callable(setter):
+            setter(x_pct, y_pct)
 
     def _is_pdf_selected(self) -> bool:
         """当前选中的是否 PDF"""

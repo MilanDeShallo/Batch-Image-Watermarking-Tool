@@ -23,7 +23,9 @@ from __future__ import annotations
 import customtkinter as ctk
 from typing import Callable, Optional
 
-from src.config import WatermarkConfig, normalize_position, opacity_to_alpha
+from src.config import (
+    WatermarkConfig, format_percent, normalize_position, opacity_to_alpha,
+)
 from src.ui import theme
 
 # 九宫格位置定义
@@ -396,6 +398,23 @@ class TextWatermarkPanel(ctk.CTkFrame):
                 )
         self._notify_change()
 
+    def set_custom_position(self, x_pct: float, y_pct: float):
+        """
+        由预览图上拖动水印写入坐标（公开入口，主窗口调用）。
+
+        顺带把定位切到"自定义"：拖动本身就表示用户要的是一个任意位置，
+        留着九宫格会让面板参数与实际画面不符。
+        写入走的是面板自己的提交通道，所以作用范围（全部/本文件/本页）
+        与手输坐标完全一致，不新增语义。
+        """
+        self._custom_x_var.set(format_percent(x_pct))
+        self._custom_y_var.set(format_percent(y_pct))
+        if self._pos_mode_var.get() != "custom":
+            self._pos_mode_var.set("custom")
+            self._on_pos_mode_changed()    # 内部会 notify，别重复触发
+        else:
+            self._notify_change()
+
     def _on_pos_mode_changed(self):
         """位置模式切换：九宫格 / 自定义坐标"""
         mode = self._pos_mode_var.get()
@@ -509,8 +528,10 @@ class TextWatermarkPanel(ctk.CTkFrame):
         else:
             cx = getattr(cfg, 'custom_x', 50)
             cy = getattr(cfg, 'custom_y', 50)
-            self._custom_x_var.set(str(cx))
-            self._custom_y_var.set(str(cy))
+            # 用 format_percent 而不是 str()：拖出来的坐标是浮点，
+            # str() 会出现 33.470000000000006 这种噪声值
+            self._custom_x_var.set(format_percent(cx))
+            self._custom_y_var.set(format_percent(cy))
 
         # 边距
         margin = getattr(cfg, 'margin', 20)
