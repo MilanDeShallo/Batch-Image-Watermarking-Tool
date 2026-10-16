@@ -186,7 +186,7 @@ PDF 与图片可混合拖入同一批次，各自按对应引擎处理；选择 
 
 ### 方式一：使用打包好的 exe（推荐普通用户）
 
-1. 从 [Releases](https://github.com/MilanDeShallo/Batch-Image-Watermarking-Tool/releases/latest) 下载 `WatermarkTool-vX.Y.zip` 并解压。
+1. 从 [Releases](https://github.com/MilanDeShallow/Batch-Image-Watermarking-Tool/releases/latest) 下载 `WatermarkTool-vX.Y.zip` 并解压。
 2. 运行 `批量图片水印工具.exe`（或在项目根目录双击 `打开水印工具.bat`）。
 3. 拖入图片或 PDF，点击「添加文件」即可开始。
 
