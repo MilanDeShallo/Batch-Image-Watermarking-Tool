@@ -97,6 +97,97 @@ def _asset_path(name: str) -> str:
     return os.path.join(base, "assets", name)
 
 
+def _work_area_size(window) -> tuple:
+    """
+    屏幕可用区域（去掉任务栏），单位与 winfo_screenwidth 一致（物理像素）。
+
+    Windows 用 SPI_GETWORKAREA；拿不到就退回整屏尺寸 ——
+    宁可夹得保守一点，也不能因为取不到工作区就完全不夹。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        # SPI_GETWORKAREA = 0x0030
+        if ctypes.windll.user32.SystemParametersInfoW(
+            0x0030, 0, ctypes.byref(rect), 0
+        ):
+            w = int(rect.right - rect.left)
+            h = int(rect.bottom - rect.top)
+            if w > 0 and h > 0:
+                return w, h
+    except Exception:
+        pass
+    return int(window.winfo_screenwidth()), int(window.winfo_screenheight())
+
+
+def _tk_units_scale(window) -> float:
+    """
+    物理像素 → Tk 单位的换算系数（物理 = Tk单位 × 系数）。
+
+    这个项目里同时存在两套长度单位，混用会让窗口差一个缩放倍数：
+    - `winfo_width/height/x/y`：**物理像素**
+    - `geometry("WxH+X+Y")`、`winfo_screenwidth/height`：**Tk 单位**
+    150% 缩放下两者差 1.5 倍。把物理值直接喂给 geometry()，窗口就会比
+    预期大一半，随后被 Tk 夹到整屏大小 —— 表现为"窗口自己变成了全屏"。
+    """
+    try:
+        from customtkinter import ScalingTracker
+
+        scale = float(ScalingTracker.get_window_scaling(window))
+        if scale > 0:
+            return scale
+    except Exception:
+        pass
+    return 1.0
+
+
+def physical_to_tk_size(w, h, scale) -> tuple:
+    """
+    把**物理像素尺寸**换算成 Tk 单位（geometry() 收的那种）。
+
+    Tk 在 Windows 上两组 winfo 的单位不一样，实测（150% 缩放、设定 800x600）：
+        winfo_width/height  → 1425x930  （物理像素）
+        winfo_x/y           → 100x150   （与传入的 geometry 偏移一致 = Tk 单位）
+        winfo_screenwidth   → 1707      （Tk 单位）
+        geometry('WxH')     → 950x620   （Tk 单位）
+    所以：**尺寸要换算、位置不用换算**。搞反任何一个，窗口都会在
+    每次启动之间漂移或放大（实测放大 1.5 倍后被 Tk 夹到整屏）。
+    """
+    scale = float(scale) if scale and float(scale) > 0 else 1.0
+    return int(round(int(w) / scale)), int(round(int(h) / scale))
+
+
+def fit_window_geometry(w, h, x, y, work_w, work_h) -> tuple:
+    """
+    把"要恢复的窗口几何"夹到屏幕可用区域内，返回 (w, h, x, y)
+    （x / y 保持 None 表示"不指定位置"，交由系统居中）。
+
+    为什么必须夹：窗口尺寸与位置是原样存盘、原样恢复的，但用户会
+    - 在**最大化**状态下关掉窗口（存下来的就是屏幕那么大的尺寸），
+    - 或者换过显示器、改过分辨率 / 缩放。
+    于是下次恢复时窗口比屏幕还大：右边缘与底部跑到屏幕外，
+    标题栏的最小化/关闭按钮被裁掉一半 —— 点起来很别扭。
+
+    位置要在**夹完尺寸之后**再夹一次：原来只校验了"别跑太远"，
+    可就算 x 合理，配上和屏幕等宽的 w 一样会把右边缘顶出去。
+
+    单位：调用方保证 w/h/x/y 与 work_w/work_h 是**同一套单位**
+    （_restore_window_geometry 里统一用 Tk 单位传入）。
+    """
+    w = max(950, int(w))
+    h = max(620, int(h))
+    if work_w > 0 and work_h > 0:
+        w = min(w, int(work_w))
+        h = min(h, int(work_h))
+    if x is not None:
+        x = max(0, min(int(x), max(0, int(work_w) - w)))
+    if y is not None:
+        y = max(0, min(int(y), max(0, int(work_h) - h)))
+    return w, h, x, y
+
+
 def _apply_window_icon(window) -> bool:
     """
     设置窗口图标（缺文件也不影响启动 —— 图标不是功能）。
@@ -227,13 +318,18 @@ class AppWindow(ctk.CTk, DnDWrapper):
         self.after(500, self._check_crash_recovery)
 
     def _center_window(self):
-        """将窗口居中显示在屏幕上"""
+        """
+        首次启动（没有存过几何）时把窗口居中。
+
+        尺寸直接用应用常量，不要去问 winfo_width：这时窗口还没真正映射，
+        Tk 报回来的是**最小尺寸**（实测 950×620），会把默认窗口做小一圈。
+        这里的单位是 Tk 单位（与 CTk 的逻辑像素一致），正是 geometry() 要的。
+        """
         self.update_idletasks()
-        w = self.winfo_width()
-        h = self.winfo_height()
+        w, h = self.WINDOW_WIDTH, self.WINDOW_HEIGHT
         x = (self.winfo_screenwidth() // 2) - (w // 2)
         y = (self.winfo_screenheight() // 2) - (h // 2)
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
 
     def _build_ui(self):
         """构建可拖动分隔线布局"""
@@ -763,25 +859,40 @@ class AppWindow(ctk.CTk, DnDWrapper):
             with open(LAYOUT_FILE, 'r', encoding='utf-8') as f:
                 layout = json.load(f)
 
-            w = max(950, layout.get("win_width", self.WINDOW_WIDTH))
-            h = max(620, layout.get("win_height", self.WINDOW_HEIGHT))
+            # 单位：文件里 win_width/height 是物理像素（winfo_width 给的），
+            # win_x/y 与 geometry()、winfo_screenwidth 同为 Tk 单位 ——
+            # Tk 这两组 winfo 单位确实不同，详见 physical_to_tk_size 的说明。
+            scale = _tk_units_scale(self)
+            w, h = physical_to_tk_size(
+                max(950, layout.get("win_width", self.WINDOW_WIDTH * scale)),
+                max(620, layout.get("win_height", self.WINDOW_HEIGHT * scale)),
+                scale,
+            )
             x = layout.get("win_x", None)
             y = layout.get("win_y", None)
 
-            # 校验坐标在屏幕内（多显示器场景）
+            # 屏幕可用区域（物理）→ Tk 单位，后面所有比较都在同一套单位里做
+            work_w, work_h = _work_area_size(self)
+            work_w, work_h = int(work_w / scale), int(work_h / scale)
+
+            # 校验坐标在屏幕内（多显示器 / 换过显示器、拔掉外接屏等）
             if x is not None and y is not None:
-                # 确保窗口至少有一部分在屏幕内
-                screen_w = self.winfo_screenwidth()
-                screen_h = self.winfo_screenheight()
-                if x < -w + 100 or x > screen_w - 100:
+                if x < -w + 100 or x > work_w - 100:
                     x = None
-                if y < 0 or y > screen_h - 100:
+                if y < 0 or y > work_h - 100:
                     y = None
 
-            if x is not None and y is not None:
-                self.geometry(f"{w}x{h}+{x}+{y}")
-            else:
-                self.geometry(f"{w}x{h}")
+            # 没有（或已失效的）位置就居中：交给系统放置会落在默认的层叠位置
+            # （实测 38,38），看起来像"窗口随手丢在角落"
+            if x is None or y is None:
+                x = max(0, (self.winfo_screenwidth() // 2) - (w // 2))
+                y = max(0, (self.winfo_screenheight() // 2) - (h // 2))
+
+            # 尺寸与位置一起夹进可用区域：最大化状态下关窗、换显示器或改缩放，
+            # 都会存下比屏幕还大的尺寸，恢复出来窗口就有一半在屏幕外
+            w, h, x, y = fit_window_geometry(w, h, x, y, work_w, work_h)
+
+            self.geometry(f"{w}x{h}+{x}+{y}")
             self.update_idletasks()
             return True
         except Exception:
@@ -844,8 +955,15 @@ class AppWindow(ctk.CTk, DnDWrapper):
             pass
 
     def _save_layout(self):
-        """保存当前布局比例与主题到 ui_layout.json"""
+        """保存当前布局比例与窗口几何到 ui_layout.json"""
         try:
+            # 最大化 / 最小化时不保存：Tk 的分隔条停在原来的像素位置，
+            # 而窗口尺寸已经变了 —— 两者一除，"比例"就被摊薄
+            # （实测最大化后左栏存成 8.6%，正常应该是 24%），
+            # 存下去等于把用户亲手调好的布局毁掉。保持上次正常状态的数据。
+            if str(self.state()) in ("zoomed", "iconic"):
+                return
+
             total_w = self._hpaned.winfo_width()
             total_h = self._vpaned.winfo_height()
 
@@ -856,6 +974,9 @@ class AppWindow(ctk.CTk, DnDWrapper):
             # 不该因为"面板还没量出宽度"就一起丢掉。
             # 旧实现是直接 return，于是"只切主题、不动面板就关窗"时选择留不下来。
             if total_w > 1 and total_h > 1:
+                # 注意单位：win_width/height 是物理像素，win_x/y 是 Tk 单位
+                # （Tk 在 Windows 上这两组 winfo 单位不同，见 physical_to_tk_size）。
+                # 恢复端按同样的口径解读，改这里要同步改 _restore_window_geometry
                 layout["win_width"] = self.winfo_width()
                 layout["win_height"] = self.winfo_height()
                 layout["win_x"] = self.winfo_x()

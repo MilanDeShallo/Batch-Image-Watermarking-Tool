@@ -574,6 +574,84 @@ class TestThemePalette:
         assert _colorref("#FFFFFF") == 0xFFFFFF
 
 
+# ==================== 窗口几何夹取 ====================
+
+
+class TestWindowGeometryClamp:
+    """
+    fit_window_geometry 的边界。
+
+    窗口尺寸与位置是原样存盘、原样恢复的 —— 用户只要在最大化状态下关一次
+    窗口，存下来的就是"屏幕那么大"的尺寸；换显示器或改缩放同理。
+    实测：存成 2564×1570 而工作区只有 2560×1528，下次打开右边缘与底部
+    跑到屏幕外，标题栏按钮被裁掉一半。
+    """
+
+    def test_size_larger_than_work_area_is_clamped(self):
+        from src.ui.app_window import fit_window_geometry
+
+        assert fit_window_geometry(2564, 1570, 38, 38, 2560, 1528) == (
+            2560, 1528, 0, 0
+        )
+
+    def test_normal_geometry_untouched(self):
+        from src.ui.app_window import fit_window_geometry
+
+        assert fit_window_geometry(1340, 880, 40, 30, 2560, 1528) == (
+            1340, 880, 40, 30
+        )
+
+    def test_position_pulled_back_so_window_fits(self):
+        """x 本身"不离谱"，但配上屏幕宽的 w 仍会把右边缘顶出去"""
+        from src.ui.app_window import fit_window_geometry
+
+        assert fit_window_geometry(2000, 900, 1500, 700, 2560, 1528)[2:] == (
+            560, 628,
+        )
+
+    def test_min_size_floor(self):
+        from src.ui.app_window import fit_window_geometry
+
+        assert fit_window_geometry(10, 10, None, None, 2560, 1528)[:2] == (
+            950, 620,
+        )
+
+    def test_none_position_stays_none(self):
+        """没存过位置就不要凭空造坐标（留给系统居中）"""
+        from src.ui.app_window import fit_window_geometry
+
+        assert fit_window_geometry(1200, 800, None, None, 2560, 1528) == (
+            1200, 800, None, None,
+        )
+
+    def test_zero_work_area_skips_size_clamp(self):
+        """取不到屏幕尺寸（0）时不能把窗口夹成 0"""
+        from src.ui.app_window import fit_window_geometry
+
+        assert fit_window_geometry(1200, 800, 10, 10, 0, 0)[:2] == (1200, 800)
+
+    def test_physical_to_tk_size(self):
+        """
+       物理像素尺寸 ÷ 缩放 = Tk 单位（geometry() 收的那种）。
+
+        Tk 在 Windows 上两组 winfo 单位不同：winfo_width/height 是物理像素，
+        winfo_x/y 与 geometry() 的偏移同为 Tk 单位。少了这一步，
+        150% 缩放下窗口会大 1.5 倍，然后被 Tk 夹到整屏大小
+        （用户看到的就是"窗口自己变成了全屏"，且再也回不到正常尺寸）。
+        """
+        from src.ui.app_window import physical_to_tk_size
+
+        assert physical_to_tk_size(1725, 1170, 1.5) == (1150, 780)
+        assert physical_to_tk_size(1425, 930, 1.5) == (950, 620)
+
+    def test_physical_to_tk_size_handles_bad_scale(self):
+        """缩放系数拿不到（0/None）时按 1:1 处理，不能除零"""
+        from src.ui.app_window import physical_to_tk_size
+
+        assert physical_to_tk_size(1200, 800, 0) == (1200, 800)
+        assert physical_to_tk_size(1200, 800, None) == (1200, 800)
+
+
 # ==================== 运行入口 ====================
 
 if __name__ == "__main__":

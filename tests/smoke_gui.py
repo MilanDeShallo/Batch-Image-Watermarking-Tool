@@ -886,6 +886,16 @@ def main():
         f"实际绑定脚本 {_script!r}",
     )
 
+    # 窗口不能大过屏幕可用区域：曾经存成 2564×1570 而工作区只有 2560×1528，
+    # 恢复出来的窗口右边缘与底部跑到屏幕外，标题栏按钮被裁掉一半
+    from src.ui.app_window import _work_area_size
+    _work_w, _work_h = _work_area_size(app)
+    check(
+        "窗口尺寸不超过屏幕可用区域",
+        app.winfo_width() <= _work_w and app.winfo_height() <= _work_h,
+        f"窗口 {app.winfo_width()}x{app.winfo_height()} / 工作区 {_work_w}x{_work_h}",
+    )
+
     # 质量标签：IntVar.set 不触发 CTkSlider 的 command，必须手动同步
     app._quality_var.set(72)
     app._quality_value_label.configure(text="72")
