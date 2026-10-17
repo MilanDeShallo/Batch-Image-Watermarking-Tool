@@ -47,9 +47,23 @@ MAX_IMAGE_PIXELS = 300_000_000
 # 可批量处理的输入扩展名（小写，含 PDF）。
 # 注意这里是"输入"而不是"图片"：PDF 也会被收集进来，
 # 只是走不同的处理分支（见 batch_planner）。
+#
+# 视频**不在**这个集合里 —— is_image_file() 用它判断"能否走 Pillow 路径"，
+# 把 .mp4 放进来会让视频被当成图片交给 Pillow 打开。视频单独放在
+# VIDEO_EXTENSIONS，两者合起来才是"程序接受的全部输入"（ACCEPTED_EXTENSIONS）。
 SUPPORTED_EXTENSIONS = frozenset({
     ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".pdf",
 })
+
+# 可加视频水印的扩展名。
+# 刻意不含 .gif：它是动图，按图片处理更合理（多帧视频化会丢色彩与透明度）。
+VIDEO_EXTENSIONS = frozenset({
+    ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm",
+    ".flv", ".wmv", ".mpg", ".mpeg", ".ts", ".m2ts",
+})
+
+# 程序接受的全部输入（文件对话框过滤、拖放、目录扫描都用它）
+ACCEPTED_EXTENSIONS = SUPPORTED_EXTENSIONS | VIDEO_EXTENSIONS
 
 # 九宫格位置的规范写法（垂直分量只有 top / middle / bottom）
 DEFAULT_POSITION = "bottom-right"

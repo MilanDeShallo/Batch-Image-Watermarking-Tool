@@ -30,6 +30,7 @@ import time
 import os
 
 from src.ui import theme
+from src.video_engine import format_time, is_video_file
 
 
 class PreviewCanvas(ctk.CTkFrame):
@@ -43,6 +44,10 @@ class PreviewCanvas(ctk.CTkFrame):
 
     DEBOUNCE_MS = 150
     ZOOM_THROTTLE_MS = 50
+    # 拖动视频时间轴的抽帧防抖。
+    # 比普通参数防抖长一些：抽一帧要起一次 ffmpeg 进程（1080p 约 80~200ms），
+    # 按 150ms 的节奏抽帧会排队，滑块反而跟手变卡。
+    VIDEO_SEEK_MS = 260
 
     def __init__(self, parent, on_config_changed=None, on_page_changed=None,
                  on_watermark_moved=None, **kwargs):
@@ -75,6 +80,15 @@ class PreviewCanvas(ctk.CTkFrame):
         self._base_scale = 1.0
         self._base_page_count = None   # PDF 总页数（随之缓存，避免重复解析）
         self._base_page_index = 0      # 底图对应的页码（已夹到合法范围）
+
+        # 视频预览状态。
+        # _video_time 是"当前预览到第几秒"，进底图缓存键 —— 拖时间轴就是换这一帧。
+        # _video_info 在选中文件时探测一次（主线程，约 100ms），
+        # 之后底图准备、时间轴上限都复用它，不再重复 ffprobe。
+        self._video_time = 0.0
+        self._video_duration = 0.0
+        self._video_info = None
+        self._video_seek_timer = None
 
         # 显示缓存：显示图只在 (画布尺寸, 缩放, 渲染版本) 变化时重采样
         self._display_key = None
@@ -252,6 +266,34 @@ class PreviewCanvas(ctk.CTkFrame):
             font=("Microsoft YaHei", 10),
         )
         self._pdf_marked_label.pack(side="left", padx=(12, 2))
+
+        # ---- 视频时间轴（仅视频文件时显示） ----
+        # 与 PDF 翻页栏共用 row=2：同一个文件不可能既是 PDF 又是视频，
+        # 两者互斥显示，不额外占用预览区高度。
+        # 拖动滑块 → 抽该秒的画面当底图 → 水印照常叠加，于是"后面那一帧长什么样"
+        # 与首帧完全一样地可见、可拖。
+        self._video_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self._video_bar.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self._video_bar.grid_remove()  # 初始隐藏
+
+        self._video_time_var = ctk.StringVar(value="00:00")
+        ctk.CTkLabel(
+            self._video_bar, textvariable=self._video_time_var, width=46,
+            font=("Consolas", 11),
+        ).pack(side="left")
+
+        self._video_slider = ctk.CTkSlider(
+            self._video_bar, from_=0, to=1, number_of_steps=1000,
+            height=18, command=self._on_video_seek,
+        )
+        self._video_slider.pack(side="left", fill="x", expand=True, padx=10)
+        self._video_slider.set(0)
+
+        self._video_duration_label = ctk.CTkLabel(
+            self._video_bar, text="00:00", width=46,
+            text_color=theme.TEXT_MUTED, font=("Consolas", 11),
+        )
+        self._video_duration_label.pack(side="left")
 
     # ==================== 缩放 ====================
 
@@ -742,8 +784,16 @@ class PreviewCanvas(ctk.CTkFrame):
             self._pdf_page = 0
             self._pdf_page_count = None
             self._pan_offset = (0, 0)
+            # 视频也回到开头：沿用上一条片子停在的秒数，
+            # 换文件后会莫名其妙地看到"第 12 秒"，而那条片子可能只有 5 秒
+            self._video_time = 0.0
+            self._video_duration = 0.0
+            self._video_info = None
         self.current_image_path = image_path
+        if self._is_video():
+            self._load_video_info(image_path)
         self._update_pdf_bar()
+        self._update_video_bar()
         self._schedule_refresh()
 
     def request_refresh(self):
@@ -757,8 +807,13 @@ class PreviewCanvas(ctk.CTkFrame):
         self._pdf_page = 0
         self._pdf_page_count = None
         self._pan_offset = (0, 0)
+        self._video_time = 0.0
+        self._video_duration = 0.0
+        self._video_info = None
         self._cancel_debounce()
+        self._cancel_video_seek()
         self._update_pdf_bar()
+        self._update_video_bar()
         self._show_placeholder("拖入图片后在此预览水印效果")
 
     @property
@@ -853,6 +908,88 @@ class PreviewCanvas(ctk.CTkFrame):
             self._pdf_jump_entry.delete(0, "end")
             self._pdf_jump_entry.insert(0, str(self._pdf_page + 1))
 
+    # ==================== 视频时间轴 ====================
+
+    def _is_video(self) -> bool:
+        """当前预览的文件是否为视频"""
+        return bool(self.current_image_path) and is_video_file(self.current_image_path)
+
+    @property
+    def current_video_time(self) -> float:
+        """当前预览的秒数（非视频恒为 0）"""
+        return self._video_time if self._is_video() else 0.0
+
+    def _load_video_info(self, path: str):
+        """
+        探测视频时长（一次性）。
+
+        为什么在 set_image 里同步做：时间轴的右端得立刻显示总时长，
+        否则用户看到的是一根"长度未知"的滑块。一次 ffprobe 约 100ms，
+        落在刚点完文件的那一下，感知不到。
+        """
+        from src.video_engine import probe_video
+
+        try:
+            info = probe_video(path)
+            self._video_info = info
+            self._video_duration = max(0.1, float(info.duration or 0.0))
+        except Exception:
+            # 探测失败不该挡住界面：时间轴退化成"只有 0 秒"，
+            # 首帧预览仍会走 _prepare_base 里的兜底路径
+            self._video_info = None
+            self._video_duration = 0.0
+
+    def _update_video_bar(self):
+        """刷新时间轴的显示、上限与两端时间文字"""
+        if not self._is_video():
+            self._video_bar.grid_remove()
+            return
+
+        self._video_bar.grid()
+        duration = max(0.5, self._video_duration)
+        self._video_slider.configure(to=duration)
+        self._video_slider.set(min(self._video_time, duration))
+        self._video_time_var.set(format_time(self._video_time))
+        self._video_duration_label.configure(text=format_time(self._video_duration))
+
+    def _on_video_seek(self, value):
+        """
+        拖动时间轴：先更新时间文字，防抖之后再抽帧。
+
+        文字必须即时响应 —— 等抽帧完成才刷文字的话，拖动会明显滞后，
+        而"拖到第几秒"这件事本身根本不需要等 ffmpeg。
+        """
+        try:
+            self._video_time = max(0.0, float(value))
+        except (TypeError, ValueError):
+            return
+
+        self._video_time_var.set(format_time(self._video_time))
+        self._cancel_video_seek()
+        self._video_seek_timer = self.after(self.VIDEO_SEEK_MS, self._apply_video_seek)
+
+    def _apply_video_seek(self):
+        """
+        真正抽帧：丢掉旧底图并立即重渲染。
+
+        必须 invalidate：缓存键里虽然带了时间点（不会取到错帧），
+        但旧帧（1080p RGBA 约 8MB，4K 约 33MB）会一直挂在内存里，
+        连续拖十几次白占几百 MB。
+        """
+        self._video_seek_timer = None
+        if not self._is_video():
+            return
+        self._invalidate_base()
+        self._schedule_refresh(immediate=True)
+
+    def _cancel_video_seek(self):
+        if self._video_seek_timer:
+            try:
+                self.after_cancel(self._video_seek_timer)
+            except Exception:
+                pass
+            self._video_seek_timer = None
+
     # ==================== 内部 ====================
 
     def _schedule_refresh(self, immediate: bool = False):
@@ -920,10 +1057,13 @@ class PreviewCanvas(ctk.CTkFrame):
         参考分辨率 = 导出时使用的尺寸：
         - 图片 → 原图像素尺寸
         - PDF  → 页面可视尺寸 × OVERLAY_SCALE（覆盖层底图尺寸）
+        - 视频 → 转正后的显示尺寸（与 ffmpeg 输出、覆盖层尺寸完全一致）；
+                 取的是"当前时间点"那一帧，拖时间轴只换帧、不换参考尺寸
         scale = 工作图宽度 / 参考宽度，交给引擎换算绝对像素类参数，
         使预览与导出的水印几何一致。
         """
         is_pdf = path.lower().endswith(".pdf")
+        is_video = is_video_file(path)
         # 覆盖层倍率也进缓存键：调过 set_overlay_scale 之后参考尺寸会变，
         # 不带上它就会命中一份"口径已经过期"的底图，
         # 表现为改了倍率但预览纹丝不动（导出却变了）
@@ -932,7 +1072,10 @@ class PreviewCanvas(ctk.CTkFrame):
             from src.pdf_engine import get_overlay_scale
             overlay_scale = get_overlay_scale()
 
-        key = (path, int(pdf_page), int(target_dim), overlay_scale)
+        # 视频的时间点同样进缓存键：拖到第 3 秒就该拿到第 3 秒的帧，
+        # 而不是复用第 0 秒的底图（那会让滑块看起来完全没生效）
+        video_time = round(self._video_time, 2) if is_video else 0.0
+        key = (path, int(pdf_page), int(target_dim), overlay_scale, video_time)
         with self._base_lock:
             if self._base_key == key and self._base_work is not None:
                 return self._base_work, self._base_ref, self._base_scale
@@ -957,6 +1100,18 @@ class PreviewCanvas(ctk.CTkFrame):
             # 渲染倍率按参考尺寸折算：目标工作尺寸 ÷ 覆盖层底图尺寸 × 覆盖层倍率
             render_scale = overlay_scale * (target_dim / max(ref_size))
             img = render_pdf_page(path, page_num=pdf_page, scale=render_scale)
+        elif is_video:
+            # 视频用"当前时间点的那一帧"当静态底图：水印位置/平铺与时间无关，
+            # 所以"在这一帧上摆好"等价于"整条片子都摆好"。
+            # 抽帧由 ffmpeg 完成，输出的就是转正后的画面（与导出一致），
+            # 参考尺寸取 display_size，覆盖层与导出的像素完全对齐。
+            from src.video_engine import extract_frame, probe_video
+
+            # _video_info 由 set_image 在主线程探测好；这里只读不写。
+            # 探测失败时兜底再探一次，避免后台线程拿到 None 直接崩。
+            info = self._video_info or probe_video(path)
+            ref_size = info.display_size
+            img = extract_frame(path, video_time)
         else:
             img = safe_open_image(path)
             ref_size = img.size

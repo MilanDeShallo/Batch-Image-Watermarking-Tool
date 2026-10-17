@@ -297,6 +297,40 @@ def main():
           pc._render_token)
     check("翻页后单飞标记复位", pc._render_busy is False, pc._render_busy)
 
+    # ---------- 视频时间轴：UI 联动（不依赖 ffmpeg） ----------
+    # 只验控件行为：可见性、上限、拖动即时反馈、换文件复位。
+    # 真实抽帧由 pytest 的 TestRealTranscode 与手动验证覆盖 ——
+    # 冒烟脚本不该因为机器没装 ffmpeg 就红一片。
+    head("视频时间轴")
+    pc.current_image_path = "dummy.mp4"
+    pc._video_duration = 6.0
+    pc._video_time = 0.0
+    pc._update_video_bar()
+    app.update()
+    check("视频时时间轴可见", pc._video_bar.winfo_manager() == "grid",
+          pc._video_bar.winfo_manager())
+    check("滑块上限等于视频时长",
+          abs(float(pc._video_slider.cget("to")) - 6.0) < 0.01,
+          pc._video_slider.cget("to"))
+    check("起始时间文字为 00:00", pc._video_time_var.get() == "00:00",
+          pc._video_time_var.get())
+    check("总时长文字为 00:06", pc._video_duration_label.cget("text") == "00:06",
+          pc._video_duration_label.cget("text"))
+
+    pc._on_video_seek(3.0)
+    app.update()
+    check("拖动后时间文字即时更新（不等抽帧）", pc._video_time_var.get() == "00:03",
+          pc._video_time_var.get())
+    check("拖动记下了目标秒数", abs(pc.current_video_time - 3.0) < 0.01,
+          pc.current_video_time)
+    pc._cancel_video_seek()   # 别让 260ms 后的抽帧排到后续步骤里
+
+    pc.current_image_path = None
+    pc._update_video_bar()
+    app.update()
+    check("非视频时时间轴隐藏", pc._video_bar.winfo_manager() == "",
+          pc._video_bar.winfo_manager())
+
     # ---------- 清空：底图缓存要丢 ----------
     head("清空预览 → 丢弃底图缓存")
     pc.clear_preview()

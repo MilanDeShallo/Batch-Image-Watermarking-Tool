@@ -52,3 +52,8 @@ presets/*.json
 
 # 旧版把用户界面布局写在项目里（现已迁到 APPDATA）
 src/presets/
+
+# 随包分发的 ffmpeg（shared 版共 234MB，不入仓库）
+# 构建前把它放到 vendor/ffmpeg/（ffmpeg.exe / ffprobe.exe / av*.dll / sw*.dll），
+# 缺这个目录也能出包，只是产物不带视频功能（build.spec 会打印警告）。
+vendor/ffmpeg/

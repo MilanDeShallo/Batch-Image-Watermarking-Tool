@@ -2,8 +2,8 @@
 文件管理器 — 文件收集、去重、格式校验、输出路径生成、路径清洗
 
 职责：
-- 从拖拽/文件对话框收集图片文件路径
-- 扩展名过滤（仅保留 SUPPORTED_EXTENSIONS 中的格式）
+- 从拖拽/文件对话框收集图片 / PDF / 视频文件路径
+- 扩展名过滤（仅保留 ACCEPTED_EXTENSIONS 中的格式）
 - 去重（基于规范化后的绝对路径）
 - 输出目录和输出文件名生成
 """
@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Optional
 
 from src.config import (
+    ACCEPTED_EXTENSIONS,
     CONFLICT_MODES,
     CONFLICT_OVERWRITE,
     CONFLICT_RENAME,
@@ -35,9 +36,21 @@ def sanitize_path(raw: str) -> str:
 
 
 def is_image_file(path: str) -> bool:
-    """检查文件扩展名是否为支持的格式（图片或 PDF）"""
+    """
+    检查文件扩展名是否为 Pillow 能处理、或能转 PDF 的格式（图片 / PDF）。
+
+    注意**不含视频**：视频要走 ffmpeg 分支，把它算进"图片"会让
+    safe_open_image 去开一个 mp4。判断"程序是否接受这个文件"请用
+    is_media_file()。
+    """
     ext = os.path.splitext(path)[1].lower()
     return ext in SUPPORTED_EXTENSIONS
+
+
+def is_media_file(path: str) -> bool:
+    """是否为程序接受的任意输入（图片 / PDF / 视频）——收集与拖放用这个"""
+    ext = os.path.splitext(path)[1].lower()
+    return ext in ACCEPTED_EXTENSIONS
 
 
 def is_pdf_file(path: str) -> bool:
@@ -50,11 +63,11 @@ def collect_files(
     existing_files: Optional[set[str]] = None
 ) -> tuple[list[str], list[str]]:
     """
-    从原始路径列表中收集有效的图片文件。
+    从原始路径列表中收集有效的媒体文件（图片 / PDF / 视频）。
 
     返回 (added_files, skipped_files) 元组：
-    - added_files: 新增的有效图片文件路径（已去重）
-    - skipped_files: 被跳过的文件路径及原因（非图片 / 已存在 / 不存在）
+    - added_files: 新增的有效文件路径（已去重）
+    - skipped_files: 被跳过的文件路径及原因（格式不支持 / 已存在 / 不存在）
     """
     added = []
     skipped = []
@@ -77,8 +90,8 @@ def collect_files(
             skipped.append((abs_path, "文件不存在"))
             continue
 
-        # 检查是否为支持的格式（图片/PDF）
-        if not is_image_file(abs_path):
+        # 检查是否为支持的格式（图片 / PDF / 视频）
+        if not is_media_file(abs_path):
             skipped.append((abs_path, "不支持的格式"))
             continue
 

@@ -43,6 +43,7 @@ from src.ui import theme
 from src.file_manager import (
     collect_files,
     is_image_file,
+    is_media_file,
     is_pdf_file,
     resolve_output_target,
 )
@@ -53,6 +54,11 @@ from src.config import (
     DEFAULT_JPEG_QUALITY,
     WatermarkConfig,
 )
+from src.video_engine import (
+    OUTPUT_MODE_MP4,
+    OUTPUT_MODE_SOURCE,
+    is_video_file,
+)
 from src.logger import log_error, log_exception, log_info, log_path
 from src.overrides import SCOPE_ALL, SCOPE_FILE, SCOPE_LABELS, SCOPE_PAGE, ScopeStore
 
@@ -61,6 +67,14 @@ LAYOUT_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "
 
 # 崩溃恢复会话文件
 SESSION_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WatermarkTool", "session.json")
+
+# 视频输出编码：界面文案 ⇄ 内部标识。
+# 「转MP4」兼容性最好；「保持原编码」编回源编码器，方便素材回流到剪辑流程。
+VIDEO_MODE_LABELS = {
+    OUTPUT_MODE_MP4: "视频: 转MP4",
+    OUTPUT_MODE_SOURCE: "视频: 保持原编码",
+}
+VIDEO_MODE_FROM_LABEL = {label: mode for mode, label in VIDEO_MODE_LABELS.items()}
 
 # 各区域最小尺寸
 MIN_LEFT = 180
@@ -427,7 +441,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         # 添加文件是这一栏的主路径：整个界面只有它和「开始处理」用主色，
         # 其余按钮一律走中性色，视线才会先落在这两处
         self._browse_btn = ctk.CTkButton(
-            left_frame, text="+ 浏览添加图片", command=self._browse_files,
+            left_frame, text="+ 浏览添加文件", command=self._browse_files,
             fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
             text_color=theme.ON_ACCENT,
         )
@@ -564,6 +578,16 @@ class AppWindow(ctk.CTk, DnDWrapper):
             command=self._on_format_changed,
         )
         self._format_menu.pack(side="left", padx=2)
+
+        # 视频输出编码：只在列表里含视频时出现（图片批次完全看不到它，
+        # 底栏宽度不变；视频批次里它与"合并 PDF"是互斥的，不会叠加挤爆这一行）
+        self._video_mode_var = ctk.StringVar(value=VIDEO_MODE_LABELS[OUTPUT_MODE_MP4])
+        self._video_mode_menu = ctk.CTkOptionMenu(
+            self._row1, variable=self._video_mode_var,
+            values=list(VIDEO_MODE_LABELS.values()), width=118,
+        )
+        self._video_mode_menu.pack(side="left", padx=(6, 2))
+        self._video_mode_menu.pack_forget()  # 无视频时隐藏
 
         # 仅格式=PDF 时出现：把整批合成一个多页 PDF
         self._merge_pdf_var = ctk.BooleanVar(value=False)
@@ -775,6 +799,10 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 self._format_var.set(fmt)
                 self._on_format_changed(fmt)  # set() 不触发下拉回调，需手动同步
                 self._merge_pdf_var.set(bool(session.get("merge_pdf", False)))
+                video_mode = session.get("video_mode", OUTPUT_MODE_MP4)
+                self._video_mode_var.set(
+                    VIDEO_MODE_LABELS.get(video_mode, VIDEO_MODE_LABELS[OUTPUT_MODE_MP4])
+                )
                 quality = session.get("quality", 90)
                 self._quality_var.set(quality)
                 # 同理：IntVar.set 不会触发 CTkSlider 的 command，
@@ -831,6 +859,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
                 "output_dir": self._output_dir_var.get(),
                 "format": self._format_var.get(),
                 "merge_pdf": bool(self._merge_pdf_var.get()),
+                "video_mode": self._video_output_mode(),
                 "quality": self._quality_var.get(),
                 "scopes": self._scopes.to_dict(),
             }
@@ -1177,12 +1206,67 @@ class AppWindow(ctk.CTk, DnDWrapper):
     # ---------- 作用范围：档位切换、面板回填与标记 ----------
 
     def _on_format_changed(self, choice: str):
-        """输出格式切换：仅 PDF 显示「合并为单个 PDF」开关"""
-        if choice == "PDF":
+        """输出格式切换：仅 PDF 且不含视频时显示「合并为单个 PDF」开关"""
+        has_video = self._has_video_files()
+        if choice == "PDF" and not has_video:
             self._merge_pdf_cb.pack(side="left", padx=(6, 2))
         else:
             self._merge_pdf_cb.pack_forget()
             self._merge_pdf_var.set(False)
+
+        if choice == "PDF" and has_video:
+            # 视频没有"页"，塞不进 PDF。plan_batch 会把视频照样输出成 mp4，
+            # 但用户选了 PDF 却看到一堆 mp4，不说清楚就是"程序没按我选的来"
+            self._status_label.configure(text="视频不参与 PDF，仍按「视频」选项输出")
+
+    def _has_video_files(self) -> bool:
+        """当前列表里是否含视频（界面刷新不该因列表状态抛错）"""
+        try:
+            return any(is_video_file(p) for p in self._file_list.files)
+        except Exception:
+            return False
+
+    def _video_output_mode(self) -> str:
+        """读取视频输出编码下拉；未知文案回落到默认 mp4"""
+        try:
+            return VIDEO_MODE_FROM_LABEL.get(self._video_mode_var.get(), OUTPUT_MODE_MP4)
+        except Exception:
+            return OUTPUT_MODE_MP4
+
+    def _refresh_video_ui(self):
+        """
+        按「本批有没有视频」调整底栏控件。
+
+        视频有三条硬约束：不进合并 PDF、不就地覆盖原文件、输出不是图片格式。
+        前两条在界面上直接禁掉（别让用户白点一次再看到报错），
+        第三条由 plan_batch 兜底 —— 视频的 output_format 一律被翻译成容器扩展名。
+        """
+        has_video = self._has_video_files()
+
+        try:
+            if has_video:
+                self._video_mode_menu.pack(side="left", padx=(6, 2))
+            else:
+                self._video_mode_menu.pack_forget()
+                self._video_mode_var.set(VIDEO_MODE_LABELS[OUTPUT_MODE_MP4])
+        except Exception:
+            pass
+
+        if has_video:
+            try:
+                self._merge_pdf_cb.pack_forget()
+                self._merge_pdf_var.set(False)
+            except Exception:
+                pass
+
+        try:
+            if has_video:
+                self._overwrite_original_var.set(False)
+                self._overwrite_original_cb.configure(state="disabled")
+            else:
+                self._overwrite_original_cb.configure(state="normal")
+        except Exception:
+            pass
 
     def _on_scope_changed(self, scope: str):
         """用户切换作用范围 → 面板回填该层的参数"""
@@ -1352,6 +1436,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
             self._scopes,
             out_format=self._format_var.get(),
             merge_pdf=bool(self._merge_pdf_var.get()),
+            video_output_mode=self._video_output_mode(),
         )
 
     # ============================================================
@@ -1500,30 +1585,36 @@ class AppWindow(ctk.CTk, DnDWrapper):
             current_count = self._file_list.count
             self._file_list.select_by_index(current_count - count)
 
-        # 显示添加结果反馈
+        # 显示添加结果反馈。
+        # 量词按内容走：纯图片说"张"，含视频时统一说"个" ——
+        # "已添加 2 张视频"读起来就是没想清楚。
         from collections import Counter
+        unit = "个" if any(is_video_file(p) for p in added) else "张"
         if skipped:
             reasons = Counter(reason for _, reason in skipped)
-            reason_str = "、".join(f"{c}张{r}" for r, c in reasons.most_common())
+            reason_str = "、".join(f"{c}{unit}{r}" for r, c in reasons.most_common())
             if added:
                 self._status_label.configure(
-                    text=f"已添加 {len(added)} 张；跳过 {len(skipped)} 张（{reason_str}）"
+                    text=f"已添加 {len(added)} {unit}；跳过 {len(skipped)} {unit}（{reason_str}）"
                 )
             else:
-                self._status_label.configure(text=f"跳过 {len(skipped)} 张（{reason_str}）")
+                self._status_label.configure(text=f"跳过 {len(skipped)} {unit}（{reason_str}）")
         elif added:
-            self._status_label.configure(text=f"已添加 {len(added)} 张")
+            self._status_label.configure(text=f"已添加 {len(added)} {unit}")
 
     def _browse_files(self):
         """浏览添加文件（拖拽的兜底入口）"""
         from tkinter.filedialog import askopenfilenames
 
         files = askopenfilenames(
-            title="选择图片/PDF文件",
+            title="选择图片 / PDF / 视频文件",
             filetypes=[
+                ("所有支持的格式",
+                 "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.tif *.pdf "
+                 "*.mp4 *.mov *.m4v *.mkv *.avi *.webm *.flv *.wmv"),
                 ("图片文件", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.tif"),
                 ("PDF 文件", "*.pdf"),
-                ("所有支持的格式", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.tif *.pdf"),
+                ("视频文件", "*.mp4 *.mov *.m4v *.mkv *.avi *.webm *.flv *.wmv"),
                 ("所有文件", "*.*"),
             ],
         )
@@ -1713,6 +1804,7 @@ class AppWindow(ctk.CTk, DnDWrapper):
         """更新文件计数显示"""
         count = self._file_list.count
         self._count_label.configure(text=f"共 {count} 个文件")
+        self._refresh_video_ui()
         self._refresh_output_hint()
         self._refresh_top_status()
 
@@ -2036,6 +2128,10 @@ class AppWindow(ctk.CTk, DnDWrapper):
         merge_pdf = plan.merge
         quality = self._quality_var.get()
 
+        # 视频输出编码在主线程读一次快照：
+        # 工作线程里读 tkinter 变量不是线程安全的（Tcl 解释器只在主线程跑）。
+        video_output_mode = self._video_output_mode()
+
         output_paths, merged_path = plan_output_paths(
             plan, output_dir,
             filename_template=template,
@@ -2111,11 +2207,36 @@ class AppWindow(ctk.CTk, DnDWrapper):
         def _process_one(index, out_path):
             task = specs[index]
             name = os.path.basename(task.path)
+            total_count = max(1, len(active))
+            # 该任务在"活跃任务"里的序号：跳过模式下 index 不连续，
+            # 直接拿 index 当进度会跳号
+            active_pos = next(
+                (pos for pos, (idx, _t) in enumerate(active) if idx == index), 0
+            )
+
+            def _video_progress(percent, text):
+                """
+                视频内部进度 → 整体进度条。
+
+                一条 3 分钟的视频要跑好几分钟，如果进度条只在文件切换时动一下，
+                用户会以为程序卡死了。这里按「前面已完成 + 当前视频百分比」折算，
+                和图片批次用的是同一根进度条、同一套文案。
+                """
+                if self._cancel_requested:
+                    return
+                overall = (
+                    active_pos + max(0.0, min(100.0, percent)) / 100.0
+                ) / total_count
+                self.after(0, lambda p=overall, pos=active_pos + 1, t=text:
+                           self._update_progress(p, pos, total_count, f"{name} {t}"))
+
             try:
                 execute_task(
                     task, out_path, jpeg_quality=quality,
                     should_cancel=lambda: self._cancel_requested,
                     overlay_scale=overlay_scale_snapshot,
+                    video_output_mode=video_output_mode,
+                    video_progress=_video_progress if task.is_video_source else None,
                 )
                 return (index, STATUS_OK, None, name)
             except TaskCancelled:

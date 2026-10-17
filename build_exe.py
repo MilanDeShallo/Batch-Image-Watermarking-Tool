@@ -175,6 +175,33 @@ def main() -> int:
         print(f"\n[失败] 没有找到产物：{exe}")
         return 1
 
+    # ---- 视频：把 ffmpeg 放进 _internal/ffmpeg/ ----
+    # 为什么不在 spec 里用 datas：PyInstaller 会顺着 ffmpeg.exe 的导入表
+    # 把同一批 dll 再收一遍到 _internal 根目录 —— 同样 234MB 存两份，
+    # 分发包从 110MB 涨到 212MB（实测）。放在它管不到的地方最省事。
+    vendor_ffmpeg = ROOT / "vendor" / "ffmpeg"
+    if vendor_ffmpeg.is_dir():
+        target_dir = DIST / "_internal" / "ffmpeg"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for item in sorted(vendor_ffmpeg.iterdir()):
+            if item.is_file():
+                shutil.copy2(item, target_dir / item.name)
+                copied += 1
+        size_mb = sum(p.stat().st_size for p in target_dir.iterdir()) / 1024 / 1024
+        print(f"[视频] ffmpeg 已随包：{copied} 个文件 {size_mb:.0f} MB -> _internal/ffmpeg/")
+    else:
+        print("[视频] 警告：vendor/ffmpeg 不存在，本次包不支持视频水印")
+        print("       需要的话把 shared 版 ffmpeg 放到 vendor/ffmpeg/ 再重新打包")
+
+    # AGPL 要求分发二进制时附带许可证，并让接收方知道源码在哪。
+    # 放包根目录（不是 _internal）：用户解压第一眼就能看到。
+    for name in ("LICENSE", "README.md"):
+        src_file = ROOT / name
+        if src_file.exists():
+            shutil.copy2(src_file, DIST / name)
+    print("[许可] LICENSE 与 README 已放入包根目录")
+
     zip_path = make_dist_zip(APP_NAME, __version__, exe)
 
     print()

@@ -71,7 +71,7 @@ from src.pdf_engine import (  # noqa: E402
     pdf_page_reference_size,
     render_pdf_page,
 )
-from src.ui.app_window import AppWindow  # noqa: E402
+from src.ui.app_window import AppWindow, VIDEO_MODE_LABELS  # noqa: E402
 
 
 # ---------------------------------------------------------------
@@ -992,6 +992,61 @@ def main():
               f"done 对话框 {len(_done)} 个，report={_rep!r}")
     finally:
         _rb.oversized_files, _rb.large_images = _orig_over, _orig_large
+
+    # ---------- 视频接入：底栏控件联动 ----------
+    # 视频有三条硬约束（不进合并 PDF、不就地覆盖、输出不是图片格式），
+    # 界面必须在用户点"开始"之前就把这些摆明，否则只能事后报错。
+    head("视频接入")
+    import tempfile as _tempfile
+
+    from src.video_engine import OUTPUT_MODE_MP4, OUTPUT_MODE_SOURCE
+
+    _vdir = _tempfile.mkdtemp(prefix="wm_smoke_video_")
+    _vfake = os.path.join(_vdir, "clip.mp4")
+    with open(_vfake, "wb") as _f:
+        _f.write(b"\x00" * 64)
+
+    app._file_list.clear_all()
+    app._update_count()
+    app.update_idletasks()
+    check("无视频时隐藏视频编码下拉",
+          app._video_mode_menu.winfo_manager() == "",
+          app._video_mode_menu.winfo_manager())
+    check("无视频时覆盖原图可用",
+          str(app._overwrite_original_cb.cget("state")) == "normal",
+          str(app._overwrite_original_cb.cget("state")))
+
+    app._file_list.add_files([_vfake])
+    app._update_count()
+    app.update_idletasks()
+    check("有视频时显示视频编码下拉",
+          app._video_mode_menu.winfo_manager() == "pack",
+          app._video_mode_menu.winfo_manager())
+    check("有视频时隐藏合并 PDF 开关",
+          app._merge_pdf_cb.winfo_manager() == "",
+          app._merge_pdf_cb.winfo_manager())
+    check("有视频时禁用覆盖原图",
+          str(app._overwrite_original_cb.cget("state")) == "disabled",
+          str(app._overwrite_original_cb.cget("state")))
+    check("视频编码默认统一 mp4",
+          app._video_output_mode() == OUTPUT_MODE_MP4, app._video_output_mode())
+
+    app._video_mode_var.set(VIDEO_MODE_LABELS[OUTPUT_MODE_SOURCE])
+    check("视频编码可切到保持原编码",
+          app._video_output_mode() == OUTPUT_MODE_SOURCE, app._video_output_mode())
+
+    _vplan = app._build_batch_plan([_vfake])
+    check("视频任务输出容器是视频扩展名而不是图片格式",
+          _vplan.tasks[0].output_format in ("mp4", "mov", "mkv"),
+          _vplan.tasks[0].output_format)
+    check("含视频时计划拒绝合并 PDF", _vplan.has_video and not _vplan.merge)
+
+    app._file_list.clear_all()
+    app._update_count()
+    app.update_idletasks()
+    check("移除视频后覆盖原图恢复可用",
+          str(app._overwrite_original_cb.cget("state")) == "normal",
+          str(app._overwrite_original_cb.cget("state")))
 
     # ---------- 收尾 ----------
     head("收尾")

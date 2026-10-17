@@ -7,5 +7,5 @@
 - 窗口标题 / 失败清单 / PDF Producer 都引用 APP_NAME，改名只改这一处
 """
 
-__version__ = "1.6.0"
+__version__ = "1.7.1"
 APP_NAME = "图印"

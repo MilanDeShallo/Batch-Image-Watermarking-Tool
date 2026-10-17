@@ -39,6 +39,15 @@ pdfium_binaries = collect_dynamic_libs('pypdfium2')
 # 开发运行有图标、打包后反而没有）
 all_datas = ctk_datas + dnd_datas + [('assets/app.ico', 'assets')]
 
+# ---- 视频支持的 ffmpeg 不在这里打包 ----
+# 试过用 datas 传 vendor/ffmpeg：PyInstaller 会顺着 ffmpeg.exe 的导入表
+# 把同一批 dll 再收一遍到 _internal 根目录 —— 234MB 变成 468MB，
+# 分发包从 110MB 涨到 212MB。而把重复项从 a.binaries 删掉更糟：
+# PyInstaller 在 Analysis 阶段已经把 datas 里的 dll 挪进 binaries，
+# 删 binaries 等于两处都没了，包直接退回 27MB 且没有视频功能。
+# 结论：让 PyInstaller 完全不碰 ffmpeg，改由 build_exe.py 在打包完成后
+# 手动复制到 dist/WatermarkTool/_internal/ffmpeg/。
+
 # 不再打包 presets/ 目录：预设现在存到 %APPDATA%/WatermarkTool/presets，
 # 安装目录是只读的。把空目录打进包里只会让用户以为预设存在那里。
 
@@ -71,7 +80,6 @@ a = Analysis(
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-
 exe = EXE(
     pyz,
     a.scripts,

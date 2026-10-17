@@ -16,7 +16,7 @@ import customtkinter as ctk
 from tkinterdnd2 import DND_FILES
 from tkinterdnd2.TkinterDnD import DnDWrapper
 
-from src.file_manager import collect_files, is_image_file, sanitize_path
+from src.file_manager import collect_files, is_media_file, sanitize_path
 from src.ui import theme
 
 
@@ -62,7 +62,7 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
     _HOVER_BORDER_WIDTH = 2
     _DEFAULT_TEXT_COLOR = theme.TEXT_MUTED
     _HOVER_TEXT_COLOR = theme.ACCENT
-    _DEFAULT_HINT = "将图片或 PDF 拖拽到这里\n或点击下方按钮添加"
+    _DEFAULT_HINT = "将图片、PDF 或视频拖拽到这里\n或点击下方按钮添加"
     _HOVER_HINT = "松开以添加文件"
 
     def __init__(
@@ -140,11 +140,11 @@ class DropZone(ctk.CTkFrame, DnDWrapper):
         raw_paths = self.tk.splitlist(event.data)
         clean_paths = [sanitize_path(p) for p in raw_paths]
 
-        # 过滤有效图片文件
-        image_files = [p for p in clean_paths if is_image_file(p)]
+        # 过滤有效输入文件（图片 / PDF / 视频）
+        media_files = [p for p in clean_paths if is_media_file(p)]
 
-        if image_files:
-            self.on_files_added(image_files)
+        if media_files:
+            self.on_files_added(media_files)
 
     def _set_icon_color(self, color: str):
         """

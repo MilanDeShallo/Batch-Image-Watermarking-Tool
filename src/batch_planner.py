@@ -20,6 +20,7 @@ from src.config import (
     WatermarkConfig,
 )
 from src.file_manager import DESKTOP_FALLBACK_DIRNAME, is_pdf_file
+from src.video_engine import OUTPUT_MODE_MP4, is_video_file, target_container
 
 
 # 界面下拉文案 / 格式名 → 内部格式标识
@@ -61,6 +62,17 @@ class FileTask:
         return is_pdf_file(self.path)
 
     @property
+    def is_video_source(self) -> bool:
+        """
+        是否视频源。
+
+        和 is_pdf_source 一样，是"走哪条引擎分支"的开关：
+        PDF → pypdf 覆盖层合并，图片 → Pillow，视频 → ffmpeg overlay。
+        output_format 对它只是"输出容器扩展名"，不参与格式转换决策。
+        """
+        return is_video_file(self.path)
+
+    @property
     def has_page_configs(self) -> bool:
         return bool(self.page_configs)
 
@@ -84,6 +96,7 @@ class BatchPlan:
     tasks: list = field(default_factory=list)
     merge: bool = False  # 是否合并为单个 PDF
     out_format: str = "auto"
+    has_video: bool = False  # 本批是否含视频（界面据此提示"合并已停用"等）
 
     @property
     def outputs_pdf(self) -> bool:
@@ -95,7 +108,13 @@ class BatchPlan:
         return len(self.tasks)
 
     def merge_items(self) -> list:
-        return [t.to_merge_item() for t in self.tasks]
+        """
+        合并输入只取能进 PDF 的源。
+
+        视频永远不进合并 —— 它没有"页"的概念，混进去只会让
+        build_merged_pdf 在打开文件时就失败。
+        """
+        return [t.to_merge_item() for t in self.tasks if not t.is_video_source]
 
 
 def plan_output_paths(
@@ -132,7 +151,18 @@ def plan_output_paths(
         return [], generate_merged_output_path(merged_dir, existing_names)
 
     paths: list = []
+    warned_video_overwrite = False
     for index, task in enumerate(plan.tasks, start=1):
+        # 视频永不就地覆盖：一次编码失败就把原始素材毁了，
+        # 而视频素材往往没有第二份。这里在规划层强制关掉，
+        # 界面即使漏了拦截也伤不到源文件。
+        is_video = getattr(task, "is_video_source", False)
+        if is_video and overwrite_original and not warned_video_overwrite:
+            from src.logger import log_warning
+            log_warning("视频不支持就地覆盖原文件，已改为输出到独立文件")
+            warned_video_overwrite = True
+        effective_overwrite = overwrite_original and not is_video
+
         path = generate_output_path(
             task.path,
             output_dir,
@@ -141,9 +171,9 @@ def plan_output_paths(
             seq_counter=index,
             existing_names=existing_names,
             on_conflict=on_conflict,
-            overwrite_original=overwrite_original,
+            overwrite_original=effective_overwrite,
         )
-        if path and overwrite_original:
+        if path and effective_overwrite:
             # 就地覆盖模式下 generate_output_path 直接返回源路径，
             # 这里补登记，避免同一批里两个任务落到同一个源文件上
             existing_names.add(path)
@@ -152,7 +182,13 @@ def plan_output_paths(
     return paths, ""
 
 
-def plan_batch(files, scopes, out_format: str = "auto", merge_pdf: bool = False) -> BatchPlan:
+def plan_batch(
+    files,
+    scopes,
+    out_format: str = "auto",
+    merge_pdf: bool = False,
+    video_output_mode: str = OUTPUT_MODE_MP4,
+) -> BatchPlan:
     """
     生成整批处理计划。
 
@@ -160,33 +196,48 @@ def plan_batch(files, scopes, out_format: str = "auto", merge_pdf: bool = False)
     :param scopes: ScopeStore，提供「全局默认 → 文件层 → 页层」的参数解析
     :param out_format: 期望的输出格式（界面文案或内部标识都可）
     :param merge_pdf: 是否合并为单个 PDF（仅在 out_format 为 pdf 时生效）
+    :param video_output_mode: 视频输出编码方式（mp4 / source），只影响视频源
     :return: BatchPlan
 
     说明：
     - PDF 源文件无论输出格式选什么，都强制输出 PDF
       （PNG/JPEG 选项对 PDF 源无效，把 PDF 页面光栅化会丢文字可搜性）
+    - 视频源同理，output_format 一律翻译成**容器扩展名**（mp4 / mov / mkv）。
+      它的"输出格式"下拉（PNG/JPEG/PDF）对视频没有任何意义 ——
+      视频不可能变成 PNG，也不可能塞进合并 PDF。
+    - 只要本批含视频，合并就自动停用：视频没有"页"，混进合并结果
+      只会在打开文件时失败。界面通过 has_video 给用户明确提示。
     - page_configs 只收录被单独设置过的页；未收录的页沿用文件层/全局默认
     """
     norm = normalize_format(out_format)
-    merge = bool(merge_pdf) and norm == "pdf"
+    has_video = any(is_video_file(path) for path in files)
+    merge = bool(merge_pdf) and norm == "pdf" and not has_video
 
     tasks = []
     for path in files:
         is_pdf = is_pdf_file(path)
+        is_video = is_video_file(path)
 
         page_configs = {}
         if is_pdf:
             for page in scopes.page_numbers(path):
                 page_configs[page] = scopes.config_for(path, page)
 
+        if is_video:
+            task_format = target_container(path, video_output_mode)
+        elif is_pdf:
+            task_format = "pdf"
+        else:
+            task_format = norm
+
         tasks.append(FileTask(
             path=path,
             config=scopes.config_for(path),
-            output_format="pdf" if is_pdf else norm,
+            output_format=task_format,
             page_configs=page_configs,
         ))
 
-    return BatchPlan(tasks=tasks, merge=merge, out_format=norm)
+    return BatchPlan(tasks=tasks, merge=merge, out_format=norm, has_video=has_video)
 
 
 class TaskCancelled(Exception):
@@ -194,7 +245,9 @@ class TaskCancelled(Exception):
 
 
 def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
-                 should_cancel=None, overlay_scale: float | None = None) -> int:
+                 should_cancel=None, overlay_scale: float | None = None,
+                 video_output_mode: str = OUTPUT_MODE_MP4,
+                 video_progress=None) -> int:
     """
     执行单个文件任务，结果写到 output_path。
 
@@ -204,9 +257,12 @@ def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
     :param should_cancel: 可选回调，返回 True 时抛 TaskCancelled
     :param overlay_scale: 覆盖层渲染倍率快照（PDF 源使用）；
         None 表示由 pdf_engine 取当时的全局值
-    :return: 写出的页数（图片恒为 1）
+    :param video_output_mode: 视频输出编码方式（mp4 / source）
+    :param video_progress: 视频进度回调 (百分比, 文字)；图片/PDF 不使用
+    :return: 写出的页数（图片、视频恒为 1）
 
     分支说明：
+    - 视频源 → ffmpeg 叠加（覆盖层由 Pillow 引擎生成，几何与图片一致）
     - PDF 源 → 覆盖层合并，原文保留可选可搜，逐页参数生效
     - 图片 + 输出 pdf → 单页 PDF，页面尺寸按像素比例换算
     - 图片 + 输出 png/jpeg/auto → Pillow 引擎直接存图
@@ -216,6 +272,7 @@ def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
        PDF 源还会在**每页之间**再检查一次 —— 所以 800 页的 PDF 点取消能立刻停下，
        而不是把整本跑完。已经进入 Pillow 合成的那一页无法安全中断
        （合成过程没有中断点），但不会再开新的一页/一个新文件。
+       视频源把同一个回调交给 ffmpeg 轮询，取消时直接终止子进程。
     2. **原子写出**：所有分支都先写临时文件、再 os.replace 到最终路径。
        中途异常 / 进程被杀都不会留下"看着存在、其实是坏文件"的半成品。
        覆盖原图模式尤其依赖这一点 —— 否则一次失败就能把源文件毁掉。
@@ -224,6 +281,22 @@ def execute_task(task: FileTask, output_path: str, jpeg_quality: int = 90,
         raise TaskCancelled("用户取消")
 
     from src.file_manager import atomic_output
+
+    if task.is_video_source:
+        from src.video_engine import VideoCancelled, watermark_video
+        try:
+            # atomic_output 由 watermark_video 内部处理：它必须把
+            # ffmpeg 的输出直接指向临时文件，否则大文件要多拷一遍。
+            return watermark_video(
+                task.path,
+                output_path,
+                task.config,
+                output_mode=video_output_mode,
+                progress=video_progress,
+                should_cancel=should_cancel,
+            )
+        except VideoCancelled as exc:
+            raise TaskCancelled("用户取消") from exc
 
     if task.is_pdf_source:
         from src.pdf_engine import apply_pdf_watermark
