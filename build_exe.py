@@ -194,8 +194,8 @@ def main() -> int:
         print("[视频] 警告：vendor/ffmpeg 不存在，本次包不支持视频水印")
         print("       需要的话把 shared 版 ffmpeg 放到 vendor/ffmpeg/ 再重新打包")
 
-    # AGPL 要求分发二进制时附带许可证，并让接收方知道源码在哪。
-    # 放包根目录（不是 _internal）：用户解压第一眼就能看到。
+    # 包里含 FFmpeg（GPL-3.0），按它的要求分发时要让接收方知道来源与条款；
+    # 项目自身是 MIT。两份都放包根目录（不是 _internal）：解压第一眼就能看到。
     for name in ("LICENSE", "README.md"):
         src_file = ROOT / name
         if src_file.exists():

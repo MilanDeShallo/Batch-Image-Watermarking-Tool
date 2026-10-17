@@ -950,11 +950,9 @@ A：旧版本会在切换 Tab 时把另一种水印的类型覆盖掉，已修�
 
 ## 许可证
 
-本项目采用 **GNU Affero General Public License v3.0**（AGPL-3.0）发布，完整条款见 [LICENSE](LICENSE)。
+本项目采用 [MIT License](LICENSE)。
 
-Copyright (C) 2026 MilanDeShallow
-
-这意味着你可以自由使用、修改、再分发本软件；但**如果你修改后把它作为网络服务提供给他人使用，必须以 AGPL-3.0 公开你修改后的完整源码**；分发给他人时也必须附带许可证与对应源码。
+Copyright (c) 2026 MilanDeShallo
 
 ### 第三方组件
 
@@ -969,6 +967,6 @@ Copyright (C) 2026 MilanDeShallow
 | psutil | BSD | 内存预算 |
 | FFmpeg | GPL-3.0 | 视频解码 / 叠加 / 编码 |
 
-以上组件均与 AGPL-3.0 兼容。其中 FFmpeg 许可证为 GPL-3.0，AGPL-3.0 第 13 条明确允许与 GPLv3 作品组合分发；它以**独立可执行文件**形式随 Windows 分发包提供（不静态链接、未做修改），源码可从 <https://ffmpeg.org/download.html> 获取，本项目使用的构建见 <https://www.gyan.dev/ffmpeg/builds/>。
+以上组件均与本项目的 MIT 协议兼容。其中 FFmpeg 以**独立可执行文件**形式随 Windows 分发包提供（不静态链接、未做修改），它本身按 GPL-3.0 分发，源码可从 <https://ffmpeg.org/download.html> 获取，本项目使用的构建见 <https://www.gyan.dev/ffmpeg/builds/>。
 
-如需更换许可协议，请修改本声明并替换对应 LICENSE 文件。
+如需更换许可协议，请修改本声明并添加对应 LICENSE 文件。
